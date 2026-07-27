@@ -1,0 +1,12 @@
+{
+  "appId": "com.mapgo.app",
+  "appName": "随行地图",
+  "webDir": "public",
+  "server": {
+    "url": "http://YOUR-SERVER-ADDRESS:3000",
+    "cleartext": true
+  },
+  "android": {
+    "allowMixedContent": true
+  }
+}

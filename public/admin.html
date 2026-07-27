@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>随行地图 · 管理后台</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; background: #f2f3f7; color: #222; padding: 20px; }
+.wrap { max-width: 860px; margin: 0 auto; }
+h1 { font-size: 20px; margin-bottom: 16px; }
+.card { background: #fff; border-radius: 14px; padding: 18px; margin-bottom: 16px; box-shadow: 0 2px 10px rgba(0,0,0,.06); }
+.card h2 { font-size: 15px; margin-bottom: 10px; }
+input { padding: 9px 12px; border: 1px solid #ccd; border-radius: 9px; font-size: 14px; margin: 4px 6px 4px 0; }
+button { border: none; background: #4a7cf7; color: #fff; font-weight: 600; padding: 9px 16px; border-radius: 9px; font-size: 13.5px; cursor: pointer; }
+button.danger { background: #ef4444; }
+button.ghost { background: #eef0f5; color: #445; }
+table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid #f0f1f4; }
+th { color: #889; font-weight: 600; font-size: 12.5px; }
+.muted { color: #889; font-size: 13px; }
+.err { color: #d33; font-size: 13px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 4px; }
+.tile { background: #f6f7fa; border-radius: 12px; padding: 12px; }
+.tile b { font-size: 22px; display: block; }
+.tile span { font-size: 12px; color: #889; }
+.hidden { display: none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🗺️ 随行地图 · 管理后台</h1>
+
+  <div class="card" id="login-card">
+    <h2>管理员登录</h2>
+    <p class="muted" style="margin-bottom:8px">第一个注册的账号自动成为管理员。</p>
+    <input id="u" placeholder="用户名">
+    <input id="p" type="password" placeholder="密码">
+    <button onclick="login()">登录</button>
+    <p id="login-err" class="err"></p>
+  </div>
+
+  <div id="panel" class="hidden">
+    <div class="card">
+      <h2>📊 总览</h2>
+      <div class="tiles" id="tiles"></div>
+    </div>
+
+    <div class="card">
+      <h2>🔑 服务端高德 Key(推荐)</h2>
+      <p class="muted" style="margin-bottom:8px">配置后:所有用户与分享页自动使用此 Key,安全密钥只存服务器,前端通过 /_AMapService 官方代理访问,不再暴露。留空 Key 保存可清除。</p>
+      <input id="ak" placeholder="Key" style="width:300px">
+      <input id="aj" placeholder="安全密钥 jscode(留空则不修改)" style="width:300px">
+      <button onclick="saveKey()">保存</button>
+      <span id="key-msg" class="muted"></span>
+    </div>
+
+    <div class="card">
+      <h2>👤 用户列表</h2>
+      <table>
+        <thead><tr><th>ID</th><th>用户名</th><th>昵称</th><th>注册时间</th><th>运动</th><th>收藏</th><th>足迹</th><th>计划</th><th></th></tr></thead>
+        <tbody id="users"></tbody>
+      </table>
+    </div>
+
+    <button class="ghost" onclick="logout()">退出登录</button>
+  </div>
+</div>
+
+<script>
+'use strict';
+let token = '';
+try { token = localStorage.getItem('mapgo_token') || ''; } catch (e) {}
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+async function api(method, url, body) {
+  const r = await fetch('/api' + url, {
+    method,
+    headers: Object.assign({ 'Content-Type': 'application/json' }, token ? { Authorization: 'Bearer ' + token } : {}),
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const d = await r.json().catch(() => null);
+  if (!r.ok || !d || d.ok === false) throw new Error((d && d.msg) || ('请求失败 ' + r.status));
+  return d.data;
+}
+
+async function login() {
+  document.getElementById('login-err').textContent = '';
+  try {
+    const r = await api('POST', '/login', { username: document.getElementById('u').value.trim(), password: document.getElementById('p').value });
+    token = r.token;
+    try { localStorage.setItem('mapgo_token', token); } catch (e) {}
+    if (!r.user.is_admin) { document.getElementById('login-err').textContent = '该账号不是管理员'; return; }
+    enter();
+  } catch (e) { document.getElementById('login-err').textContent = e.message; }
+}
+
+function logout() {
+  api('POST', '/logout').catch(() => {});
+  try { localStorage.removeItem('mapgo_token'); } catch (e) {}
+  location.reload();
+}
+
+async function enter() {
+  document.getElementById('login-card').classList.add('hidden');
+  document.getElementById('panel').classList.remove('hidden');
+  await Promise.all([loadOverview(), loadKey()]);
+}
+
+async function loadOverview() {
+  const d = await api('GET', '/admin/overview');
+  document.getElementById('tiles').innerHTML =
+    '<div class="tile"><b>' + d.totals.users + '</b><span>用户</span></div>' +
+    '<div class="tile"><b>' + (d.totals.distance / 1000).toFixed(1) + '</b><span>总运动公里</span></div>' +
+    '<div class="tile"><b>' + d.totals.tracks + '</b><span>路线记录</span></div>' +
+    '<div class="tile"><b>' + d.totals.checkins + '</b><span>足迹打卡</span></div>' +
+    '<div class="tile"><b>' + d.totals.shares + '</b><span>分享链接</span></div>';
+  document.getElementById('users').innerHTML = d.users.map((u) =>
+    '<tr><td>' + u.id + (u.is_admin ? ' 👑' : '') + '</td><td>' + esc(u.username) + '</td><td>' + esc(u.nickname) + '</td>' +
+    '<td class="muted">' + esc((u.created_at || '').slice(0, 16)) + '</td>' +
+    '<td>' + u.tracks + ' 次 / ' + (u.distance / 1000).toFixed(1) + 'km</td>' +
+    '<td>' + u.favorites + '</td><td>' + u.checkins + '</td><td>' + u.plans + '</td>' +
+    '<td>' + (u.is_admin ? '' : '<button class="danger" onclick="delUser(' + u.id + ',\'' + esc(u.username) + '\')">删除</button>') + '</td></tr>'
+  ).join('');
+}
+
+async function delUser(id, name) {
+  if (!confirm('删除用户 ' + name + '?其全部数据(收藏/计划/记录/足迹)将一并删除,不可恢复!')) return;
+  try { await api('DELETE', '/admin/users/' + id); loadOverview(); } catch (e) { alert(e.message); }
+}
+
+async function loadKey() {
+  try {
+    const d = await api('GET', '/admin/amapkey');
+    document.getElementById('ak').value = d.key || '';
+    document.getElementById('key-msg').textContent = d.hasJscode ? '已配置安全密钥(' + d.jscodeMasked + ')' : '未配置安全密钥';
+  } catch (e) {}
+}
+
+async function saveKey() {
+  try {
+    await api('POST', '/admin/amapkey', { key: document.getElementById('ak').value, jscode: document.getElementById('aj').value });
+    document.getElementById('aj').value = '';
+    document.getElementById('key-msg').textContent = '已保存 ✓';
+    loadKey();
+  } catch (e) { alert(e.message); }
+}
+
+/* 已有 token 时直接尝试进入 */
+if (token) {
+  api('GET', '/me').then((u) => { if (u.is_admin) enter(); }).catch(() => {});
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>随行地图 · 分享</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; background: #1f2430; }
+#map { position: fixed; inset: 0; }
+.card {
+  position: fixed; left: 10px; right: 10px; bottom: 14px; z-index: 20;
+  background: #fff; border-radius: 16px; padding: 14px 16px;
+  box-shadow: 0 8px 30px rgba(0,0,0,.25); font-size: 14px; line-height: 1.7;
+  max-height: 44vh; overflow-y: auto;
+}
+.card h1 { font-size: 17px; margin-bottom: 4px; }
+.muted { color: #889; font-size: 12.5px; }
+.err { color: #d33; }
+.step { display: flex; gap: 8px; padding: 6px 0; border-top: 1px solid #f0f1f4; align-items: baseline; }
+.step .no { min-width: 20px; height: 20px; border-radius: 50%; background: #4a7cf7; color: #fff; font-size: 12px; display: inline-flex; align-items: center; justify-content: center; align-self: center; }
+.brand {
+  position: fixed; top: 12px; left: 12px; z-index: 20;
+  background: rgba(31,36,48,.92); color: #fff; border-radius: 20px;
+  padding: 8px 16px; font-size: 14px; font-weight: 600;
+}
+.btn { border: none; background: #4a7cf7; color: #fff; font-weight: 600; padding: 8px 14px; border-radius: 10px; font-size: 13.5px; cursor: pointer; margin-top: 6px; }
+.keybox { position: fixed; inset: 0; z-index: 50; background: #1f2430; color: #eee; display: flex; align-items: center; justify-content: center; padding: 24px; }
+.keybox .inner { max-width: 380px; width: 100%; background: #fff; color: #222; border-radius: 16px; padding: 22px; }
+.keybox input { width: 100%; padding: 10px 12px; border: 1px solid #ccd; border-radius: 10px; font-size: 14px; margin: 6px 0 12px; }
+.runner { font-size: 24px; text-shadow: 0 2px 4px rgba(0,0,0,.4); }
+.num-marker { width: 28px; height: 28px; border-radius: 50%; background: #4a7cf7; color: #fff; font-weight: 700; font-size: 13px; display: flex; align-items: center; justify-content: center; border: 2.5px solid #fff; box-shadow: 0 3px 8px rgba(0,0,0,.35); }
+.num-marker.start { background: #16a34a; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div class="brand">🗺️ 随行地图 · 分享</div>
+<div class="card" id="card"><span class="muted">加载中…</span></div>
+<div class="keybox" id="keybox" style="display:none">
+  <div class="inner">
+    <h2 style="font-size:17px;margin-bottom:8px">需要高德 Key 才能显示地图</h2>
+    <p class="muted">该服务器未托管地图 Key。请输入你自己的高德 Web端(JS API)Key 与安全密钥(仅存本机)。</p>
+    <input id="k1" placeholder="Key">
+    <input id="k2" placeholder="安全密钥 jscode">
+    <button class="btn" onclick="saveKey()">加载地图</button>
+  </div>
+</div>
+
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function fmtDist(m) { return m >= 1000 ? (m/1000).toFixed(1) + ' 公里' : Math.round(m) + ' 米'; }
+function fmtDur(s) { return s >= 3600 ? Math.floor(s/3600) + ' 小时 ' + Math.round(s%3600/60) + ' 分' : Math.max(1, Math.round(s/60)) + ' 分钟'; }
+function hav(a, b) {
+  const R = 6371000, r = Math.PI/180;
+  const dx = (b[1]-a[1])*r, dy = (b[0]-a[0])*r;
+  const s = Math.sin(dx/2)**2 + Math.cos(a[1]*r)*Math.cos(b[1]*r)*Math.sin(dy/2)**2;
+  return 2*R*Math.asin(Math.sqrt(s));
+}
+
+let map = null, share = null;
+const token = new URLSearchParams(location.search).get('t') || '';
+
+async function boot() {
+  if (!token) { $('card').innerHTML = '<span class="err">链接不完整</span>'; return; }
+  let resp;
+  try {
+    resp = await fetch('/api/share/' + token).then((r) => r.json());
+  } catch (e) { $('card').innerHTML = '<span class="err">无法连接服务器</span>'; return; }
+  if (!resp.ok) { $('card').innerHTML = '<span class="err">' + esc(resp.msg || '分享不存在') + '</span>'; return; }
+  share = resp.data;
+
+  /* 先渲染基础信息卡(即使地图加载失败也能看到内容) */
+  const d0 = share.payload || {};
+  $('card').innerHTML = '<h1>' + (share.type === 'track' ? (d0.kind === 'ride' ? '🚴 ' : '🏃 ') : '📝 ') + esc(d0.name || '分享') + '</h1>' +
+    (d0.distance ? '全程 <b>' + fmtDist(d0.distance) + '</b>' : '') +
+    (d0.duration ? ' · 用时 <b>' + fmtDur(d0.duration) + '</b>' : '') +
+    '<div class="muted">由 ' + esc(share.nickname) + ' 分享 · 地图加载中…</div>';
+
+  let cfg = null;
+  try { cfg = (await fetch('/api/config').then((r) => r.json())).data; } catch (e) {}
+  if (cfg && cfg.amapKey && cfg.proxy) {
+    window._AMapSecurityConfig = { serviceHost: location.origin + '/_AMapService' };
+    loadScript(cfg.amapKey);
+  } else {
+    let k = null, j = null;
+    try { k = localStorage.getItem('amap_key'); j = localStorage.getItem('amap_jscode'); } catch (e) {}
+    if (k && j) { window._AMapSecurityConfig = { securityJsCode: j }; loadScript(k); }
+    else $('keybox').style.display = 'flex';
+  }
+}
+
+function saveKey() {
+  const k = $('k1').value.trim(), j = $('k2').value.trim();
+  if (!k || !j) return;
+  try { localStorage.setItem('amap_key', k); localStorage.setItem('amap_jscode', j); } catch (e) {}
+  window._AMapSecurityConfig = { securityJsCode: j };
+  $('keybox').style.display = 'none';
+  loadScript(k);
+}
+
+function loadScript(key) {
+  const s = document.createElement('script');
+  s.src = 'https://webapi.amap.com/maps?v=2.0&key=' + encodeURIComponent(key);
+  s.onload = render;
+  s.onerror = () => { $('card').innerHTML += '<div class="err">地图加载失败,请检查网络/Key(内容信息见上)</div>'; };
+  document.head.appendChild(s);
+}
+
+function render() {
+  map = new AMap.Map('map', { zoom: 14, viewMode: '2D' });
+  const d = share.payload || {};
+  const by = '<div class="muted">由 ' + esc(share.nickname) + ' 分享 · ' + esc((share.created_at || '').slice(0, 16)) + '</div>';
+
+  if (share.type === 'track') {
+    const path = (d.path || []).map((p) => [p[0], p[1]]);
+    if (path.length >= 2) {
+      const line = new AMap.Polyline({ path, strokeColor: d.kind === 'ride' ? '#f59e0b' : '#16a34a', strokeWeight: 6, showDir: true, lineJoin: 'round' });
+      map.add(line);
+      map.setFitView([line], false, [60, 200, 60, 60]);
+      map.add(new AMap.Marker({ position: path[0], content: '<div class="num-marker start">起</div>', offset: new AMap.Pixel(-14, -14) }));
+      map.add(new AMap.Marker({ position: path[path.length - 1], content: '<div class="num-marker">终</div>', offset: new AMap.Pixel(-14, -14) }));
+    }
+    $('card').innerHTML =
+      '<h1>' + (d.kind === 'ride' ? '🚴' : '🏃') + ' ' + esc(d.name) + '</h1>' +
+      '全程 <b>' + fmtDist(d.distance || 0) + '</b>' +
+      (d.duration ? ' · 用时 <b>' + fmtDur(d.duration) + '</b>' : '') + '<br>' + by +
+      (path.length >= 2 ? '<button class="btn" onclick="replay()">▶ 回放轨迹</button>' : '');
+  } else if (share.type === 'plan') {
+    let total = 0;
+    const colors = ['#4a7cf7','#16a34a','#e74c3c','#9b59b6','#f59e0b','#0ea5e9'];
+    if (d.origin) map.add(new AMap.Marker({ position: [d.origin.lng, d.origin.lat], content: '<div class="num-marker start">起</div>', offset: new AMap.Pixel(-14, -14) }));
+    const all = [];
+    (d.legs || []).forEach((l, i) => {
+      total += l.distance || 0;
+      const line = new AMap.Polyline({ path: (l.path || []).map((p) => [p[0], p[1]]), strokeColor: colors[i % colors.length], strokeWeight: 6, showDir: true });
+      map.add(line);
+      all.push(line);
+    });
+    (d.stops || []).forEach((s, i) => {
+      const mk = new AMap.Marker({ position: [s.lng, s.lat], content: '<div class="num-marker">' + (i + 1) + '</div>', offset: new AMap.Pixel(-14, -14) });
+      map.add(mk);
+      all.push(mk);
+    });
+    if (all.length) map.setFitView(all, false, [60, 220, 60, 60]);
+    const modeName = d.travelMode === 'drive' ? '驾车' : d.travelMode === 'ride' ? '骑行' : '步行';
+    $('card').innerHTML =
+      '<h1>📝 ' + esc(d.name) + '</h1>合计 <b>' + fmtDist(total) + '</b>(' + modeName + ')<br>' + by +
+      (d.stops || []).map((s, i) =>
+        '<div class="step"><span class="no">' + (i + 1) + '</span><div><b>' + esc(s.name) + '</b> <span class="muted">(' + esc(s.task) + ')</span>' +
+        (d.legs && d.legs[i] ? '<div class="muted">' + modeName + ' ' + fmtDist(d.legs[i].distance) + '</div>' : '') + '</div></div>').join('');
+  } else {
+    $('card').innerHTML = '<span class="err">未知的分享类型</span>';
+  }
+}
+
+/* 轨迹回放(与主应用同款变速逻辑的精简版) */
+let rp = { raf: 0, marker: null, line: null };
+function replay() {
+  const d = share.payload;
+  const raw = d.path || [];
+  const path = raw.map((p) => [p[0], p[1]]);
+  if (path.length < 2) return;
+  if (rp.raf) cancelAnimationFrame(rp.raf);
+  if (rp.marker) map.remove(rp.marker);
+  if (rp.line) map.remove(rp.line);
+
+  let times = raw[0] && raw[0].length >= 3 ? raw.map((p) => p[2]) : null;
+  if (!times) {
+    const total = d.duration || (d.distance / (d.kind === 'ride' ? 4 : 2));
+    let acc = 0; times = [0];
+    for (let i = 1; i < path.length; i++) { acc += hav(path[i - 1], path[i]); times.push(acc); }
+    times = times.map((x) => x / (acc || 1) * total);
+  }
+  const realTotal = times[times.length - 1] || 1;
+  const speedup = realTotal / Math.min(40, Math.max(8, realTotal / 60));
+
+  rp.line = new AMap.Polyline({ path: [path[0]], strokeColor: '#ef4444', strokeWeight: 6, zIndex: 120 });
+  map.add(rp.line);
+  rp.marker = new AMap.Marker({ position: path[0], content: '<div class="runner">' + (d.kind === 'ride' ? '🚴' : '🏃') + '</div>', offset: new AMap.Pixel(-14, -22), zIndex: 130 });
+  map.add(rp.marker);
+
+  const start = performance.now();
+  let seg = 1;
+  const step = (now) => {
+    const simT = (now - start) / 1000 * speedup;
+    if (simT >= realTotal) { rp.line.setPath(path); rp.marker.setPosition(path[path.length - 1]); return; }
+    while (seg < times.length - 1 && times[seg] <= simT) seg++;
+    const t0 = times[seg - 1], t1 = times[seg] || t0 + 1;
+    const f = Math.min(1, Math.max(0, (simT - t0) / ((t1 - t0) || 1)));
+    const p0 = path[seg - 1], p1 = path[seg];
+    const cur = [p0[0] + (p1[0] - p0[0]) * f, p0[1] + (p1[1] - p0[1]) * f];
+    rp.marker.setPosition(cur);
+    rp.line.setPath(path.slice(0, seg).concat([cur]));
+    rp.raf = requestAnimationFrame(step);
+  };
+  rp.raf = requestAnimationFrame(step);
+}
+
+boot();
+</script>
+</body>
+</html>

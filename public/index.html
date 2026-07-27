@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#1f2430">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>随行地图 MapGo</title>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<!-- ============ 登录 / 注册 ============ -->
+<div id="auth-view" class="hidden">
+  <div class="auth-card">
+    <div class="auth-logo">🗺️</div>
+    <h1>随行地图 <span>MapGo</span></h1>
+    <p class="auth-slogan">吃喝逛跑,一图搞定</p>
+    <div class="auth-tabs">
+      <button id="auth-tab-login" class="active">登录</button>
+      <button id="auth-tab-reg">注册</button>
+    </div>
+    <div class="auth-form">
+      <input type="text" id="auth-username" placeholder="用户名" autocomplete="username" maxlength="20">
+      <input type="text" id="auth-nickname" class="hidden" placeholder="昵称(选填)" maxlength="20">
+      <input type="password" id="auth-password" placeholder="密码(至少 6 位)" autocomplete="current-password" maxlength="64">
+      <input type="password" id="auth-password2" class="hidden" placeholder="确认密码" maxlength="64">
+      <input type="password" id="auth-admin-token" class="hidden" placeholder="首个管理员初始化令牌(有则填写)" maxlength="128">
+      <p id="auth-err" class="err hidden"></p>
+      <button id="auth-submit" class="primary-btn wide">登 录</button>
+      <button id="auth-guest" class="ghost-btn">先逛逛,游客模式 →</button>
+      <p id="auth-offline" class="muted hidden">⚠ 未检测到后端服务,收藏/保存等功能不可用。<br>请用 <code>npm install && npm start</code> 启动后访问 localhost:3000。</p>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 地图主界面 ============ -->
+<div id="map"></div>
+
+<header id="topbar">
+  <div id="mode-title">
+    <span id="mode-emoji">🗺️</span>
+    <span id="mode-name">随行地图</span>
+  </div>
+  <div class="top-actions">
+    <button id="btn-dark" class="icon-btn" title="夜间模式">🌙</button>
+    <button id="btn-user" class="icon-btn" title="账号">👤</button>
+    <button id="btn-locate" class="icon-btn" title="回到我的位置">⌖</button>
+    <button id="btn-settings" class="icon-btn" title="地图 Key 设置">⚙</button>
+  </div>
+</header>
+
+<div id="toast" class="hidden"></div>
+
+<!-- POI 模式面板 -->
+<div id="panel-poi" class="panel hidden">
+  <div class="panel-row">
+    <div class="searchbox">
+      <input type="text" id="poi-search" placeholder="搜索…">
+      <button id="btn-poi-search">🔍</button>
+    </div>
+    <div class="seg mini" id="poi-sort-seg">
+      <button data-sort="dist" class="seg-btn active">距离</button>
+      <button data-sort="rating" class="seg-btn">评分</button>
+    </div>
+  </div>
+  <div id="poi-chips" class="chips"></div>
+  <div class="panel-row">
+    <span id="poi-count" class="muted">正在搜索…</span>
+    <div style="display:flex;gap:8px;align-items:center">
+      <button id="btn-meet" class="small-btn hidden">👥 一起吃</button>
+      <button id="btn-nearest" class="small-btn hidden">🧭 最近的一个</button>
+      <label class="switch-label">
+        <input type="checkbox" id="chk-hide-others" checked>
+        <span>忽略其他标注</span>
+      </label>
+    </div>
+  </div>
+  <div id="poi-list" class="poi-list"></div>
+</div>
+
+<!-- 跑步 / 骑行 / 公交 面板 -->
+<div id="panel-route" class="panel hidden">
+  <div id="route-weather" class="weather hidden"></div>
+  <div class="panel-row">
+    <span id="route-hint" class="muted"></span>
+  </div>
+  <div class="panel-row">
+    <div style="display:flex;gap:8px">
+      <button id="btn-route-undo" class="small-btn">↩ 撤销</button>
+      <button id="btn-route-clear" class="small-btn">清除</button>
+      <button id="btn-route-go" class="primary-btn">规划路线</button>
+    </div>
+    <button id="btn-route-save" class="small-btn accent hidden">💾 保存</button>
+  </div>
+  <div id="route-result" class="route-result hidden"></div>
+  <div id="route-steps" class="hidden">
+    <button id="btn-route-steps" class="small-btn" style="margin:4px 0">📋 逐段指引</button>
+    <div id="route-steps-list" class="steps-list hidden"></div>
+  </div>
+  <div id="transit-plans" class="hidden"></div>
+
+  <!-- 实况记录(跑步/骑行) -->
+  <div id="live-rec" class="hidden">
+    <div class="panel-row list-head">
+      <strong>🎽 实况记录</strong>
+      <button id="btn-voice" class="small-btn" title="每公里语音播报">🔊 播报开</button>
+    </div>
+    <div id="rec-stats" class="rec-stats hidden">
+      <div><b id="rec-dist">0.00</b><span>公里</span></div>
+      <div><b id="rec-time">00:00</b><span>用时</span></div>
+      <div><b id="rec-pace">--</b><span>配速</span></div>
+    </div>
+    <div class="panel-row">
+      <button id="btn-rec-start" class="primary-btn rec">▶ 开始记录</button>
+      <button id="btn-rec-pause" class="small-btn hidden">⏸ 暂停</button>
+      <button id="btn-rec-stop" class="small-btn danger hidden">⏹ 结束</button>
+    </div>
+  </div>
+
+  <div id="route-records">
+    <div class="panel-row list-head">
+      <strong>📂 我的记录</strong>
+      <span id="route-records-hint" class="muted"></span>
+    </div>
+    <div id="route-records-list" class="saved-list"></div>
+  </div>
+</div>
+
+<!-- 足迹面板 -->
+<div id="panel-foot" class="panel hidden">
+  <div class="panel-row">
+    <strong>📔 足迹日记</strong>
+    <span id="foot-hint" class="muted"></span>
+  </div>
+  <div class="panel-row">
+    <div class="emoji-pick" id="foot-emoji">
+      <button class="active">📍</button><button>🍜</button><button>🏞️</button><button>💪</button><button>❤️</button><button>🎉</button>
+    </div>
+  </div>
+  <div class="panel-row">
+    <input type="text" id="foot-note" class="text-inp" placeholder="此刻想说点什么…(选填)">
+    <button id="btn-checkin" class="primary-btn">📍 在此打卡</button>
+  </div>
+  <p class="muted" style="margin-bottom:6px">默认打卡当前定位;也可先点地图任意处选一个位置再打卡。</p>
+  <div id="foot-list" class="poi-list"></div>
+</div>
+
+<!-- 统计面板 -->
+<div id="panel-stats" class="panel hidden">
+  <div class="panel-row">
+    <strong>📊 我的数据</strong>
+    <div style="display:flex;gap:8px;align-items:center">
+      <button id="btn-heatmap" class="small-btn">🔥 热力足迹</button>
+      <span id="stats-hint" class="muted"></span>
+    </div>
+  </div>
+  <div id="stats-body" class="stats-body"></div>
+</div>
+
+<!-- 好友面板 -->
+<div id="panel-friends" class="panel hidden">
+  <div class="panel-row">
+    <strong>👥 好友</strong>
+    <span id="friends-hint" class="muted"></span>
+  </div>
+  <div class="panel-row">
+    <input type="text" id="friend-username" class="text-inp" placeholder="输入对方用户名">
+    <button id="btn-friend-add" class="primary-btn">加好友</button>
+  </div>
+  <div id="friends-body" class="stats-body">
+    <div id="friends-incoming"></div>
+    <div id="friends-list"></div>
+    <div class="panel-row list-head">
+      <strong>🏆 运动排行榜</strong>
+      <div class="seg mini" id="lb-seg">
+        <button data-days="7" class="seg-btn active">近7天</button>
+        <button data-days="30" class="seg-btn">近30天</button>
+      </div>
+    </div>
+    <div id="leaderboard"></div>
+  </div>
+</div>
+
+<!-- 找中间点弹层 -->
+<div id="meet-mask" class="mask hidden">
+  <div class="dialog">
+    <h2>👥 一起吃:找中间点</h2>
+    <p class="muted">每行输入一个人的位置(地名/小区/地标),写「我」代表你的当前定位。会计算对大家总路程最短的中间点,并推荐周边美食。</p>
+    <textarea id="meet-input" rows="4" style="width:100%;border:1px solid #dde;border-radius:10px;padding:10px;font-size:14px;font-family:inherit" placeholder="我&#10;中关村&#10;国贸"></textarea>
+    <p id="meet-err" class="err hidden"></p>
+    <div class="dialog-actions">
+      <button id="btn-meet-cancel" class="small-btn">取消</button>
+      <button id="btn-meet-go" class="primary-btn">找中间点</button>
+    </div>
+  </div>
+</div>
+
+<!-- 计划模式面板 -->
+<div id="panel-plan" class="panel hidden">
+  <div class="panel-row">
+    <strong>今天要办的事(每行一件)</strong>
+    <button id="btn-plan-fold" class="small-btn">收起</button>
+  </div>
+  <div id="plan-body">
+    <textarea id="plan-input" rows="4" placeholder="例如:&#10;买菜 超市&#10;取快递&#10;药店买感冒药&#10;吃午饭 面馆"></textarea>
+    <div class="panel-row">
+      <div class="seg" id="plan-mode-seg">
+        <button data-tmode="walk" class="seg-btn active">🚶 步行</button>
+        <button data-tmode="ride" class="seg-btn">🚲 骑行</button>
+        <button data-tmode="drive" class="seg-btn">🚗 驾车</button>
+      </div>
+      <button id="btn-plan-go" class="primary-btn">最短路径规划</button>
+    </div>
+    <div class="panel-row plan-time-row">
+      <label>出发 <input type="time" id="plan-depart"></label>
+      <label>每站停留 <input type="number" id="plan-stay" value="15" min="0" max="240" style="width:52px"> 分钟</label>
+    </div>
+    <div id="plan-result" class="plan-result"></div>
+    <div class="panel-row hidden" id="plan-save-row">
+      <div style="display:flex;gap:8px">
+        <button id="btn-plan-restore" class="small-btn hidden">↺ 恢复最优</button>
+      </div>
+      <div style="display:flex;gap:8px">
+        <button id="btn-plan-share" class="small-btn">🔗 分享</button>
+        <button id="btn-plan-save" class="small-btn accent">💾 保存计划</button>
+      </div>
+    </div>
+    <div id="plan-saved">
+      <div class="panel-row list-head">
+        <strong>📂 我的计划</strong>
+        <span id="plan-saved-hint" class="muted"></span>
+      </div>
+      <div id="plan-saved-list" class="saved-list"></div>
+    </div>
+  </div>
+</div>
+
+<!-- 收藏面板 -->
+<div id="panel-fav" class="panel hidden">
+  <div class="panel-row">
+    <strong>⭐ 我的收藏</strong>
+    <span id="fav-hint" class="muted"></span>
+  </div>
+  <div id="fav-list" class="poi-list"></div>
+</div>
+
+<!-- 底部模式栏(可横向滑动) -->
+<nav id="tabbar">
+  <div id="tabbar-scroll">
+    <button class="tab active" data-mode="normal"><span>🗺️</span>常规</button>
+    <button class="tab" data-mode="food"><span>🍜</span>吃货</button>
+    <button class="tab" data-mode="toilet"><span>🚻</span>厕所</button>
+    <button class="tab" data-mode="shop"><span>🛍️</span>逛街</button>
+    <button class="tab" data-mode="park"><span>🅿️</span>停车</button>
+    <button class="tab" data-mode="fuel"><span>⛽</span>加油充电</button>
+    <button class="tab" data-mode="er"><span>🏥</span>救急</button>
+    <button class="tab" data-mode="hotel"><span>🏨</span>酒店</button>
+    <button class="tab" data-mode="run"><span>🏃</span>跑步</button>
+    <button class="tab" data-mode="ride"><span>🚴</span>骑行</button>
+    <button class="tab" data-mode="transit"><span>🚌</span>公交</button>
+    <button class="tab" data-mode="plan"><span>📝</span>计划</button>
+    <button class="tab" data-mode="foot"><span>📔</span>足迹</button>
+    <button class="tab" data-mode="friends"><span>👥</span>好友</button>
+    <button class="tab" data-mode="fav"><span>⭐</span>收藏</button>
+    <button class="tab" data-mode="stats"><span>📊</span>统计</button>
+  </div>
+</nav>
+
+<!-- Key 设置弹层 -->
+<div id="setup-mask" class="mask hidden">
+  <div class="dialog">
+    <h2>配置高德地图 Key</h2>
+    <p class="muted">前往 <b>lbs.amap.com</b> 控制台 → 应用管理 → 创建应用 →
+      添加 Key(服务平台选 <b>Web端(JS API)</b>),获得 Key 和「安全密钥」。详见 README。</p>
+    <label>Key
+      <input type="text" id="inp-key" placeholder="例如 1a2b3c4d5e6f...">
+    </label>
+    <label>安全密钥 (jscode)
+      <input type="text" id="inp-jscode" placeholder="创建 Key 时生成的安全密钥">
+    </label>
+    <p id="setup-err" class="err hidden"></p>
+    <div class="dialog-actions">
+      <button id="btn-setup-cancel" class="small-btn hidden">取消</button>
+      <button id="btn-setup-save" class="primary-btn">保存并加载地图</button>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="js/main.js"></script>
+</body>
+</html>

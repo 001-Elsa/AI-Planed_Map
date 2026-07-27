@@ -1,0 +1,18 @@
+{
+  "name": "mapgo",
+  "version": "5.1.0",
+  "description": "随行地图 MapGo — 多模式实用地图(高德 JS API)+ 用户系统(零依赖 Node + SQLite)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/api.test.js",
+    "test:e2e": "node test/e2e.run.cjs"
+  },
+  "engines": {
+    "node": ">=22.5"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "playwright": "^1.48.0"
+  }
+}

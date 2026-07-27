@@ -1,0 +1,14 @@
+services:
+  mapgo:
+    build: .
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      AMAP_KEY: ${AMAP_KEY:-}
+      AMAP_JSCODE: ${AMAP_JSCODE:-}
+      ADMIN_INIT_TOKEN: ${ADMIN_INIT_TOKEN:-}
+      ENABLE_HSTS: ${ENABLE_HSTS:-}
+      TZ: Asia/Shanghai
+    restart: unless-stopped
