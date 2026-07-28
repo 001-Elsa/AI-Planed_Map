@@ -1,0 +1,2 @@
+"""MapGo AI Planner backend."""
+
