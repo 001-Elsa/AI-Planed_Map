@@ -1,12 +1,13 @@
 /* 全局共享状态(单一数据源):所有模块通过 S 读写,避免隐式全局变量 */
 'use strict';
 
-export const DEFAULT_CENTER = [116.397428, 39.90923];
+export const DEFAULT_CENTER = [104.195397, 35.86166];
 
 export const S = {
   /* 地图核心 */
   map: null,
   myPos: null,            // {lng, lat}
+  myPosName: '',
   myMarker: null,
   currentMode: 'normal',
   infoWindow: null,

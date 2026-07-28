@@ -1,5 +1,6 @@
 data/
 node_modules/
 .env
+public/js/local-config.js
 *.log
 .DS_Store

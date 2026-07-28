@@ -2,14 +2,22 @@
 'use strict';
 
 import { S, DEFAULT_CENTER } from '../state.js';
-import { $, toast } from '../ui/dom.js';
+import { $, escapeHtml, toast } from '../ui/dom.js';
 import { store } from '../services/store.js';
 import { API } from '../services/api.js';
+import { searchPlaceSuggestions } from '../services/amap.js';
 import { showSetup, setupErr } from '../ui/auth.js';
 import * as poi from './poi.js';
 import * as route from './route.js';
 import * as plan from './plan.js';
 import * as social from './social.js';
+
+const LAST_POS_KEY = 'mapgo_last_pos';
+let locationSuggestions = [];
+let locationSearchTimer = null;
+let locationSearchSeq = 0;
+let activeLocationIndex = -1;
+let locationInputComposing = false;
 
 /* ---------------- 模式配置 ---------------- */
 export const MODES = {
@@ -123,9 +131,19 @@ export const MODES = {
 export function initMap() {
   if (!window.AMap) { showSetup(true, false); setupErr('高德 API 未就绪,请检查 Key。'); return; }
 
-  S.map = new AMap.Map('map', { zoom: 15, center: DEFAULT_CENTER, viewMode: '2D' });
+  const cachedPos = getCachedPosition();
+  S.map = new AMap.Map('map', {
+    zoom: cachedPos ? 15 : 4,
+    center: cachedPos ? [cachedPos.lng, cachedPos.lat] : DEFAULT_CENTER,
+    viewMode: '2D',
+  });
   S.map.addControl(new AMap.Scale());
   S.infoWindow = new AMap.InfoWindow({ offset: new AMap.Pixel(0, -32) });
+  if (cachedPos) {
+    S.myPos = cachedPos;
+    S.myPosName = cachedPos.name || '';
+    drawMyMarker();
+  }
 
   window.addEventListener('error', (ev) => {
     const m = String(ev && ev.message || '');
@@ -135,7 +153,7 @@ export function initMap() {
     }
   });
 
-  locateMe(true);
+  if (!cachedPos) toast('请先在上方输入你的位置，比如小区/地标/地址', 5200);
 
   S.map.on('moveend', () => {
     const cfg = MODES[S.currentMode];
@@ -151,24 +169,126 @@ export function initMap() {
   setTimeout(social.checkNudge, 4000);
 }
 
-export function locateMe(first) {
-  AMap.plugin('AMap.Geolocation', () => {
-    const geo = new AMap.Geolocation({
-      enableHighAccuracy: true, timeout: 8000,
-      showButton: false, showMarker: false, showCircle: false,
-    });
-    geo.getCurrentPosition((status, result) => {
-      if (status === 'complete' && result.position) {
-        S.myPos = { lng: result.position.lng, lat: result.position.lat };
-        drawMyMarker();
-        S.map.setZoomAndCenter(15, [S.myPos.lng, S.myPos.lat]);
-        if (!first) toast('已回到当前位置');
-      } else {
-        if (first) toast('定位失败,已用默认城市,可手动拖动地图', 3500);
-        else toast('定位失败:' + (result && result.message || '请检查定位权限'), 3500);
-      }
-    });
+function setMyPosition(pos, moveMap, name) {
+  S.myPos = { lng: Number(pos.lng), lat: Number(pos.lat) };
+  S.myPosName = String(name || '').trim();
+  store.set(LAST_POS_KEY, JSON.stringify({ lng: S.myPos.lng, lat: S.myPos.lat, name: S.myPosName, t: Date.now() }));
+  drawMyMarker();
+  if (moveMap) S.map.setZoomAndCenter(15, [S.myPos.lng, S.myPos.lat]);
+}
+
+function addressPart(value) {
+  if (Array.isArray(value)) return value.join('');
+  return String(value || '').trim();
+}
+
+function getPlaceAddress(p) {
+  const parts = [p.pname, p.cityname, p.adname, p.address]
+    .map(addressPart)
+    .filter(Boolean);
+  return parts.filter((part, index) => index === 0 || !parts.slice(0, index).some((prev) => prev === part)).join(' · ');
+}
+
+function hideLocationSuggestions() {
+  const list = $('location-suggestions');
+  list.classList.add('hidden');
+  $('my-location-input').setAttribute('aria-expanded', 'false');
+  activeLocationIndex = -1;
+}
+
+function setActiveLocationSuggestion(index) {
+  const items = $('location-suggestions').querySelectorAll('.location-suggestion');
+  if (!items.length) return;
+  activeLocationIndex = (index + items.length) % items.length;
+  items.forEach((item, i) => {
+    const active = i === activeLocationIndex;
+    item.classList.toggle('active', active);
+    item.setAttribute('aria-selected', String(active));
   });
+  items[activeLocationIndex].scrollIntoView({ block: 'nearest' });
+}
+
+function renderLocationSuggestions(items, message) {
+  const list = $('location-suggestions');
+  locationSuggestions = items;
+  activeLocationIndex = -1;
+  if (message) {
+    list.innerHTML = '<div class="location-suggestions-state">' + escapeHtml(message) + '</div>';
+  } else {
+    list.innerHTML = items.map((p, index) => {
+      const address = getPlaceAddress(p) || '地址信息暂缺';
+      return '<button type="button" class="location-suggestion" role="option" data-index="' + index + '">' +
+        '<span class="location-suggestion-name">' + escapeHtml(p.name || '未命名地点') + '</span>' +
+        '<span class="location-suggestion-address">' + escapeHtml(address) + '</span>' +
+      '</button>';
+    }).join('');
+  }
+  list.classList.remove('hidden');
+  $('my-location-input').setAttribute('aria-expanded', 'true');
+}
+
+function chooseLocationSuggestion(index) {
+  const p = locationSuggestions[index];
+  if (!p || !p.location) return;
+  const input = $('my-location-input');
+  const address = getPlaceAddress(p);
+  const name = p.name || input.value.trim();
+  input.value = address ? name + '，' + address : name;
+  hideLocationSuggestions();
+  setMyPosition({ lng: p.location.lng, lat: p.location.lat }, true, input.value);
+  input.blur();
+  toast('已设置我的位置：' + name);
+  if (MODES[S.currentMode] && MODES[S.currentMode].poi) {
+    clearTimeout(S.searchTimer);
+    S.searchTimer = setTimeout(() => poi.searchPOIsInView(), 120);
+  }
+}
+
+async function loadLocationSuggestions(query, chooseFirst) {
+  const kw = String(query || '').trim();
+  if (!kw) { hideLocationSuggestions(); return; }
+  const seq = ++locationSearchSeq;
+  $('btn-my-location-search').disabled = true;
+  renderLocationSuggestions([], '正在搜索地址...');
+  let items = [];
+  try {
+    items = await searchPlaceSuggestions(kw, 10);
+  } catch (e) {
+    if (seq !== locationSearchSeq) return;
+    renderLocationSuggestions([], '搜索失败，请检查网络后重试');
+    $('btn-my-location-search').disabled = false;
+    return;
+  }
+  if (seq !== locationSearchSeq) return;
+  $('btn-my-location-search').disabled = false;
+  if (!items.length) {
+    renderLocationSuggestions([], '没有找到，请输入更完整的省、市、区或门牌号');
+    return;
+  }
+  renderLocationSuggestions(items);
+  if (chooseFirst) chooseLocationSuggestion(0);
+}
+
+async function setMyPositionBySearch() {
+  const input = $('my-location-input');
+  const kw = input.value.trim();
+  if (!kw) { toast('请输入你的位置，比如小区/地标/地址'); input.focus(); return; }
+  if (locationSuggestions.length && !$('location-suggestions').classList.contains('hidden')) {
+    chooseLocationSuggestion(activeLocationIndex >= 0 ? activeLocationIndex : 0);
+    return;
+  }
+  await loadLocationSuggestions(kw, false);
+}
+
+function getCachedPosition() {
+  try {
+    const p = JSON.parse(store.get(LAST_POS_KEY) || 'null');
+    if (!p || !Number.isFinite(p.lng) || !Number.isFinite(p.lat)) return null;
+    if (Date.now() - Number(p.t || 0) > 7 * 24 * 60 * 60 * 1000) return null;
+    return { lng: p.lng, lat: p.lat, name: p.name || '' };
+  } catch (e) {
+    return null;
+  }
 }
 
 function drawMyMarker() {
@@ -188,7 +308,51 @@ function bindMainUI() {
   document.querySelectorAll('#tabbar .tab').forEach((btn) => {
     btn.addEventListener('click', () => switchMode(btn.dataset.mode));
   });
-  $('btn-locate').addEventListener('click', () => locateMe(false));
+  $('my-location-search').addEventListener('submit', (e) => {
+    e.preventDefault();
+    setMyPositionBySearch();
+  });
+  const locationInput = $('my-location-input');
+  locationInput.addEventListener('compositionstart', () => { locationInputComposing = true; });
+  locationInput.addEventListener('compositionend', () => {
+    locationInputComposing = false;
+    clearTimeout(locationSearchTimer);
+    locationSearchTimer = setTimeout(() => loadLocationSuggestions(locationInput.value, false), 180);
+  });
+  locationInput.addEventListener('input', () => {
+    if (locationInputComposing) return;
+    clearTimeout(locationSearchTimer);
+    const kw = locationInput.value.trim();
+    if (!kw) { hideLocationSuggestions(); return; }
+    locationSuggestions = [];
+    hideLocationSuggestions();
+    locationSearchTimer = setTimeout(() => loadLocationSuggestions(kw, false), 320);
+  });
+  locationInput.addEventListener('keydown', (e) => {
+    if (locationInputComposing || $('location-suggestions').classList.contains('hidden')) return;
+    if (e.key === 'ArrowDown') { e.preventDefault(); setActiveLocationSuggestion(activeLocationIndex + 1); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); setActiveLocationSuggestion(activeLocationIndex - 1); }
+    else if (e.key === 'Enter' && locationSuggestions.length) {
+      e.preventDefault();
+      chooseLocationSuggestion(activeLocationIndex >= 0 ? activeLocationIndex : 0);
+    }
+    else if (e.key === 'Escape') { e.preventDefault(); hideLocationSuggestions(); }
+  });
+  $('location-suggestions').addEventListener('mousedown', (e) => {
+    const item = e.target.closest('.location-suggestion');
+    if (!item) return;
+    e.preventDefault();
+    chooseLocationSuggestion(Number(item.dataset.index));
+  });
+  document.addEventListener('mousedown', (e) => {
+    if (!$('my-location-search').contains(e.target)) hideLocationSuggestions();
+  });
+  $('btn-locate').addEventListener('click', () => {
+    locationInput.focus();
+    locationInput.select();
+    toast('请输入你的位置，比如小区/地标/地址');
+  });
+  if (S.myPosName) locationInput.value = S.myPosName;
   $('chk-hide-others').addEventListener('change', applyMapDressing);
 
   poi.bindPoiUI();

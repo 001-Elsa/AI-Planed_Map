@@ -4,8 +4,15 @@
 import { boot } from './ui/auth.js';
 
 if ('serviceWorker' in navigator && location.protocol !== 'file:') {
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (sessionStorage.getItem('mapgo_sw_reloaded') === '1') return;
+    sessionStorage.setItem('mapgo_sw_reloaded', '1');
+    location.reload();
+  });
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('sw.js').catch(() => {});
+    navigator.serviceWorker.register('sw.js').then(() => {
+      sessionStorage.removeItem('mapgo_sw_reloaded');
+    }).catch(() => {});
   });
 }
 

@@ -10,7 +10,7 @@
 <link rel="manifest" href="manifest.json">
 <link rel="icon" href="icons/icon-192.png">
 <link rel="apple-touch-icon" href="icons/icon-192.png">
-<link rel="stylesheet" href="css/style.css">
+<link rel="stylesheet" href="css/style.css?v=6">
 </head>
 <body>
 
@@ -46,10 +46,25 @@
     <span id="mode-emoji">🗺️</span>
     <span id="mode-name">随行地图</span>
   </div>
+  <form id="my-location-search" class="location-search" role="search">
+    <span class="location-search-icon" aria-hidden="true">⌕</span>
+    <input
+      type="search"
+      id="my-location-input"
+      placeholder="搜索省 / 市 / 区 / 街道 / 门牌号"
+      autocomplete="off"
+      aria-label="搜索我的位置"
+      aria-autocomplete="list"
+      aria-controls="location-suggestions"
+      aria-expanded="false"
+    >
+    <button id="btn-my-location-search" type="submit">搜索</button>
+    <div id="location-suggestions" class="location-suggestions hidden" role="listbox" aria-label="地址候选"></div>
+  </form>
   <div class="top-actions">
     <button id="btn-dark" class="icon-btn" title="夜间模式">🌙</button>
     <button id="btn-user" class="icon-btn" title="账号">👤</button>
-    <button id="btn-locate" class="icon-btn" title="回到我的位置">⌖</button>
+    <button id="btn-locate" class="icon-btn" title="输入我的位置">⌖</button>
     <button id="btn-settings" class="icon-btn" title="地图 Key 设置">⚙</button>
   </div>
 </header>
@@ -291,6 +306,6 @@
   </div>
 </div>
 
-<script type="module" src="js/main.js"></script>
+<script type="module" src="js/main.js?v=6"></script>
 </body>
 </html>

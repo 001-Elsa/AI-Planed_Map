@@ -9,6 +9,7 @@ import { loadAMap } from '../services/amap.js';
 import { initMap, refreshModeData } from '../modes/registry.js';
 
 let authMode = 'login';
+let localAmapConfigPromise = null;
 
 export function showAuth() { $('auth-view').classList.remove('hidden'); }
 export function hideAuth() { $('auth-view').classList.add('hidden'); }
@@ -138,11 +139,32 @@ function bindKeyUI() {
 export function showSetup(show, cancellable) {
   $('setup-mask').classList.toggle('hidden', !show);
   if (show) $('btn-setup-cancel').classList.toggle('hidden', !cancellable);
+  if (show) fillSetupDefaults();
 }
 export function setupErr(msg) {
   const e = $('setup-err');
   e.textContent = msg;
   e.classList.remove('hidden');
+}
+
+function getLocalAmapConfig() {
+  if (!localAmapConfigPromise) {
+    localAmapConfigPromise = import('/js/local-config.js')
+      .then((m) => ({
+        key: String(m.LOCAL_AMAP_KEY || '').trim(),
+        jscode: String(m.LOCAL_AMAP_JSCODE || '').trim(),
+      }))
+      .catch(() => null);
+  }
+  return localAmapConfigPromise;
+}
+
+function fillSetupDefaults() {
+  getLocalAmapConfig().then((cfg) => {
+    if (!cfg || !cfg.key || !cfg.jscode) return;
+    if (!$('inp-key').value) $('inp-key').value = cfg.key;
+    if (!$('inp-jscode').value) $('inp-jscode').value = cfg.jscode;
+  });
 }
 
 /* Key 来源优先级:服务端托管(代理模式)> 本机 localStorage > 弹窗引导 */
@@ -155,5 +177,9 @@ async function startApp() {
   const key = store.get('amap_key');
   const jscode = store.get('amap_jscode');
   if (key && jscode) loadAMap(key, jscode, false, initMap, onerror);
-  else showSetup(true, false);
+  else {
+    const localCfg = await getLocalAmapConfig();
+    if (localCfg && localCfg.key && localCfg.jscode) loadAMap(localCfg.key, localCfg.jscode, false, initMap, onerror);
+    else showSetup(true, false);
+  }
 }

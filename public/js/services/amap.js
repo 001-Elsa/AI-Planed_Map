@@ -13,7 +13,7 @@ export function loadAMap(key, jscode, useProxy, onload, onerror) {
     : { securityJsCode: jscode };
   const s = document.createElement('script');
   s.src = 'https://webapi.amap.com/maps?v=2.0&key=' + encodeURIComponent(key) +
-    '&plugin=AMap.PlaceSearch,AMap.Walking,AMap.Riding,AMap.Driving,AMap.Transfer,AMap.Weather,AMap.HeatMap,AMap.Geolocation,AMap.Scale';
+    '&plugin=AMap.PlaceSearch,AMap.Walking,AMap.Riding,AMap.Driving,AMap.Transfer,AMap.Weather,AMap.HeatMap,AMap.Scale';
   s.onload = onload;
   s.onerror = onerror;
   document.head.appendChild(s);
@@ -104,6 +104,22 @@ export function searchPlaceByKeyword(kw) {
     ps.search(kw, (status, result) => {
       const p = status === 'complete' && result.poiList && result.poiList.pois[0];
       resolve(p && p.location ? p : null);
+    });
+  });
+}
+
+/* ---- 地址搜索候选:返回多个带省/市/区/详细地址的 POI ---- */
+export function searchPlaceSuggestions(kw, pageSize = 10) {
+  return new Promise((resolve) => {
+    const ps = new AMap.PlaceSearch({
+      pageSize,
+      pageIndex: 1,
+      extensions: 'all',
+      autoFitView: false,
+    });
+    ps.search(kw, (status, result) => {
+      const pois = status === 'complete' && result.poiList && result.poiList.pois;
+      resolve(Array.isArray(pois) ? pois.filter((p) => p && p.location) : []);
     });
   });
 }
