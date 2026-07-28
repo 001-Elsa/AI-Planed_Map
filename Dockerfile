@@ -1,18 +1,20 @@
-# 随行地图 MapGo — 零第三方依赖,无需 npm install
-FROM node:22-alpine
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PORT=3000
 
 WORKDIR /app
-COPY package.json server.js ./
-COPY src ./src
-COPY public ./public
+COPY backend/requirements.txt ./backend/requirements.txt
+RUN pip install --no-cache-dir -r backend/requirements.txt
 
-ENV NODE_ENV=production \
-    PORT=3000 \
-    DATA_DIR=/app/data
+COPY backend ./backend
+COPY public ./public
+COPY alembic.ini ./
 
 EXPOSE 3000
-
 HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
-  CMD wget -qO- http://127.0.0.1:3000/api/health || exit 1
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3000/api/health', timeout=2)"
 
-CMD ["node", "server.js"]
+CMD ["python", "-m", "uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "3000"]
+

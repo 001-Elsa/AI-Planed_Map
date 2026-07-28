@@ -218,18 +218,21 @@
 <!-- 计划模式面板 -->
 <div id="panel-plan" class="panel hidden">
   <div class="panel-row">
-    <strong>今天要办的事(每行一件)</strong>
+    <strong>AI 智能出行规划</strong>
     <button id="btn-plan-fold" class="small-btn">收起</button>
   </div>
   <div id="plan-body">
-    <textarea id="plan-input" rows="4" placeholder="例如:&#10;买菜 超市&#10;取快递&#10;药店买感冒药&#10;吃午饭 面馆"></textarea>
+    <textarea id="plan-input" rows="4" placeholder="例如：明天下午两点从学校出发，先取快递，再找一家评分高的蛋糕店，顺路买水果，五点前到医院，尽量少走路。"></textarea>
     <div class="panel-row">
       <div class="seg" id="plan-mode-seg">
         <button data-tmode="walk" class="seg-btn active">🚶 步行</button>
         <button data-tmode="ride" class="seg-btn">🚲 骑行</button>
         <button data-tmode="drive" class="seg-btn">🚗 驾车</button>
       </div>
-      <button id="btn-plan-go" class="primary-btn">最短路径规划</button>
+      <div style="display:flex;gap:6px">
+        <button id="btn-plan-go" class="small-btn">经典规划</button>
+        <button id="btn-ai-plan" class="primary-btn">✨ AI 规划</button>
+      </div>
     </div>
     <div class="panel-row plan-time-row">
       <label>出发 <input type="time" id="plan-depart"></label>

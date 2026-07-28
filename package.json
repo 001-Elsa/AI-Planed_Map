@@ -1,11 +1,13 @@
 {
-  "name": "mapgo",
-  "version": "5.1.0",
-  "description": "随行地图 MapGo — 多模式实用地图(高德 JS API)+ 用户系统(零依赖 Node + SQLite)",
+  "name": "mapgo-ai-planner",
+  "version": "6.0.0",
+  "description": "MapGo 智能出行规划平台：大模型意图解析、真实 POI 检索与确定性约束路线优化",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
+    "start": "python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 3000",
+    "start:legacy": "node server.js",
     "test": "node --test test/api.test.js",
+    "test:python": "python -m pytest -c backend/pytest.ini",
     "test:e2e": "node test/e2e.run.cjs"
   },
   "engines": {

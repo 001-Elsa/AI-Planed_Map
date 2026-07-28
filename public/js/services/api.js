@@ -48,6 +48,24 @@ export const API = {
   listPlans() { return API.req('GET', '/plans?limit=100'); },
   addPlan(name, data) { return API.req('POST', '/plans', { name, data }); },
   delPlan(id) { return API.req('DELETE', '/plans/' + id); },
+  aiPlan(request, idempotencyKey) {
+    const headers = { 'Content-Type': 'application/json' };
+    if (API.token) headers.Authorization = 'Bearer ' + API.token;
+    if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
+    return fetch('/api/ai/plans', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(request),
+    }).then(async (res) => {
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data || data.ok === false) {
+        const err = new Error((data && data.msg) || ('请求失败 ' + res.status));
+        err.status = res.status;
+        throw err;
+      }
+      return data.data;
+    });
+  },
 
   listTracks(kind, limit) {
     const q = ['limit=' + (limit || 100)];

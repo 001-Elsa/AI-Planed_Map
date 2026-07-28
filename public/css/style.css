@@ -424,6 +424,13 @@ body {
 .plan-step .done-chk { align-self: center; width: 17px; height: 17px; accent-color: #16a34a; }
 .plan-step.done { opacity: .45; }
 .plan-step.done .name, .plan-step.done b { text-decoration: line-through; }
+.ai-card {
+  margin: 8px 0; padding: 9px 11px; border: 1px solid #b9cdfd;
+  border-radius: 10px; background: #f3f7ff; color: #334155; font-size: 13px;
+}
+.ai-card p { margin: 4px 0 0; }
+.ai-card.err { border-color: #fecaca; background: #fff5f5; }
+body.dark .ai-card { background: #1d2a44; border-color: #3e5b91; color: #dbe7ff; }
 
 /* ============ v4 新增组件 ============ */
 /* 回放小人 */

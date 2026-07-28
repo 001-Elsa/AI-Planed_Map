@@ -32,6 +32,7 @@ export function bindPlanUI() {
     });
   });
   $('btn-plan-go').addEventListener('click', runPlan);
+  $('btn-ai-plan').addEventListener('click', runAIPlan);
   $('btn-plan-save').addEventListener('click', savePlan);
   $('btn-plan-share').addEventListener('click', sharePlan);
   $('btn-plan-restore').addEventListener('click', () => runPlan());
@@ -39,6 +40,65 @@ export function bindPlanUI() {
     const folded = $('plan-body').classList.toggle('hidden');
     $('btn-plan-fold').textContent = folded ? '展开' : '收起';
   });
+}
+
+async function runAIPlan() {
+  if (!requireLogin()) return;
+  const text = $('plan-input').value.trim();
+  if (!text) { toast('请先描述你的出行需求'); return; }
+  const origin = S.myPos || (() => {
+    const center = S.map.getCenter();
+    return { lng: center.lng, lat: center.lat };
+  })();
+  const button = $('btn-ai-plan');
+  const out = $('plan-result');
+  button.disabled = true;
+  button.textContent = '理解需求中…';
+  clearAll();
+  try {
+    const mode = S.planTravelMode === 'drive' ? 'driving' : S.planTravelMode === 'ride' ? 'cycling' : 'walking';
+    const result = await API.aiPlan({
+      text,
+      origin,
+      transport_mode: mode,
+      default_service_duration_minutes: Math.max(0, parseInt($('plan-stay').value, 10) || 0),
+    }, crypto.randomUUID());
+    if (result.status === 'need_clarification') {
+      out.innerHTML = '<div class="ai-card"><b>还需要你确认</b>' +
+        result.questions.map((q) => '<p>' + escapeHtml(q.message || q.field) + '</p>').join('') + '</div>';
+      return;
+    }
+    const ordered = result.stops.map((stop) => ({
+      task: stop.task.description,
+      name: stop.poi.name,
+      address: stop.poi.address || '',
+      loc: stop.poi.location,
+    }));
+    const legs = [];
+    let previous = origin;
+    for (const stop of ordered) {
+      legs.push(await routeLeg(previous, stop.loc, S.planTravelMode));
+      previous = stop.loc;
+    }
+    S.lastPlanCtx = { origin, stops: ordered, legs, missed: [] };
+    renderPlanResult(origin, ordered, legs, [], result.algorithm === 'exact-permutation', false);
+    const banner = document.createElement('div');
+    banner.className = result.status === 'infeasible' ? 'ai-card err' : 'ai-card';
+    banner.innerHTML = '<b>' + (result.status === 'infeasible' ? '约束冲突' : '规划说明') + '</b><p>' +
+      escapeHtml(result.explanation || '') + '</p>' +
+      (result.conflicts || []).map((item) => '<p>• ' + escapeHtml(item) + '</p>').join('');
+    out.prepend(banner);
+    S.lastPlan = {
+      text, travelMode: S.planTravelMode, depart: $('plan-depart').value,
+      stay: $('plan-stay').value, aiResult: result,
+    };
+    $('plan-save-row').classList.remove('hidden');
+  } catch (err) {
+    out.innerHTML = '<div class="err">AI 规划失败：' + escapeHtml(err.message || String(err)) + '</div>';
+  } finally {
+    button.disabled = false;
+    button.textContent = '✨ AI 规划';
+  }
 }
 
 function travelModeName() {

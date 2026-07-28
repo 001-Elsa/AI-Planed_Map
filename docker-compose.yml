@@ -1,14 +1,37 @@
 services:
-  mapgo:
+  api:
     build: .
     ports:
       - "3000:3000"
-    volumes:
-      - ./data:/app/data
     environment:
+      DATABASE_URL: postgresql+asyncpg://mapgo:mapgo@postgres:5432/mapgo
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      ADMIN_INIT_TOKEN: ${ADMIN_INIT_TOKEN:-}
+      AMAP_WEB_KEY: ${AMAP_WEB_KEY:-}
       AMAP_KEY: ${AMAP_KEY:-}
       AMAP_JSCODE: ${AMAP_JSCODE:-}
-      ADMIN_INIT_TOKEN: ${ADMIN_INIT_TOKEN:-}
-      ENABLE_HSTS: ${ENABLE_HSTS:-}
-      TZ: Asia/Shanghai
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4.1-mini}
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: mapgo
+      POSTGRES_USER: mapgo
+      POSTGRES_PASSWORD: mapgo
+    volumes:
+      - mapgo_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mapgo -d mapgo"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  mapgo_pgdata:
+
