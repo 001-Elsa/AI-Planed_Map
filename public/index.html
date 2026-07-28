@@ -258,6 +258,34 @@
   </div>
 </div>
 
+<!-- AI-Planned 结构化行程时间线（桌面右栏 / 移动端抽屉） -->
+<aside id="agent-timeline" class="agent-timeline hidden" aria-label="随行 Agent 行程状态">
+  <div class="timeline-head">
+    <div>
+      <span class="eyebrow">MAPGO COMPANION</span>
+      <strong>实时行程控制台</strong>
+    </div>
+    <span id="trip-state-badge" class="trip-state">PLAN_READY</span>
+  </div>
+  <div id="timeline-proof" class="timeline-proof"></div>
+  <div class="constraint-board">
+    <span><i class="ok"></i> 硬约束</span>
+    <span><i id="timeline-data-dot"></i> 数据可信度</span>
+    <span><i class="ok"></i> 版本可回滚</span>
+  </div>
+  <div id="structured-timeline" class="structured-timeline">
+    <p class="muted">生成 AI 计划后显示逐站 ETA、风险和数据来源。</p>
+  </div>
+  <div id="agent-risk-card" class="agent-risk-card hidden"></div>
+  <div id="plan-patch-card" class="plan-patch-card hidden"></div>
+  <div class="timeline-actions">
+    <button id="btn-trip-start" class="primary-btn">确认并开始行程</button>
+    <button id="btn-trip-pause" class="small-btn hidden">暂停</button>
+    <button id="btn-location-consent" class="small-btn">精确定位：未授权</button>
+    <button id="btn-trip-replan" class="small-btn hidden">评估并重规划</button>
+  </div>
+</aside>
+
 <!-- 收藏面板 -->
 <div id="panel-fav" class="panel hidden">
   <div class="panel-row">

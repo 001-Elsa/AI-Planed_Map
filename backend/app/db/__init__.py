@@ -1,2 +1,1 @@
 """Database session and migrations."""
-

@@ -45,4 +45,3 @@ def token_hash(token: str) -> str:
 
 def expires_at(days: int) -> datetime:
     return datetime.now(timezone.utc) + timedelta(days=days)
-

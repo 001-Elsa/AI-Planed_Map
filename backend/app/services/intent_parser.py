@@ -16,7 +16,6 @@ from backend.app.schemas.ai_intent import (
     TransportMode,
 )
 
-
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
@@ -30,12 +29,25 @@ class RuleBasedIntentParser:
     """Deterministic fallback for local development and graceful degradation."""
 
     name = "rule-based-v1"
+    input_tokens = 0
+    output_tokens = 0
     _action_split = re.compile(r"(?:，|,|；|;|\n|然后|再|接着|最后|顺路|先)")
 
     def _datetime(self, text: str, context: str = "") -> datetime | None:
         for chinese, number in {
-            "十二": "12", "十一": "11", "十": "10", "九": "9", "八": "8",
-            "七": "7", "六": "6", "五": "5", "四": "4", "三": "3", "两": "2", "二": "2", "一": "1",
+            "十二": "12",
+            "十一": "11",
+            "十": "10",
+            "九": "9",
+            "八": "8",
+            "七": "7",
+            "六": "6",
+            "五": "5",
+            "四": "4",
+            "三": "3",
+            "两": "2",
+            "二": "2",
+            "一": "1",
         }.items():
             text = text.replace(chinese, number)
         match = re.search(r"(?:(明天|后天|今天).{0,8})?([0-2]?\d)(?:[:：点时]([0-5]?\d)?)", text)
@@ -94,8 +106,12 @@ class RuleBasedIntentParser:
             )
             if deadline_match:
                 deadline = self._datetime(deadline_match.group(1), text)
-                if deadline and departure and not any(
-                    word in deadline_match.group(1) for word in ("今天", "明天", "后天")
+                if (
+                    deadline
+                    and departure
+                    and not any(
+                        word in deadline_match.group(1) for word in ("今天", "明天", "后天")
+                    )
                 ):
                     deadline = deadline.replace(
                         year=departure.year, month=departure.month, day=departure.day
@@ -133,8 +149,11 @@ class RuleBasedIntentParser:
 class OpenAICompatibleIntentParser:
     name = "openai-compatible"
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, client: httpx.AsyncClient) -> None:
         self.settings = settings
+        self.client = client
+        self.input_tokens = 0
+        self.output_tokens = 0
 
     async def parse(self, text: str) -> PlanningIntent:
         schema = PlanningIntent.model_json_schema()
@@ -154,6 +173,7 @@ class OpenAICompatibleIntentParser:
         make_strict(schema)
         payload = {
             "model": self.settings.llm_model,
+            "max_tokens": self.settings.max_llm_output_tokens,
             "messages": [
                 {
                     "role": "system",
@@ -172,20 +192,23 @@ class OpenAICompatibleIntentParser:
         }
         headers = {"Authorization": f"Bearer {self.settings.llm_api_key}"}
         try:
-            async with httpx.AsyncClient(timeout=self.settings.external_timeout_seconds) as client:
-                response = await client.post(
-                    f"{self.settings.llm_base_url.rstrip('/')}/chat/completions",
-                    json=payload,
-                    headers=headers,
-                )
-                response.raise_for_status()
-            content = response.json()["choices"][0]["message"]["content"]
+            response = await self.client.post(
+                f"{self.settings.llm_base_url.rstrip('/')}/chat/completions",
+                json=payload,
+                headers=headers,
+            )
+            response.raise_for_status()
+            response_data = response.json()
+            content = response_data["choices"][0]["message"]["content"]
+            usage = response_data.get("usage") or {}
+            self.input_tokens = int(usage.get("prompt_tokens") or 0)
+            self.output_tokens = int(usage.get("completion_tokens") or 0)
             return PlanningIntent.model_validate(json.loads(content))
         except (httpx.HTTPError, KeyError, json.JSONDecodeError, ValidationError) as exc:
             raise UpstreamError("模型输出未通过结构校验", {"reason": str(exc)}) from exc
 
 
-def build_intent_parser(settings: Settings) -> IntentParser:
+def build_intent_parser(settings: Settings, client: httpx.AsyncClient) -> IntentParser:
     if settings.llm_api_key:
-        return OpenAICompatibleIntentParser(settings)
+        return OpenAICompatibleIntentParser(settings, client)
     return RuleBasedIntentParser()

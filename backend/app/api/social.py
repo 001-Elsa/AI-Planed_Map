@@ -1,6 +1,7 @@
 import json
 import secrets
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from fastapi import APIRouter
 from pydantic import BaseModel
@@ -9,7 +10,6 @@ from sqlalchemy import or_, select
 from backend.app.api.deps import CurrentUser, Db
 from backend.app.core.exceptions import AppError
 from backend.app.models import Favorite, Friend, Share, Track, User
-
 
 router = APIRouter(tags=["sharing"])
 
@@ -43,11 +43,25 @@ async def create_share(body: ShareCreate, user: CurrentUser, db: Db):
 
 @router.get("/shares")
 async def list_shares(user: CurrentUser, db: Db):
-    rows = list((await db.scalars(select(Share).where(Share.user_id == user.id).order_by(Share.id.desc()))).all())
-    return {"ok": True, "data": [
-        {"id": row.id, "token": row.token, "type": row.type, "created_at": row.created_at.isoformat(sep=" ")}
-        for row in rows
-    ]}
+    rows = list(
+        (
+            await db.scalars(
+                select(Share).where(Share.user_id == user.id).order_by(Share.id.desc())
+            )
+        ).all()
+    )
+    return {
+        "ok": True,
+        "data": [
+            {
+                "id": row.id,
+                "token": row.token,
+                "type": row.type,
+                "created_at": row.created_at.isoformat(sep=" "),
+            }
+            for row in rows
+        ],
+    }
 
 
 @router.delete("/shares/{item_id}")
@@ -68,10 +82,15 @@ async def public_share(token: str, db: Db):
     if created < datetime.now(timezone.utc) - timedelta(days=180):
         raise AppError(404, "SHARE_EXPIRED", "分享不存在或已过期")
     owner = await db.get(User, item.user_id)
-    return {"ok": True, "data": {
-        "type": item.type, "payload": json.loads(item.payload),
-        "nickname": owner.nickname if owner else "", "created_at": item.created_at.isoformat(sep=" "),
-    }}
+    return {
+        "ok": True,
+        "data": {
+            "type": item.type,
+            "payload": json.loads(item.payload),
+            "nickname": owner.nickname if owner else "",
+            "created_at": item.created_at.isoformat(sep=" "),
+        },
+    }
 
 
 @router.post("/friends/request")
@@ -81,10 +100,14 @@ async def request_friend(body: FriendRequest, user: CurrentUser, db: Db):
         raise AppError(404, "USER_NOT_FOUND", "没有这个用户")
     if target.id == user.id:
         raise AppError(400, "FRIEND_SELF", "不能加自己为好友")
-    existing = await db.scalar(select(Friend).where(or_(
-        (Friend.user_id == user.id) & (Friend.friend_id == target.id),
-        (Friend.user_id == target.id) & (Friend.friend_id == user.id),
-    )))
+    existing = await db.scalar(
+        select(Friend).where(
+            or_(
+                (Friend.user_id == user.id) & (Friend.friend_id == target.id),
+                (Friend.user_id == target.id) & (Friend.friend_id == user.id),
+            )
+        )
+    )
     if existing:
         raise AppError(409, "FRIEND_REQUEST_EXISTS", "已有好友关系或待处理请求")
     db.add(Friend(user_id=user.id, friend_id=target.id))
@@ -94,14 +117,25 @@ async def request_friend(body: FriendRequest, user: CurrentUser, db: Db):
 
 @router.get("/friends")
 async def list_friends(user: CurrentUser, db: Db):
-    rows = list((await db.scalars(select(Friend).where(or_(
-        Friend.user_id == user.id, Friend.friend_id == user.id
-    )))).all())
+    rows = list(
+        (
+            await db.scalars(
+                select(Friend).where(or_(Friend.user_id == user.id, Friend.friend_id == user.id))
+            )
+        ).all()
+    )
     accepted, incoming, outgoing = [], [], []
     for row in rows:
         other_id = row.friend_id if row.user_id == user.id else row.user_id
         other = await db.get(User, other_id)
-        item = {"id": row.id, "uid": other_id, "username": other.username, "nickname": other.nickname}
+        if other is None:
+            continue
+        item = {
+            "id": row.id,
+            "uid": other_id,
+            "username": other.username,
+            "nickname": other.nickname,
+        }
         if row.status == "accepted":
             accepted.append(item)
         elif row.friend_id == user.id:
@@ -134,13 +168,17 @@ async def delete_friend(item_id: int, user: CurrentUser, db: Db):
 
 
 async def accepted_friend(db: Db, first: int, second: int) -> bool:
-    return bool(await db.scalar(select(Friend.id).where(
-        Friend.status == "accepted",
-        or_(
-            (Friend.user_id == first) & (Friend.friend_id == second),
-            (Friend.user_id == second) & (Friend.friend_id == first),
-        ),
-    )))
+    return bool(
+        await db.scalar(
+            select(Friend.id).where(
+                Friend.status == "accepted",
+                or_(
+                    (Friend.user_id == first) & (Friend.friend_id == second),
+                    (Friend.user_id == second) & (Friend.friend_id == first),
+                ),
+            )
+        )
+    )
 
 
 @router.get("/friends/{friend_id}/favorites")
@@ -148,35 +186,65 @@ async def friend_favorites(friend_id: int, user: CurrentUser, db: Db):
     if not await accepted_friend(db, user.id, friend_id):
         raise AppError(403, "NOT_FRIENDS", "你们还不是好友")
     other = await db.get(User, friend_id)
-    rows = list((await db.scalars(select(Favorite).where(Favorite.user_id == friend_id).order_by(Favorite.id.desc()))).all())
-    return {"ok": True, "data": {
-        "nickname": other.nickname if other else "",
-        "favorites": [
-            {"name": row.name, "address": row.address, "lng": row.lng, "lat": row.lat, "mode": row.mode}
-            for row in rows
-        ],
-    }}
+    rows = list(
+        (
+            await db.scalars(
+                select(Favorite).where(Favorite.user_id == friend_id).order_by(Favorite.id.desc())
+            )
+        ).all()
+    )
+    return {
+        "ok": True,
+        "data": {
+            "nickname": other.nickname if other else "",
+            "favorites": [
+                {
+                    "name": row.name,
+                    "address": row.address,
+                    "lng": row.lng,
+                    "lat": row.lat,
+                    "mode": row.mode,
+                }
+                for row in rows
+            ],
+        },
+    }
 
 
 @router.get("/leaderboard")
 async def leaderboard(user: CurrentUser, db: Db, days: int = 7):
     days = min(365, max(1, days))
-    relations = list((await db.scalars(select(Friend).where(
-        Friend.status == "accepted", or_(Friend.user_id == user.id, Friend.friend_id == user.id)
-    ))).all())
+    relations = list(
+        (
+            await db.scalars(
+                select(Friend).where(
+                    Friend.status == "accepted",
+                    or_(Friend.user_id == user.id, Friend.friend_id == user.id),
+                )
+            )
+        ).all()
+    )
     user_ids = [user.id] + [
         row.friend_id if row.user_id == user.id else row.user_id for row in relations
     ]
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    result = []
+    result: list[dict[str, Any]] = []
     for user_id in user_ids:
         person = await db.get(User, user_id)
-        tracks = list((await db.scalars(select(Track).where(
-            Track.user_id == user_id, Track.created_at >= cutoff
-        ))).all())
-        result.append({
-            "uid": user_id, "nickname": person.nickname if person else "",
-            "distance": sum(item.distance for item in tracks), "count": len(tracks),
-        })
+        tracks = list(
+            (
+                await db.scalars(
+                    select(Track).where(Track.user_id == user_id, Track.created_at >= cutoff)
+                )
+            ).all()
+        )
+        result.append(
+            {
+                "uid": user_id,
+                "nickname": person.nickname if person else "",
+                "distance": sum(item.distance for item in tracks),
+                "count": len(tracks),
+            }
+        )
     result.sort(key=lambda item: item["distance"], reverse=True)
     return {"ok": True, "data": {"days": days, "rows": result, "me": user.id}}

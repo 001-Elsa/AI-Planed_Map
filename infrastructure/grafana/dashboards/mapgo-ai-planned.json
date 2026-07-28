@@ -1,0 +1,39 @@
+{
+  "title": "MapGo AI-Planned Production",
+  "uid": "mapgo-ai-planned",
+  "schemaVersion": 39,
+  "refresh": "15s",
+  "time": {"from": "now-6h", "to": "now"},
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "API request rate",
+      "gridPos": {"x": 0, "y": 0, "w": 8, "h": 8},
+      "targets": [{"expr": "sum(rate(mapgo_api_requests_total[5m])) by (status)", "legendFormat": "{{status}}"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Planning latency",
+      "gridPos": {"x": 8, "y": 0, "w": 8, "h": 8},
+      "targets": [{"expr": "rate(mapgo_planning_duration_seconds_sum[5m]) / rate(mapgo_planning_duration_seconds_count[5m])", "legendFormat": "average"}]
+    },
+    {
+      "type": "stat",
+      "title": "Fallback edges",
+      "gridPos": {"x": 16, "y": 0, "w": 8, "h": 8},
+      "targets": [{"expr": "sum(increase(mapgo_route_fallback_edges_total[6h]))"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Map provider errors",
+      "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8},
+      "targets": [{"expr": "sum(rate(mapgo_map_api_errors_total[5m])) by (type)", "legendFormat": "{{type}}"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Planning results",
+      "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
+      "targets": [{"expr": "sum(increase(mapgo_planning_results_total[1h])) by (status)", "legendFormat": "{{status}}"}]
+    }
+  ]
+}

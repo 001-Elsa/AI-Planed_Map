@@ -5,8 +5,11 @@ on:
     branches: [main, master]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
-  python:
+  quality:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -15,29 +18,86 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: backend/requirements.txt
-      - run: pip install -r backend/requirements.txt pytest
-      - name: Compile
-        run: python -m compileall -q backend
-      - name: Unit and integration tests
-        env:
-          DATABASE_URL: sqlite+aiosqlite:////tmp/mapgo-ci.db
-          MOCK_MAP_PROVIDER: "true"
-          ENVIRONMENT: test
-        run: python -m pytest -c backend/pytest.ini
+      - run: pip install -r backend/requirements.txt ruff mypy bandit pip-audit
+      - run: ruff check backend
+      - run: ruff format --check backend
+      - run: mypy backend/app
+      - run: bandit -q -r backend/app
+      - run: pip-audit -r backend/requirements.txt
 
-  legacy-and-e2e:
+  python-postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: mapgo_test
+          POSTGRES_USER: mapgo
+          POSTGRES_PASSWORD: mapgo_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mapgo -d mapgo_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+asyncpg://mapgo:mapgo_test@localhost:5432/mapgo_test
+      MOCK_MAP_PROVIDER: "true"
+      ENVIRONMENT: test
+      REDIS_URL: redis://localhost:6379/15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - run: pip install -r backend/requirements.txt
+      - name: Migration upgrade, rollback and upgrade
+        run: |
+          alembic upgrade head
+          alembic downgrade 0001
+          alembic upgrade head
+          alembic check
+      - name: Tests and coverage
+        run: python -m pytest -c backend/pytest.ini --cov --cov-report=term-missing --cov-report=xml
+      - name: AI offline evaluation
+        run: python backend/tests/evaluation/evaluate_intent.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.xml
+
+  frontend-e2e:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22.x
-      - name: Legacy API regression tests
-        run: npm test
-      - name: Install Playwright
-        run: |
-          npm i -D playwright
-          npx playwright install --with-deps chromium
-      - name: Frontend E2E smoke tests
-        run: npm run test:e2e
+      - run: npm install
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
 
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: mapgo:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

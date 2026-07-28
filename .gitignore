@@ -1,6 +1,8 @@
 data/
 *.db
 .pytest_cache/
+.coverage
+coverage.xml
 __pycache__/
 .venv/
 node_modules/

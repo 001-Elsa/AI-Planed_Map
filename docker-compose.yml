@@ -1,21 +1,80 @@
+name: mapgo
+
+x-api-environment: &api-environment
+  DATABASE_URL: postgresql+asyncpg://mapgo:${POSTGRES_PASSWORD:-mapgo_dev_only}@postgres:5432/mapgo
+  ENVIRONMENT: ${ENVIRONMENT:-development}
+  ADMIN_INIT_TOKEN: ${ADMIN_INIT_TOKEN:-}
+  AMAP_WEB_KEY: ${AMAP_WEB_KEY:-}
+  AMAP_KEY: ${AMAP_KEY:-}
+  AMAP_JSCODE: ${AMAP_JSCODE:-}
+  LLM_API_KEY: ${LLM_API_KEY:-}
+  LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
+  LLM_MODEL: ${LLM_MODEL:-gpt-4.1-mini}
+  REDIS_URL: redis://redis:6379/0
+  MOCK_WEATHER_PROVIDER: ${MOCK_WEATHER_PROVIDER:-false}
+  FEATURE_COMPANION_AGENT: ${FEATURE_COMPANION_AGENT:-true}
+  LOCATION_ENCRYPTION_KEY: ${LOCATION_ENCRYPTION_KEY:-}
+
 services:
+  migrate:
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    environment: *api-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
   api:
     build: .
     ports:
       - "3000:3000"
-    environment:
-      DATABASE_URL: postgresql+asyncpg://mapgo:mapgo@postgres:5432/mapgo
-      ENVIRONMENT: ${ENVIRONMENT:-development}
-      ADMIN_INIT_TOKEN: ${ADMIN_INIT_TOKEN:-}
-      AMAP_WEB_KEY: ${AMAP_WEB_KEY:-}
-      AMAP_KEY: ${AMAP_KEY:-}
-      AMAP_JSCODE: ${AMAP_JSCODE:-}
-      LLM_API_KEY: ${LLM_API_KEY:-}
-      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
-      LLM_MODEL: ${LLM_MODEL:-gpt-4.1-mini}
+    environment: *api-environment
     depends_on:
-      postgres:
+      migrate:
+        condition: service_completed_successfully
+      redis:
         condition: service_healthy
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "1.50"
+          memory: 768M
+
+  worker:
+    build: .
+    command: ["python", "-m", "backend.app.worker"]
+    environment: *api-environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    security_opt:
+      - no-new-privileges:true
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    volumes:
+      - mapgo_redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     restart: unless-stopped
 
   postgres:
@@ -23,7 +82,7 @@ services:
     environment:
       POSTGRES_DB: mapgo
       POSTGRES_USER: mapgo
-      POSTGRES_PASSWORD: mapgo
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mapgo_dev_only}
     volumes:
       - mapgo_pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -31,7 +90,39 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 512M
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    profiles: ["observability"]
+    command: ["--config.file=/etc/prometheus/prometheus.yml"]
+    volumes:
+      - ./infrastructure/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    profiles: ["observability"]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-mapgo_dev_only}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./infrastructure/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infrastructure/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
 
 volumes:
   mapgo_pgdata:
-
+  mapgo_redisdata:

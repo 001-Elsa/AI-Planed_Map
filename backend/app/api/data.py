@@ -10,7 +10,6 @@ from backend.app.api.deps import CurrentUser, Db
 from backend.app.core.exceptions import AppError
 from backend.app.models import Checkin, Favorite, Plan, PlanStop, Track
 
-
 router = APIRouter(tags=["user-data"])
 
 
@@ -56,12 +55,20 @@ async def paged(db: Db, model, user_id: int, limit: int, offset: int, extra=None
     condition = model.user_id == user_id
     if extra is not None:
         condition = condition & extra
-    rows = list((await db.scalars(select(model).where(condition).order_by(model.id.desc()).limit(limit).offset(offset))).all())
+    rows = list(
+        (
+            await db.scalars(
+                select(model).where(condition).order_by(model.id.desc()).limit(limit).offset(offset)
+            )
+        ).all()
+    )
     return [row_dict(row) for row in rows]
 
 
 @router.get("/plans")
-async def list_plans(user: CurrentUser, db: Db, limit: int = Query(100, ge=1, le=200), offset: int = Query(0, ge=0)):
+async def list_plans(
+    user: CurrentUser, db: Db, limit: int = Query(100, ge=1, le=200), offset: int = Query(0, ge=0)
+):
     return {"ok": True, "data": await paged(db, Plan, user.id, limit, offset)}
 
 
@@ -81,19 +88,23 @@ async def create_plan(body: PlanCreate, user: CurrentUser, db: Db):
                     task = stop["task"]
                     poi = stop["poi"]
                     location = poi["location"]
-                    db.add(PlanStop(
-                        plan_id=plan.id,
-                        position=position,
-                        task_description=str(task["description"])[:300],
-                        poi_id=str(poi.get("id") or "")[:80] or None,
-                        poi_name=str(poi.get("name") or "")[:200] or None,
-                        longitude=float(location["lng"]),
-                        latitude=float(location["lat"]),
-                        eta=datetime.fromisoformat(stop["arrival_time"]),
-                        service_duration_minutes=int(task.get("service_duration_minutes") or 0),
-                        deadline=datetime.fromisoformat(task["deadline"]) if task.get("deadline") else None,
-                        constraint_satisfied=bool(stop.get("constraint_satisfied", True)),
-                    ))
+                    db.add(
+                        PlanStop(
+                            plan_id=plan.id,
+                            position=position,
+                            task_description=str(task["description"])[:300],
+                            poi_id=str(poi.get("id") or "")[:80] or None,
+                            poi_name=str(poi.get("name") or "")[:200] or None,
+                            longitude=float(location["lng"]),
+                            latitude=float(location["lat"]),
+                            eta=datetime.fromisoformat(stop["arrival_time"]),
+                            service_duration_minutes=int(task.get("service_duration_minutes") or 0),
+                            deadline=datetime.fromisoformat(task["deadline"])
+                            if task.get("deadline")
+                            else None,
+                            constraint_satisfied=bool(stop.get("constraint_satisfied", True)),
+                        )
+                    )
                 except (KeyError, TypeError, ValueError):
                     continue
     await db.commit()
@@ -110,16 +121,22 @@ async def delete_plan(item_id: int, user: CurrentUser, db: Db):
 
 
 @router.get("/favorites")
-async def list_favorites(user: CurrentUser, db: Db, limit: int = Query(100, ge=1, le=200), offset: int = Query(0, ge=0)):
+async def list_favorites(
+    user: CurrentUser, db: Db, limit: int = Query(100, ge=1, le=200), offset: int = Query(0, ge=0)
+):
     return {"ok": True, "data": await paged(db, Favorite, user.id, limit, offset)}
 
 
 @router.post("/favorites")
 async def create_favorite(body: FavoriteCreate, user: CurrentUser, db: Db):
-    duplicate = await db.scalar(select(Favorite).where(
-        Favorite.user_id == user.id, Favorite.name == body.name,
-        func.abs(Favorite.lng - body.lng) < 0.000001, func.abs(Favorite.lat - body.lat) < 0.000001,
-    ))
+    duplicate = await db.scalar(
+        select(Favorite).where(
+            Favorite.user_id == user.id,
+            Favorite.name == body.name,
+            func.abs(Favorite.lng - body.lng) < 0.000001,
+            func.abs(Favorite.lat - body.lat) < 0.000001,
+        )
+    )
     if duplicate:
         raise AppError(409, "FAVORITE_EXISTS", "已经收藏过啦")
     item = Favorite(user_id=user.id, **body.model_dump())
@@ -138,7 +155,13 @@ async def delete_favorite(item_id: int, user: CurrentUser, db: Db):
 
 
 @router.get("/tracks")
-async def list_tracks(user: CurrentUser, db: Db, kind: str | None = None, limit: int = Query(100, ge=1, le=200), offset: int = Query(0, ge=0)):
+async def list_tracks(
+    user: CurrentUser,
+    db: Db,
+    kind: str | None = None,
+    limit: int = Query(100, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
     extra = Track.kind == kind if kind else None
     return {"ok": True, "data": await paged(db, Track, user.id, limit, offset, extra)}
 
@@ -146,8 +169,13 @@ async def list_tracks(user: CurrentUser, db: Db, kind: str | None = None, limit:
 @router.post("/tracks")
 async def create_track(body: TrackCreate, user: CurrentUser, db: Db):
     item = Track(
-        user_id=user.id, kind=body.kind, name=body.name, distance=body.distance,
-        duration=body.duration, path=json.dumps(body.path), is_real=body.real,
+        user_id=user.id,
+        kind=body.kind,
+        name=body.name,
+        distance=body.distance,
+        duration=body.duration,
+        path=json.dumps(body.path),
+        is_real=body.real,
     )
     db.add(item)
     await db.commit()
@@ -164,7 +192,9 @@ async def delete_track(item_id: int, user: CurrentUser, db: Db):
 
 
 @router.get("/checkins")
-async def list_checkins(user: CurrentUser, db: Db, limit: int = Query(100, ge=1, le=200), offset: int = Query(0, ge=0)):
+async def list_checkins(
+    user: CurrentUser, db: Db, limit: int = Query(100, ge=1, le=200), offset: int = Query(0, ge=0)
+):
     return {"ok": True, "data": await paged(db, Checkin, user.id, limit, offset)}
 
 
@@ -192,19 +222,31 @@ async def stats(user: CurrentUser, db: Db):
     for kind in ("run", "ride"):
         selected = [item for item in tracks if item.kind == kind]
         if selected:
-            by_kind.append({
-                "kind": kind, "count": len(selected),
-                "distance": sum(item.distance for item in selected),
-                "duration": sum(item.duration or 0 for item in selected),
-                "realCount": sum(1 for item in selected if item.is_real),
-            })
+            by_kind.append(
+                {
+                    "kind": kind,
+                    "count": len(selected),
+                    "distance": sum(item.distance for item in selected),
+                    "duration": sum(item.duration or 0 for item in selected),
+                    "realCount": sum(1 for item in selected if item.is_real),
+                }
+            )
+
     async def count(model):
         return await db.scalar(select(func.count(model.id)).where(model.user_id == user.id)) or 0
-    return {"ok": True, "data": {
-        "byKind": by_kind, "weekly": [],
-        "counts": {
-            "favorites": await count(Favorite), "plans": await count(Plan),
-            "checkins": await count(Checkin), "tracks": len(tracks),
+
+    return {
+        "ok": True,
+        "data": {
+            "byKind": by_kind,
+            "weekly": [],
+            "counts": {
+                "favorites": await count(Favorite),
+                "plans": await count(Plan),
+                "checkins": await count(Checkin),
+                "tracks": len(tracks),
+            },
+            "recentCheckins": [],
+            "since": user.created_at.isoformat(sep=" "),
         },
-        "recentCheckins": [], "since": user.created_at.isoformat(sep=" "),
-    }}
+    }

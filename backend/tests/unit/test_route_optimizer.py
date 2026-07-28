@@ -34,4 +34,3 @@ def test_two_opt_never_returns_worse_than_initial_shape():
     assert algorithm == "nearest-neighbor+2-opt"
     assert result.order == list(range(7))
     assert result.total_distance == 700
-

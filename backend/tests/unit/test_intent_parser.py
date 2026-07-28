@@ -12,4 +12,3 @@ def test_chinese_request_extracts_preferences_and_deadline():
     assert intent.preferences.minimize_walking
     assert intent.preferences.prefer_high_rating
     assert any(task.deadline and task.deadline.hour == 17 for task in intent.tasks)
-

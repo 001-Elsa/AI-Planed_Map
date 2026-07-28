@@ -9,6 +9,15 @@ import { routeLeg, searchNearestPOI } from '../services/amap.js';
 import { solveOrder, solveOrderExact } from '../services/algo.js';
 import { requireLogin } from '../ui/auth.js';
 
+let activeTripId = null;
+let activePlanningRunId = null;
+let locationConsentGranted = false;
+let locationWatchId = null;
+let planningConversationId = null;
+let planningConversationRevision = null;
+let eventStreamController = null;
+let lastStreamEventId = 0;
+
 /* ---------------- 生命周期 ---------------- */
 export function activate() {
   $('plan-save-row').classList.add('hidden');
@@ -40,6 +49,10 @@ export function bindPlanUI() {
     const folded = $('plan-body').classList.toggle('hidden');
     $('btn-plan-fold').textContent = folded ? '展开' : '收起';
   });
+  $('btn-trip-start').addEventListener('click', startTrip);
+  $('btn-trip-pause').addEventListener('click', pauseTrip);
+  $('btn-location-consent').addEventListener('click', toggleLocationConsent);
+  $('btn-trip-replan').addEventListener('click', requestDynamicReplan);
 }
 
 async function runAIPlan() {
@@ -57,27 +70,90 @@ async function runAIPlan() {
   clearAll();
   try {
     const mode = S.planTravelMode === 'drive' ? 'driving' : S.planTravelMode === 'ride' ? 'cycling' : 'walking';
-    const result = await API.aiPlan({
+    const result = await API.startPlanningConversation({
       text,
       origin,
       transport_mode: mode,
       default_service_duration_minutes: Math.max(0, parseInt($('plan-stay').value, 10) || 0),
-    }, crypto.randomUUID());
+    });
+    planningConversationId = result.conversation_id;
+    planningConversationRevision = result.conversation_revision;
     if (result.status === 'need_clarification') {
-      out.innerHTML = '<div class="ai-card"><b>还需要你确认</b>' +
-        result.questions.map((q) => '<p>' + escapeHtml(q.message || q.field) + '</p>').join('') + '</div>';
+      renderClarification(result, out);
       return;
     }
+    await renderAIResult(result, origin, text, out);
+  } catch (err) {
+    out.innerHTML = '<div class="err">AI 规划失败：' + escapeHtml(err.message || String(err)) + '</div>';
+  } finally {
+    button.disabled = false;
+    button.textContent = '✨ AI 规划';
+  }
+}
+
+function renderClarification(result, out) {
+  out.innerHTML = '<div class="ai-card"><b>Agent 发现信息不完整</b>' +
+    result.questions.map((q) => '<p><span class="constraint-chip">待补充</span> ' +
+      escapeHtml(q.question || q.field) +
+      (q.reason ? '<small>' + escapeHtml(q.reason) + '</small>' : '') + '</p>').join('') +
+    '<form id="clarification-form" class="clarification-form">' +
+    result.questions.map((q, index) => '<label>' + escapeHtml(q.field) +
+      '<input name="q-' + index + '" data-field="' + escapeHtml(q.field) +
+      '" required placeholder="请输入明确值"></label>').join('') +
+    '<button class="primary-btn" type="submit">确认约束并继续规划</button></form></div>';
+  $('clarification-form').addEventListener('submit', continueAIConversation);
+}
+
+async function continueAIConversation(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const answers = {};
+  form.querySelectorAll('input[data-field]').forEach((input) => {
+    const field = input.dataset.field;
+    let value = input.value.trim();
+    if (/meters|minutes|yuan/.test(field)) value = Number(value);
+    answers[field] = value;
+  });
+  const out = $('plan-result');
+  try {
+    const result = await API.continuePlanningConversation(
+      planningConversationId, planningConversationRevision, answers,
+    );
+    planningConversationRevision = result.conversation_revision;
+    if (result.status === 'need_clarification') {
+      renderClarification(result, out);
+      return;
+    }
+    const origin = result.origin || S.myPos || S.map.getCenter();
+    await renderAIResult(result, origin, $('plan-input').value.trim(), out);
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+async function renderAIResult(result, origin, text, out) {
     const ordered = result.stops.map((stop) => ({
       task: stop.task.description,
       name: stop.poi.name,
       address: stop.poi.address || '',
       loc: stop.poi.location,
+      confidence: stop.poi.confidence,
     }));
     const legs = [];
     let previous = origin;
-    for (const stop of ordered) {
-      legs.push(await routeLeg(previous, stop.loc, S.planTravelMode));
+    for (let index = 0; index < ordered.length; index += 1) {
+      const stop = ordered[index];
+      const visualLeg = await routeLeg(previous, stop.loc, S.planTravelMode);
+      const verified = result.stops[index].travel;
+      legs.push({
+        ...visualLeg,
+        distance: verified.distance_meters,
+        time: verified.duration_seconds,
+        source: verified.source,
+        quality: verified.quality,
+        confidence: verified.confidence,
+        fallbackUsed: verified.fallback_used,
+      });
       previous = stop.loc;
     }
     S.lastPlanCtx = { origin, stops: ordered, legs, missed: [] };
@@ -86,18 +162,224 @@ async function runAIPlan() {
     banner.className = result.status === 'infeasible' ? 'ai-card err' : 'ai-card';
     banner.innerHTML = '<b>' + (result.status === 'infeasible' ? '约束冲突' : '规划说明') + '</b><p>' +
       escapeHtml(result.explanation || '') + '</p>' +
-      (result.conflicts || []).map((item) => '<p>• ' + escapeHtml(item) + '</p>').join('');
+      '<div class="plan-proof"><span>置信度 ' + Math.round((result.confidence || 0) * 100) + '%</span>' +
+      '<span>候选 ' + (result.candidate_count || 0) + '</span><span>' + escapeHtml(result.algorithm || '') + '</span></div>' +
+      (result.uncertainty ? '<p>耗时合理区间 ' +
+        fmtDur(result.uncertainty.lower_duration_seconds) + '～' +
+        fmtDur(result.uncertainty.upper_duration_seconds) +
+        (result.uncertainty.on_time_probability != null ? ' · 按时概率 ' +
+          Math.round(result.uncertainty.on_time_probability * 100) + '%' : '') + '</p>' : '') +
+      (result.conflicts || []).map((item) => '<p>• ' + escapeHtml(item) + '</p>').join('') +
+      (result.warnings || []).map((item) => '<p class="estimate-warning">⚠ ' + escapeHtml(item) + '</p>').join('');
     out.prepend(banner);
     S.lastPlan = {
       text, travelMode: S.planTravelMode, depart: $('plan-depart').value,
       stay: $('plan-stay').value, aiResult: result,
     };
+    activePlanningRunId = result.planning_run_id;
+    renderStructuredTimeline(result);
     $('plan-save-row').classList.remove('hidden');
-  } catch (err) {
-    out.innerHTML = '<div class="err">AI 规划失败：' + escapeHtml(err.message || String(err)) + '</div>';
-  } finally {
-    button.disabled = false;
-    button.textContent = '✨ AI 规划';
+}
+
+function renderStructuredTimeline(result) {
+  const aside = $('agent-timeline');
+  aside.classList.remove('hidden');
+  $('trip-state-badge').textContent = result.planning_state || 'PLAN_READY';
+  $('timeline-data-dot').className = result.confidence >= .8 ? 'ok' : result.confidence >= .6 ? 'warn' : 'bad';
+  $('timeline-proof').innerHTML =
+    '<div><b>' + Math.round((result.confidence || 0) * 100) + '%</b><span>综合置信度</span></div>' +
+    '<div><b>v' + (result.plan_version || 1) + '</b><span>计划版本</span></div>' +
+    '<div><b>' + (result.candidate_count || 0) + '</b><span>候选 POI</span></div>';
+  $('structured-timeline').innerHTML = result.stops.map((stop, index) => {
+    const sourceClass = stop.travel.fallback_used ? 'estimated' : 'verified';
+    return '<article class="timeline-stop"><span class="timeline-no">' + (index + 1) + '</span>' +
+      '<div><b>' + escapeHtml(stop.poi.name) + '</b><small>' +
+      escapeHtml(new Date(stop.arrival_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })) +
+      ' 到达 · 停留 ' + stop.task.service_duration_minutes + ' 分钟</small>' +
+      '<em class="' + sourceClass + '">' + escapeHtml(stop.travel.source) + ' · ' +
+      Math.round(stop.travel.confidence * 100) + '%</em></div></article>';
+  }).join('');
+  const risk = $('agent-risk-card');
+  if (result.status === 'infeasible' || (result.warnings || []).length) {
+    risk.classList.remove('hidden');
+    risk.innerHTML = '<b>' + (result.status === 'infeasible' ? '硬约束冲突' : '可信度提醒') + '</b>' +
+      [...(result.conflicts || []), ...(result.warnings || [])]
+        .map((item) => '<p>' + escapeHtml(item) + '</p>').join('');
+  } else {
+    risk.classList.add('hidden');
+  }
+}
+
+async function startTrip() {
+  if (!activePlanningRunId) { toast('请先生成正式 AI 计划'); return; }
+  try {
+    if (!activeTripId) {
+      const created = await API.createTrip(activePlanningRunId);
+      activeTripId = created.trip_id;
+    }
+    const trip = await API.getTrip(activeTripId);
+    if (trip.state === 'PLAN_READY' || trip.state === 'PAUSED') {
+      await API.transitionTrip(activeTripId, 'ACTIVE_TRIP', '用户在时间线确认开始行程');
+    }
+    $('trip-state-badge').textContent = 'ACTIVE_TRIP';
+    $('btn-trip-start').classList.add('hidden');
+    $('btn-trip-pause').classList.remove('hidden');
+    $('btn-trip-replan').classList.remove('hidden');
+    startTripEventStream();
+    toast('随行 Agent 已启动；未授权前不会读取精确位置');
+  } catch (error) { toast(error.message); }
+}
+
+async function pauseTrip() {
+  if (!activeTripId) return;
+  try {
+    await API.transitionTrip(activeTripId, 'PAUSED', '用户主动暂停');
+    $('trip-state-badge').textContent = 'PAUSED';
+    $('btn-trip-pause').classList.add('hidden');
+    $('btn-trip-start').classList.remove('hidden');
+    stopLocationTracking();
+    stopTripEventStream();
+  } catch (error) { toast(error.message); }
+}
+
+async function startTripEventStream() {
+  if (!activeTripId || eventStreamController) return;
+  eventStreamController = new AbortController();
+  try {
+    const response = await fetch('/api/companion/trips/' + activeTripId + '/stream', {
+      headers: {
+        Authorization: 'Bearer ' + API.token,
+        'Last-Event-ID': String(lastStreamEventId),
+      },
+      signal: eventStreamController.signal,
+    });
+    if (!response.ok || !response.body) throw new Error('事件流连接失败');
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      buffer += decoder.decode(chunk.value, { stream: true });
+      const frames = buffer.split('\n\n');
+      buffer = frames.pop();
+      frames.forEach(handleEventFrame);
+    }
+  } catch (error) {
+    if (error.name !== 'AbortError' && eventStreamController) {
+      setTimeout(() => { eventStreamController = null; startTripEventStream(); }, 2000);
+      return;
+    }
+  }
+  eventStreamController = null;
+  if (activeTripId && $('trip-state-badge').textContent === 'ACTIVE_TRIP') {
+    setTimeout(startTripEventStream, 2000);
+  }
+}
+
+function handleEventFrame(frame) {
+  const idLine = frame.split('\n').find((line) => line.startsWith('id:'));
+  const dataLine = frame.split('\n').find((line) => line.startsWith('data:'));
+  if (idLine) lastStreamEventId = Number(idLine.slice(3).trim()) || lastStreamEventId;
+  if (!dataLine) return;
+  try {
+    const event = JSON.parse(dataLine.slice(5).trim());
+    $('trip-state-badge').textContent = event.state;
+    if (event.decision && event.decision.should_notify) {
+      const risk = $('agent-risk-card');
+      risk.classList.remove('hidden');
+      risk.innerHTML = '<b>实时风险：' + escapeHtml(event.type) + '</b><p>' +
+        escapeHtml(event.decision.reason || '') + '</p>';
+    }
+  } catch (_) { /* 忽略不完整帧，重连会基于事件 ID 恢复 */ }
+}
+
+function stopTripEventStream() {
+  if (eventStreamController) eventStreamController.abort();
+  eventStreamController = null;
+}
+
+async function requestDynamicReplan() {
+  if (!activeTripId) return;
+  const current = S.myPos || (() => {
+    const center = S.map.getCenter();
+    return { lng: center.lng, lat: center.lat };
+  })();
+  try {
+    const result = await API.replanTrip(activeTripId, {
+      current_location: current,
+      current_time: new Date().toISOString(),
+      completed_stop_ids: [],
+      reason: '用户请求基于当前位置和当前时间重新评估',
+    });
+    renderPatchProposal(result);
+  } catch (error) { toast(error.message); }
+}
+
+function renderPatchProposal(result) {
+  const card = $('plan-patch-card');
+  card.classList.remove('hidden');
+  if (!result.patch_created) {
+    card.innerHTML = '<b>重规划评估</b><p>' +
+      escapeHtml(result.status === 'current_order_still_optimal' ? '原计划仍可执行，无需变更。' : '当前没有可行的自动调整。') +
+      '</p>' + (result.options || []).map((option) => '<p>• ' + escapeHtml(option.action) + '</p>').join('');
+    return;
+  }
+  const before = result.impact.before || {};
+  const after = result.impact.after || {};
+  card.innerHTML = '<b>Plan Patch 待确认</b><div class="patch-compare">' +
+    '<div><b>原计划 v' + before.plan_version + '</b><span>行程 ' +
+    fmtDur(before.total_travel_seconds || 0) + '</span></div>' +
+    '<div><b>新方案</b><span>行程 ' + fmtDur(after.total_travel_seconds || 0) +
+    '</span><span>' + fmtDist(after.total_distance_meters || 0) + '</span></div></div>' +
+    '<p>Agent 只提出变更；确认后仍会由硬约束验证器复算。</p>' +
+    '<div class="patch-actions"><button id="btn-patch-accept" class="primary-btn">接受并应用</button>' +
+    '<button id="btn-patch-reject" class="small-btn">保留原计划</button></div>';
+  $('btn-patch-accept').onclick = () => decidePatch(result.patch_id, true);
+  $('btn-patch-reject').onclick = () => decidePatch(result.patch_id, false);
+}
+
+async function decidePatch(patchId, accept) {
+  try {
+    const decision = await API.decidePlanPatch(activePlanningRunId, patchId, accept);
+    $('plan-patch-card').innerHTML = '<b>' +
+      (accept ? '已验证并应用计划 v' + decision.plan_version : '已拒绝，原计划保持不变') + '</b>';
+    if (accept) $('trip-state-badge').textContent = 'ACTIVE_TRIP';
+  } catch (error) { toast(error.message); }
+}
+
+async function toggleLocationConsent() {
+  if (!activeTripId) { toast('请先开始行程'); return; }
+  const next = !locationConsentGranted;
+  if (next && !confirm('允许本次行程使用精确位置？位置仅短期保存，行程结束后停止跟踪。')) return;
+  try {
+    await API.setTripConsent(activeTripId, 'precise_location', next);
+    locationConsentGranted = next;
+    $('btn-location-consent').textContent = '精确定位：' + (next ? '已授权' : '未授权');
+    if (next) startLocationTracking(); else stopLocationTracking();
+  } catch (error) { toast(error.message); }
+}
+
+function startLocationTracking() {
+  if (!navigator.geolocation || locationWatchId != null || !activeTripId) return;
+  locationWatchId = navigator.geolocation.watchPosition(async (position) => {
+    try {
+      await API.updateTripLocation(activeTripId, {
+        event_id: 'location-' + Date.now() + '-' + Math.round(position.coords.latitude * 1e5),
+        location: { lng: position.coords.longitude, lat: position.coords.latitude },
+        accuracy_meters: position.coords.accuracy,
+        captured_at: new Date(position.timestamp).toISOString(),
+      });
+    } catch (error) {
+      if (error.status === 403 || error.status === 409) stopLocationTracking();
+    }
+  }, () => {}, { enableHighAccuracy: true, maximumAge: 15000, timeout: 10000 });
+}
+
+function stopLocationTracking() {
+  if (locationWatchId != null && navigator.geolocation) {
+    navigator.geolocation.clearWatch(locationWatchId);
+    locationWatchId = null;
   }
 }
 
@@ -257,7 +539,10 @@ function renderPlanResult(origin, ordered, legs, missed, exact, manual) {
     html += '<div class="plan-step" draggable="true" data-i="' + i + '"><span class="no">' + (i + 1) + '</span>' +
       '<div style="flex:1"><div><b>' + escapeHtml(s.name) + '</b> <span class="muted">(' + escapeHtml(s.task) + ')</span></div>' +
       '<div class="leg">' + (i === 0 ? '从当前位置 ' : '') + travelModeName() + ' ' + fmtDist(leg.distance) +
-      (leg.time != null ? ' · 约 ' + fmtDur(leg.time) : ' · 直线估算') + eta + '</div></div>' +
+      (leg.time != null ? ' · 约 ' + fmtDur(leg.time) : ' · 直线估算') + eta +
+      (leg.source ? ' <span class="data-badge ' + (leg.fallbackUsed ? 'estimated' : 'verified') + '">' +
+        escapeHtml(leg.fallbackUsed ? '估算' : 'Provider') + ' · ' +
+        Math.round((leg.confidence || 0) * 100) + '%</span>' : '') + '</div></div>' +
       '<span class="mv"><button class="mv-btn mv-up" title="上移">▲</button><button class="mv-btn mv-dn" title="下移">▼</button></span>' +
       '<input type="checkbox" class="done-chk" title="办完打勾"></div>';
   });

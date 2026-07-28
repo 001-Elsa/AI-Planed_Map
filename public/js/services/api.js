@@ -66,6 +66,37 @@ export const API = {
       return data.data;
     });
   },
+  startPlanningConversation(request) {
+    return API.req('POST', '/ai/conversations', request);
+  },
+  continuePlanningConversation(conversationId, baseRevision, answers) {
+    return API.req('PATCH', '/ai/conversations/' + conversationId, {
+      base_revision: baseRevision, answers,
+    });
+  },
+  decidePlanPatch(planningRunId, patchId, accept) {
+    return API.req('POST', '/ai/plans/' + planningRunId + '/patches/' + patchId + '/decision', { accept });
+  },
+  createTrip(planningRunId) { return API.req('POST', '/companion/trips', { planning_run_id: planningRunId }); },
+  getTrip(tripId) { return API.req('GET', '/companion/trips/' + tripId); },
+  transitionTrip(tripId, targetState, reason) {
+    return API.req('POST', '/companion/trips/' + tripId + '/transition', {
+      target_state: targetState, reason,
+    });
+  },
+  setTripConsent(tripId, scope, granted) {
+    return API.req('POST', '/companion/trips/' + tripId + '/consents', { scope, granted });
+  },
+  updateTripLocation(tripId, payload) {
+    return API.req('POST', '/companion/trips/' + tripId + '/location', payload);
+  },
+  sendTripEvent(tripId, event) {
+    return API.req('POST', '/companion/trips/' + tripId + '/events', event);
+  },
+  replanTrip(tripId, payload) {
+    return API.req('POST', '/companion/trips/' + tripId + '/replan', payload);
+  },
+  deleteTripLocations(tripId) { return API.req('DELETE', '/companion/trips/' + tripId + '/locations'); },
 
   listTracks(kind, limit) {
     const q = ['limit=' + (limit || 100)];

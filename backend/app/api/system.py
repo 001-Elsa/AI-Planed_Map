@@ -8,7 +8,6 @@ from backend.app.core.config import get_settings
 from backend.app.core.exceptions import AppError
 from backend.app.models import Checkin, Favorite, Plan, Setting, Share, Track, User
 
-
 router = APIRouter(tags=["system"])
 BOOT_TIME = time.monotonic()
 
@@ -17,10 +16,15 @@ BOOT_TIME = time.monotonic()
 async def health(db: Db):
     await db.execute(text("SELECT 1"))
     settings = get_settings()
-    return {"ok": True, "data": {
-        "status": "ok", "version": settings.app_version,
-        "uptimeSec": round(time.monotonic() - BOOT_TIME), "runtime": "Python / FastAPI",
-    }}
+    return {
+        "ok": True,
+        "data": {
+            "status": "ok",
+            "version": settings.app_version,
+            "uptimeSec": round(time.monotonic() - BOOT_TIME),
+            "runtime": "Python / FastAPI",
+        },
+    }
 
 
 async def setting(db: Db, key: str) -> str:
@@ -46,9 +50,14 @@ async def get_amap_key(user: CurrentUser, db: Db):
     require_admin(user)
     key = await setting(db, "amap_key")
     jscode = await setting(db, "amap_jscode")
-    return {"ok": True, "data": {
-        "key": key, "jscodeMasked": f"{jscode[:4]}****" if jscode else "", "hasJscode": bool(jscode),
-    }}
+    return {
+        "ok": True,
+        "data": {
+            "key": key,
+            "jscodeMasked": f"{jscode[:4]}****" if jscode else "",
+            "hasJscode": bool(jscode),
+        },
+    }
 
 
 @router.post("/admin/amapkey")
@@ -79,22 +88,37 @@ async def admin_overview(user: CurrentUser, db: Db):
 
     users = []
     for person in people:
-        distance = await db.scalar(select(func.coalesce(func.sum(Track.distance), 0)).where(Track.user_id == person.id))
-        users.append({
-            "id": person.id, "username": person.username, "nickname": person.nickname,
-            "is_admin": int(person.is_admin), "created_at": person.created_at.isoformat(sep=" "),
-            "tracks": await count(Track, person.id), "distance": distance or 0,
-            "favorites": await count(Favorite, person.id),
-            "checkins": await count(Checkin, person.id), "plans": await count(Plan, person.id),
-        })
-    return {"ok": True, "data": {
-        "users": users,
-        "totals": {
-            "users": len(users), "tracks": await count(Track),
-            "distance": await db.scalar(select(func.coalesce(func.sum(Track.distance), 0))) or 0,
-            "shares": await count(Share), "checkins": await count(Checkin),
+        distance = await db.scalar(
+            select(func.coalesce(func.sum(Track.distance), 0)).where(Track.user_id == person.id)
+        )
+        users.append(
+            {
+                "id": person.id,
+                "username": person.username,
+                "nickname": person.nickname,
+                "is_admin": int(person.is_admin),
+                "created_at": person.created_at.isoformat(sep=" "),
+                "tracks": await count(Track, person.id),
+                "distance": distance or 0,
+                "favorites": await count(Favorite, person.id),
+                "checkins": await count(Checkin, person.id),
+                "plans": await count(Plan, person.id),
+            }
+        )
+    return {
+        "ok": True,
+        "data": {
+            "users": users,
+            "totals": {
+                "users": len(users),
+                "tracks": await count(Track),
+                "distance": await db.scalar(select(func.coalesce(func.sum(Track.distance), 0)))
+                or 0,
+                "shares": await count(Share),
+                "checkins": await count(Checkin),
+            },
         },
-    }}
+    }
 
 
 @router.delete("/admin/users/{user_id}")

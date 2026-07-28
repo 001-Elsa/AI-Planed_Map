@@ -19,4 +19,3 @@ class AppError(Exception):
 class UpstreamError(AppError):
     def __init__(self, message: str, details: Any | None = None) -> None:
         super().__init__(502, "UPSTREAM_SERVICE_ERROR", message, details)
-

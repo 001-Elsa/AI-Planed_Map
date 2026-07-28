@@ -14,4 +14,3 @@ class ErrorEnvelope(BaseModel):
     msg: str
     request_id: str
     details: dict[str, Any] = Field(default_factory=dict)
-
