@@ -102,15 +102,24 @@ function saveKey() {
   loadScript(k);
 }
 
+function mapLoadFailed(msg) {
+  $('card').innerHTML += '<div class="err">' + (msg || '地图加载失败,请检查网络/Key(内容信息见上)') + '</div>';
+}
+
 function loadScript(key) {
   const s = document.createElement('script');
   s.src = 'https://webapi.amap.com/maps?v=2.0&key=' + encodeURIComponent(key);
   s.onload = render;
-  s.onerror = () => { $('card').innerHTML += '<div class="err">地图加载失败,请检查网络/Key(内容信息见上)</div>'; };
+  s.onerror = () => mapLoadFailed();
   document.head.appendChild(s);
 }
 
 function render() {
+  // 无效 Key / 脚本被拦截时 onload 仍可能触发,但 window.AMap 未就绪
+  if (!window.AMap) {
+    mapLoadFailed('地图脚本未就绪,请检查 Key 或网络(内容信息见上)');
+    return;
+  }
   map = new AMap.Map('map', { zoom: 14, viewMode: '2D' });
   const d = share.payload || {};
   const by = '<div class="muted">由 ' + esc(share.nickname) + ' 分享 · ' + esc((share.created_at || '').slice(0, 16)) + '</div>';
