@@ -22,6 +22,27 @@ Worker  ←── Redis queues / locks / pubsub
 PostgreSQL
 ```
 
+```mermaid
+sequenceDiagram
+    participant E as "高风险事件"
+    participant W as "Worker + 分布式锁"
+    participant A as "Agent Controller"
+    participant P as "Policy + Tools"
+    participant R as "Replanner"
+    participant U as "用户"
+    E->>W: 偏航 / 延误 / 暴雨 / POI 关闭
+    W->>A: Trip State + Observation
+    loop 受限工具循环
+        A->>P: LLM 选择白名单工具
+        P-->>A: 位置 / 天气 / 行程事实
+    end
+    A->>R: propose_replan（只可创建 pending）
+    R-->>W: Patch + 影响对比
+    W-->>U: SSE 推送待确认方案
+    U->>R: 确认
+    R-->>U: 约束复验通过后 Version N+1
+```
+
 ## 一次规划
 
 1. API 校验身份、请求体、配额边界与幂等指纹。
@@ -68,14 +89,18 @@ Version N
 
 所有路径写入 `decision_audit_logs`，包括阻止执行的规则。
 
+Patch 操作包括 `remove_stop`、`move_stop`、`replace_stop`、`change_transport_mode`。接受时会在新地点与新交通方式下重新计算路线、时间窗、步行上限和费用上限；任何冲突都会阻止新 Version 写入。
+
 ## 伴游与 Worker
 
 - Trip Session 管理状态机、Consent 与定位 TTL；
 - 位置更新可自动做路线走廊偏航检测并生成 `UserOffRoute`；
-- Agent Controller 按 Observation → Proposal → Policy → Tool → Message 循环编排；
+- Agent Controller 按 Observation → LLM Decision → Policy → Tool → Observation 循环编排。模型只能输出白名单工具或结束，不能写入 PlanVersion；无 LLM 或 LLM 调用失败时降级为同一边界内的规则决策器；
 - Worker 消费 `mapgo:trip-events` / `mapgo:notifications`，支持重试与死信；
-- 高影响事件可提出重规划，但仍需用户确认 Plan Patch。
+- 高影响事件可自动产生待确认 Patch。Worker 锁和事件状态避免重复消费生成多个 Patch；Patch 应用仍需要用户确认。
 
 ## 数据可信度
 
 每条路线边的 `source/quality/traffic_timestamp/confidence/fallback_used` 是正式 API 合同。任何回退都降低置信度并在前端显示“估算”，不能以精确概率 ETA 的口吻呈现。
+
+当前规划时使用的是 Provider 置信度与安全缓冲构成的启发式区间。`calibrate_from_history()` 仍是离线辅助函数，尚未获得按交通方式、时段聚合的真实 ETA 样本，所以不作为在线“历史残差校准”能力宣称。

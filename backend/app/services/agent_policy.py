@@ -44,8 +44,7 @@ TOOL_POLICIES = {
     "propose_replan": ToolPolicy(
         frozenset(
             {TripState.active_trip, TripState.off_route, TripState.at_risk, TripState.replanning}
-        ),
-        confirmation_required=True,
+        )
     ),
     "create_plan_patch": ToolPolicy(
         frozenset(

@@ -860,9 +860,21 @@ async def replan_remaining_trip(
     if lock_token is None:
         raise AppError(409, "TRIP_LOCKED", "行程正在被其他实例修改，请稍后重试")
     try:
-        return await _replan_remaining_trip_locked(
-            trip_id, body, request, user, db, trip, context, replan_count
+        from backend.app.services.replanning import PendingReplanRequest, create_pending_replan
+
+        data = await create_pending_replan(
+            db=db,
+            trip=trip,
+            provider=request.app.state.map_provider,
+            request=PendingReplanRequest(
+                current_location=body.current_location,
+                current_time=body.current_time,
+                completed_stop_ids=body.completed_stop_ids,
+                reason=body.reason,
+            ),
+            trace_id=request.state.trace_id,
         )
+        return {"ok": True, "data": data}
     finally:
         await request.app.state.runtime_store.release_lock(f"trip-mutate:{trip.id}", lock_token)
 

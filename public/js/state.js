@@ -9,7 +9,7 @@ export const S = {
   myPos: null,            // {lng, lat}
   myPosName: '',
   myMarker: null,
-  currentMode: 'normal',
+  currentMode: 'plan',
   infoWindow: null,
   searchTimer: null,
 

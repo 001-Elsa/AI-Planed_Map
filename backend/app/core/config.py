@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     precise_location_ttl_minutes: int = 120
     location_encryption_key: str = ""
     max_agent_tool_calls: int = 8
+    max_agent_steps: int = 4
+    max_agent_input_tokens: int = 6_000
+    max_agent_output_tokens: int = 800
+    max_agent_run_cost_usd: float = 0.05
     max_replans_per_trip: int = 10
     daily_ai_token_quota: int = 100_000
     max_ai_request_cost_usd: float = 0.20

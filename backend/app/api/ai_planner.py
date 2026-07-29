@@ -2,7 +2,7 @@ import json
 import time
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Header, Request
+from fastapi import APIRouter, Header, Query, Request
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
@@ -386,6 +386,106 @@ async def _owned_run(db: Db, run_id: int, user_id: int) -> PlanningRun:
     return run
 
 
+@router.get("/plans/overview")
+async def get_plan_overview(
+    user: CurrentUser,
+    db: Db,
+    limit: int = Query(5, ge=1, le=20),
+):
+    """Return the user's formal AI plans as a resumable planning workspace."""
+    total_runs = int(
+        await db.scalar(select(func.count(PlanningRun.id)).where(PlanningRun.user_id == user.id))
+        or 0
+    )
+    successful_runs = int(
+        await db.scalar(
+            select(func.count(PlanningRun.id)).where(
+                PlanningRun.user_id == user.id,
+                PlanningRun.status == "success",
+            )
+        )
+        or 0
+    )
+    formal_plans = int(
+        await db.scalar(
+            select(func.count(func.distinct(PlanVersion.planning_run_id))).where(
+                PlanVersion.user_id == user.id
+            )
+        )
+        or 0
+    )
+    active_trips = int(
+        await db.scalar(
+            select(func.count(TripSession.id)).where(
+                TripSession.user_id == user.id,
+                TripSession.state.in_(("ACTIVE_TRIP", "PAUSED", "REPLANNING")),
+            )
+        )
+        or 0
+    )
+
+    runs = (
+        await db.scalars(
+            select(PlanningRun)
+            .where(PlanningRun.user_id == user.id)
+            .order_by(PlanningRun.created_at.desc(), PlanningRun.id.desc())
+            .limit(limit * 3)
+        )
+    ).all()
+    recent = []
+    for run in runs:
+        latest_version = await db.scalar(
+            select(PlanVersion)
+            .where(PlanVersion.planning_run_id == run.id)
+            .order_by(PlanVersion.version.desc())
+            .limit(1)
+        )
+        if latest_version is None:
+            continue
+        trip = await db.scalar(
+            select(TripSession)
+            .where(TripSession.planning_run_id == run.id, TripSession.user_id == user.id)
+            .order_by(TripSession.updated_at.desc(), TripSession.id.desc())
+            .limit(1)
+        )
+        snapshot = json.loads(latest_version.snapshot_json)
+        snapshot["planning_run_id"] = run.id
+        snapshot["plan_version"] = latest_version.version
+        recent.append(
+            {
+                "planning_run_id": run.id,
+                "input_text": run.input_text,
+                "status": run.status,
+                "created_at": run.created_at,
+                "plan_version": latest_version.version,
+                "change_reason": latest_version.change_reason,
+                "trip_id": trip.id if trip else None,
+                "trip_state": trip.state if trip else None,
+                "summary": {
+                    "stop_count": len(snapshot.get("stops") or []),
+                    "total_distance_meters": snapshot.get("total_distance_meters", 0),
+                    "total_travel_seconds": snapshot.get("total_travel_seconds", 0),
+                    "confidence": snapshot.get("confidence", 0),
+                },
+                "snapshot": snapshot,
+            }
+        )
+        if len(recent) >= limit:
+            break
+
+    return {
+        "ok": True,
+        "data": {
+            "total_runs": total_runs,
+            "successful_runs": successful_runs,
+            "formal_plans": formal_plans,
+            "active_trips": active_trips,
+            "success_rate": successful_runs / total_runs if total_runs else None,
+            "recent": recent,
+        },
+    }
+
+
 @router.get("/plans/{run_id}/versions")
 async def list_plan_versions(run_id: int, user: CurrentUser, db: Db):
     await _owned_run(db, run_id, user.id)
@@ -486,6 +586,30 @@ def _apply_structure(snapshot: dict, operations: list[dict]) -> list[dict]:
             if source is None or target is None or source >= len(stops) or target >= len(stops):
                 raise AppError(422, "PATCH_POSITION_INVALID", "移动站点的位置无效")
             stops.insert(target, stops.pop(source))
+        elif operation["operation"] == "replace_stop":
+            stop_id = operation.get("stop_id")
+            replacement = operation.get("replacement_stop")
+            position = next(
+                (i for i, stop in enumerate(stops) if stop["poi"]["id"] == stop_id),
+                None,
+            )
+            if position is None:
+                raise AppError(422, "PATCH_STOP_NOT_FOUND", f"找不到站点 {stop_id!r}")
+            if (
+                not isinstance(replacement, dict)
+                or not replacement.get("poi")
+                or not replacement.get("task")
+            ):
+                raise AppError(422, "PATCH_REPLACEMENT_INVALID", "替换站点必须包含 POI 和任务")
+            stops[position] = replacement
+        elif operation["operation"] == "change_transport_mode":
+            mode = operation.get("transport_mode")
+            try:
+                from backend.app.schemas.ai_intent import TransportMode
+
+                snapshot.setdefault("intent", {})["transport_mode"] = TransportMode(mode).value
+            except (TypeError, ValueError) as exc:
+                raise AppError(422, "PATCH_TRANSPORT_MODE_INVALID", "交通方式无效") from exc
     if not stops:
         raise AppError(422, "PATCH_EMPTY_PLAN", "正式计划至少需要保留一个站点")
     return stops
@@ -553,9 +677,16 @@ async def _recalculate_snapshot(
     max_walk = hard.get("max_walking_meters")
     if mode == TransportMode.walking and max_walk is not None and total_distance > max_walk:
         conflicts.append(f"调整后步行 {total_distance:.0f} 米，超过上限 {max_walk:.0f} 米")
+    max_cost = hard.get("max_total_cost_yuan")
+    total_cost = sum(
+        float((stop.get("poi") or {}).get("estimated_cost_yuan") or 0) for stop in stops
+    )
+    if max_cost is not None and total_cost > float(max_cost):
+        conflicts.append(f"调整后预估费用 {total_cost:.0f} 元，超过上限 {float(max_cost):.0f} 元")
     snapshot["stops"] = stops
     snapshot["total_distance_meters"] = total_distance
     snapshot["total_travel_seconds"] = total_seconds
+    snapshot["estimated_cost_yuan"] = total_cost
     snapshot["confidence"] = min(
         (stop["travel"]["confidence"] for stop in stops),
         default=0,

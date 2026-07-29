@@ -1,4 +1,6 @@
-# MapGo AI-Planned
+# MapGo-AI-Planner
+
+[![CI](https://github.com/001-Elsa/AI-Planed_Map/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/001-Elsa/AI-Planed_Map/actions/workflows/ci.yml)
 
 > 基于大模型意图理解、候选 POI 与路线联合求解、可验证约束和计划版本控制的智能出行平台。
 
@@ -25,8 +27,10 @@ MapGo 的定位不是“让模型生成一条看起来合理的路线”。系�
 - Runtime Store 抽象（内存 / Redis）：计数、JSON 状态、队列、分布式锁、重试与死信、Pub/Sub；
 - 后台 Worker：消费行程事件、通知去重投递、Agent Controller 编排、过期定位清理；
 - LLM 运行时失败自动降级到 RuleBased 解析器，并写入不确定约束 / 降低置信度；
-- 多轮规划澄清（起点、时间、人群、忌口、区域、候选 POI 选择等）；
-- 伴游 Trip Session、位置授权、自动偏航检测、动态重规划（多方案对比 + Plan Patch）；
+- 多轮规划澄清（起点、时间、人群、忌口、区域、候选 POI 选择等）；确认答案会写回类型化意图、重新召回候选并重新求解；
+- 伴游 Agent：LLM 在受限 JSON 输出中根据 Trip State、Observation 和工具结果逐步决定下一工具；Policy、调用步数、Token/费用预算与完整 AgentRun/AgentToolCall 审计始终生效；
+- 高影响事件经 Worker 的分布式锁触发 Agent 工具循环，自动生成 `pending` Plan Patch 并推送 SSE；正式 Version 只能由用户确认后创建；
+- 动态重规划支持 `replace_stop`、`remove_stop`、`move_stop`、`change_transport_mode`；闭馆可找替代 POI，暴雨可将室外地点替为室内候选；
 - 策展知识库 + 本地 TF-IDF RAG 检索与引文；拒绝无来源编造；
 - 行程复盘摘要（站间偏差、重规划、建议接受/拒绝、ETA 误差）；
 - 站内通知服务（去重、重试、投递状态；Web Push/邮件为可扩展通道）；
@@ -35,7 +39,7 @@ MapGo 的定位不是“让模型生成一条看起来合理的路线”。系�
 
 诚实边界：
 
-- 置信度为启发式 / 历史残差校准，不是严格概率预报；
+- 置信度当前是基于 Provider 质量和安全缓冲的启发式区间，不是严格概率预报；代码中的历史残差校准函数尚未接入在线规划，因而不对外宣称已校准；
 - RAG 为本地轻量检索，不是托管向量库；
 - 通知的 Web Push / 邮件适配器尚未对接真实厂商；
 - OpenTelemetry 全链路 SDK 仍可继续加深；当前以 Prometheus + Trace ID 为主。
@@ -104,10 +108,12 @@ AI 离线评测对 RuleBased 解析器施加质量门禁（Schema 合法率等�
 
 更多设计见 [架构说明](docs/ARCHITECTURE.md)、[威胁模型](docs/THREAT_MODEL.md) 和 [ADR](docs/adr/0001-deterministic-planning-boundary.md)。
 
+演示流程、可复现的测试与压测命令见 [演示与运行证据](docs/DEMO.md)。仓库展示名已调整为 **MapGo-AI-Planner**；GitHub 上的远端仓库重命名需在仓库设置中执行后，再同步更新 `origin`。
+
 ## 路线图（仍未完成 / 可继续加深）
 
 - 真实 LLM 评测对比与 Prompt 回归；
 - 托管向量库 / 重排序完整 RAG；
 - Web Push / 邮件 / App Push 真实投递；
 - OpenTelemetry 跨 API/Worker/DB/Redis 全链路；
-- 在线 Demo、演示视频与长期绿色 CI badge。
+- 录制演示视频 / GIF 并发布在线 Demo；

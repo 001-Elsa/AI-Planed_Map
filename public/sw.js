@@ -1,8 +1,8 @@
 /* 随行地图 MapGo — 应用壳缓存(地图与接口数据走网络) */
-const CACHE = 'mapgo-shell-v6';
+const CACHE = 'mapgo-shell-v7';
 const SHELL = [
-  './index.html', './css/style.css?v=6', './manifest.json',
-  './js/main.js?v=6', './js/state.js',
+  './index.html', './css/style.css?v=7', './manifest.json',
+  './js/main.js?v=7', './js/state.js',
   './js/services/store.js', './js/services/api.js', './js/services/format.js',
   './js/services/algo.js', './js/services/amap.js',
   './js/ui/dom.js', './js/ui/auth.js',

@@ -189,8 +189,9 @@ def apply_clarification_answer(request_data: dict[str, Any], field: str, value: 
         task_index = int(parts[1])
         overrides = request_data.setdefault("task_location_overrides", {})
         overrides[str(task_index)] = value
-        # Also enrich free-text so the next parse/search can use the clearer name.
-        request_data["text"] = f"{request_data.get('text', '')}；地点确认{task_index}:{value}"
+        # Keep the original natural-language request stable.  Appending an
+        # answer to it can make the parser invent an extra task and shift the
+        # task index that this override is meant to target.
         return
     if field.startswith("tasks.") and field.endswith(".selected_poi_id"):
         parts = field.split(".")

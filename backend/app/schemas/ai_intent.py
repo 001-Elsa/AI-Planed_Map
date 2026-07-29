@@ -52,6 +52,9 @@ class PlanningPreferences(StrictModel):
     minimize_walking: bool = False
     minimize_cost: bool = False
     prefer_high_rating: bool = False
+    # Kept on the formal intent so a clarification answer is visible to both
+    # candidate recall and the auditable final plan snapshot.
+    dietary_restrictions: list[str] = Field(default_factory=list, max_length=20)
     weights: ObjectiveWeights = Field(default_factory=ObjectiveWeights)
 
 
@@ -129,6 +132,13 @@ class AIPlanRequest(StrictModel):
     city: str | None = Field(default=None, max_length=50)
     constraints: TripConstraintSet | None = None
     max_candidates_per_task: int = Field(default=3, ge=1, le=5)
+    # Structured conversation answers.  These are deliberately part of the
+    # request model (rather than opaque persisted extras) so every retry runs
+    # the same planner input.
+    task_poi_overrides: dict[str, str] = Field(default_factory=dict)
+    task_location_overrides: dict[str, str] = Field(default_factory=dict)
+    task_field_overrides: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    preferences_answers: dict[str, Any] = Field(default_factory=dict)
 
 
 class PoiCandidate(StrictModel):
@@ -244,10 +254,12 @@ class AIPlanResult(StrictModel):
 
 
 class PlanPatchOperation(StrictModel):
-    operation: Literal["remove_stop", "move_stop"]
+    operation: Literal["remove_stop", "move_stop", "replace_stop", "change_transport_mode"]
     stop_id: str | None = None
     from_position: int | None = Field(default=None, ge=0)
     to_position: int | None = Field(default=None, ge=0)
+    replacement_stop: dict[str, Any] | None = None
+    transport_mode: TransportMode | None = None
 
 
 class CreatePlanPatchRequest(StrictModel):

@@ -218,3 +218,12 @@ def test_multi_turn_planning_conversation_is_versioned():
         assert final["status"] in {"success", "infeasible"}
         assert final["planning_run_id"] > 0
         assert final["plan_version"] == 1
+
+        overview = client.get("/api/ai/plans/overview?limit=3", headers=headers)
+        assert overview.status_code == 200, overview.text
+        workspace = overview.json()["data"]
+        assert workspace["total_runs"] >= 1
+        assert workspace["formal_plans"] >= 1
+        assert workspace["recent"][0]["planning_run_id"] == final["planning_run_id"]
+        assert workspace["recent"][0]["plan_version"] == 1
+        assert workspace["recent"][0]["snapshot"]["stops"]

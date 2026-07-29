@@ -17,7 +17,7 @@ from backend.app.schemas.ai_intent import (
 from backend.app.services.clarification import select_clarification_questions
 from backend.app.services.intent_parser import IntentParser
 from backend.app.services.route_optimizer import CandidateNode, optimize_joint_route
-from backend.app.services.uncertainty import calibrate_from_history
+from backend.app.services.uncertainty import heuristic_envelope
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
@@ -51,6 +51,46 @@ class PlanningService:
             intent.transport_mode = request.transport_mode
         if request.constraints:
             intent.constraints = request.constraints
+        # Conversation answers must modify the typed planning intent before
+        # candidate recall and optimisation.  Persisting them alone made a
+        # successful answer look accepted while silently planning the old trip.
+        for key, value in request.preferences_answers.items():
+            if key == "dietary_restrictions":
+                values = value if isinstance(value, list) else [value]
+                intent.preferences.dietary_restrictions = [str(item) for item in values if item]
+            elif key in {
+                "minimize_distance",
+                "minimize_walking",
+                "minimize_cost",
+                "prefer_high_rating",
+            }:
+                setattr(intent.preferences, key, bool(value))
+        for raw_index, location in request.task_location_overrides.items():
+            index = int(raw_index)
+            if not 0 <= index < len(intent.tasks):
+                raise ValueError(f"task location override index out of range: {index}")
+            intent.tasks[index].location_name = location
+            intent.tasks[index].location_hint = location
+        for raw_index, field_overrides in request.task_field_overrides.items():
+            index = int(raw_index)
+            if not 0 <= index < len(intent.tasks):
+                raise ValueError(f"task field override index out of range: {index}")
+            if "appointment_time" in field_overrides:
+                appointment = field_overrides["appointment_time"]
+                if isinstance(appointment, str):
+                    appointment = datetime.fromisoformat(appointment)
+                if appointment.tzinfo is None:
+                    appointment = appointment.replace(tzinfo=SHANGHAI)
+                # An appointment is an arrival-time constraint, not merely
+                # display metadata.  The optimizer may wait for it but cannot
+                # schedule the stop after it.
+                intent.tasks[index] = intent.tasks[index].model_copy(
+                    update={
+                        "appointment_time": appointment,
+                        "earliest_arrival": appointment,
+                        "deadline": appointment,
+                    }
+                )
         for task in intent.tasks:
             if task.service_duration_minutes == 0:
                 task.service_duration_minutes = request.default_service_duration_minutes
@@ -85,9 +125,7 @@ class PlanningService:
         if origin is None:
             raise RuntimeError("澄清阶段结束后仍缺少起点")
 
-        keywords = [
-            task.location_name or task.category or task.description for task in intent.tasks
-        ]
+        keywords = [self._recall_keyword(task, intent) for task in intent.tasks]
         search_results = await asyncio.gather(
             *(self.map_provider.search_poi(keyword, origin, request.city) for keyword in keywords)
         )
@@ -97,7 +135,29 @@ class PlanningService:
             if found
             and len(found) >= 2
             and len({item.name.strip().casefold() for item in found[:3]}) == 1
+            and str(index) not in request.task_poi_overrides
         }
+        selected_missing: list[ClarificationQuestion] = []
+        for raw_index, poi_id in request.task_poi_overrides.items():
+            index = int(raw_index)
+            if not 0 <= index < len(search_results):
+                raise ValueError(f"task POI override index out of range: {index}")
+            candidates_for_task = search_results[index]
+            selected = next((item for item in candidates_for_task if item.id == poi_id), None)
+            if selected is None:
+                selected_missing.append(
+                    ClarificationQuestion(
+                        field=f"tasks.{index}.selected_poi_id",
+                        reason="The selected POI is no longer returned by the map provider",
+                        question="该地点已无法验证，请重新选择一个候选地点。",
+                        candidates=candidates_for_task[:5],
+                    )
+                )
+            else:
+                # A resolved ambiguity is a hard user choice, not a ranking
+                # hint.  Keep exactly that POI so the joint solver cannot
+                # silently select another same-name result for a lower score.
+                search_results[index] = [selected]
         missing = [
             ClarificationQuestion(
                 field=f"tasks.{index}.location",
@@ -107,7 +167,9 @@ class PlanningService:
             for index, found in enumerate(search_results)
             if not found
         ]
-        if not missing and ambiguous:
+        if selected_missing:
+            missing = selected_missing
+        elif not missing and ambiguous:
             missing = select_clarification_questions(
                 request=request,
                 intent=intent,
@@ -203,11 +265,13 @@ class PlanningService:
             previous = node.matrix_index
 
         confidence = sum(confidences) / len(confidences) if confidences else 0
-        envelope = calibrate_from_history(
+        # ETA observations are collected for post-trip analysis but are not
+        # yet queried as a statistically representative cohort at plan time.
+        # Do not claim historical calibration until that data path exists.
+        envelope = heuristic_envelope(
             expected_seconds=evaluation.total_travel_seconds,
             mean_confidence=confidence,
             fallback_used=bool(estimated_edges),
-            history=[],
             safety_buffer_minutes=safety_buffer,
             has_deadline=any(task.deadline for task in intent.tasks),
         )
@@ -269,3 +333,16 @@ class PlanningService:
             candidate_count=len(flattened),
             uncertainty=uncertainty,
         )
+
+    @staticmethod
+    def _recall_keyword(task, intent) -> str:
+        """Attach confirmed dining requirements to the actual POI recall query."""
+        base = task.location_name or task.category or task.description
+        dining_terms = ("餐", "饭", "吃", "咖啡", "茶", "food", "restaurant")
+        task_text = f"{task.description} {task.location_name or ''} {task.category or ''}".lower()
+        if intent.preferences.dietary_restrictions and any(
+            term in task_text for term in dining_terms
+        ):
+            restrictions = " ".join(intent.preferences.dietary_restrictions)
+            return f"{base} {restrictions}"
+        return base

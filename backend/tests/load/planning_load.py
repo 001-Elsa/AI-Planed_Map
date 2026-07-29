@@ -29,7 +29,9 @@ async def one(client: httpx.AsyncClient, url: str, token: str, index: int) -> tu
 
 async def main(args) -> None:
     limits = httpx.Limits(max_connections=args.concurrency)
-    async with httpx.AsyncClient(timeout=args.timeout, limits=limits) as client:
+    # A local benchmark must not be silently sent through a corporate HTTP
+    # proxy; doing so turns a measurement of this API into a proxy failure.
+    async with httpx.AsyncClient(timeout=args.timeout, limits=limits, trust_env=False) as client:
         semaphore = asyncio.Semaphore(args.concurrency)
 
         async def bounded(index: int):

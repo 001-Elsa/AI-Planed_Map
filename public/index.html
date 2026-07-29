@@ -10,7 +10,7 @@
 <link rel="manifest" href="manifest.json">
 <link rel="icon" href="icons/icon-192.png">
 <link rel="apple-touch-icon" href="icons/icon-192.png">
-<link rel="stylesheet" href="css/style.css?v=6">
+<link rel="stylesheet" href="css/style.css?v=7">
 </head>
 <body>
 
@@ -217,12 +217,25 @@
 
 <!-- 计划模式面板 -->
 <div id="panel-plan" class="panel hidden">
-  <div class="panel-row">
-    <strong>AI 智能出行规划</strong>
-    <button id="btn-plan-fold" class="small-btn">收起</button>
+  <div class="plan-hero">
+    <div>
+      <span class="plan-kicker">MAPGO 核心能力</span>
+      <h2>把一串事情，变成一条可执行的路线</h2>
+      <p>告诉我去哪、要做什么和时间限制，我会核验地点、优化顺序并持续跟进。</p>
+    </div>
+    <button id="btn-plan-fold" class="small-btn" aria-label="收起计划面板">收起</button>
   </div>
   <div id="plan-body">
+    <div class="plan-starters" aria-label="计划场景模板">
+      <button type="button" data-plan-template="明天上午从家出发，先取快递，再去超市采购，最后到公司，尽量少绕路。">通勤办事</button>
+      <button type="button" data-plan-template="周六上午十点带父母出发，找两个适合长辈的景点，中午安排评分高的餐厅，下午五点前回家，尽量少走路。">家庭出游</button>
+      <button type="button" data-plan-template="今天下午从当前位置出发，先去药店，再去商场买东西，最后找一家安静的咖啡店，六点前结束。">城市半日</button>
+    </div>
     <textarea id="plan-input" rows="4" placeholder="例如：明天下午两点从学校出发，先取快递，再找一家评分高的蛋糕店，顺路买水果，五点前到医院，尽量少走路。"></textarea>
+    <div class="plan-input-meta">
+      <span>支持时间、顺序、预算、少走路等约束</span>
+      <span><kbd>Ctrl</kbd> + <kbd>Enter</kbd> 开始规划</span>
+    </div>
     <div class="panel-row">
       <div class="seg" id="plan-mode-seg">
         <button data-tmode="walk" class="seg-btn active">🚶 步行</button>
@@ -238,6 +251,14 @@
       <label>出发 <input type="time" id="plan-depart"></label>
       <label>每站停留 <input type="number" id="plan-stay" value="15" min="0" max="240" style="width:52px"> 分钟</label>
     </div>
+    <section id="plan-overview" class="plan-overview" aria-live="polite">
+      <div class="plan-overview-head">
+        <strong>计划中心</strong>
+        <span id="plan-overview-hint" class="muted">登录后同步正式计划</span>
+      </div>
+      <div id="plan-overview-stats" class="plan-overview-stats"></div>
+      <div id="plan-recent-list" class="plan-recent-list"></div>
+    </section>
     <div id="plan-result" class="plan-result"></div>
     <div class="panel-row hidden" id="plan-save-row">
       <div style="display:flex;gap:8px">
@@ -298,7 +319,8 @@
 <!-- 底部模式栏(可横向滑动) -->
 <nav id="tabbar">
   <div id="tabbar-scroll">
-    <button class="tab active" data-mode="normal"><span>🗺️</span>常规</button>
+    <button class="tab tab-plan active" data-mode="plan"><span class="tab-icon">✦</span><b>AI 计划</b><em>主模式</em></button>
+    <button class="tab" data-mode="normal"><span>🗺️</span>常规</button>
     <button class="tab" data-mode="food"><span>🍜</span>吃货</button>
     <button class="tab" data-mode="toilet"><span>🚻</span>厕所</button>
     <button class="tab" data-mode="shop"><span>🛍️</span>逛街</button>
@@ -309,7 +331,6 @@
     <button class="tab" data-mode="run"><span>🏃</span>跑步</button>
     <button class="tab" data-mode="ride"><span>🚴</span>骑行</button>
     <button class="tab" data-mode="transit"><span>🚌</span>公交</button>
-    <button class="tab" data-mode="plan"><span>📝</span>计划</button>
     <button class="tab" data-mode="foot"><span>📔</span>足迹</button>
     <button class="tab" data-mode="friends"><span>👥</span>好友</button>
     <button class="tab" data-mode="fav"><span>⭐</span>收藏</button>
@@ -337,6 +358,6 @@
   </div>
 </div>
 
-<script type="module" src="js/main.js?v=6"></script>
+<script type="module" src="js/main.js?v=7"></script>
 </body>
 </html>

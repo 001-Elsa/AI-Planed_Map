@@ -74,6 +74,9 @@ export const API = {
       base_revision: baseRevision, answers,
     });
   },
+  getPlanOverview(limit) {
+    return API.req('GET', '/ai/plans/overview?limit=' + (limit || 5));
+  },
   decidePlanPatch(planningRunId, patchId, accept) {
     return API.req('POST', '/ai/plans/' + planningRunId + '/patches/' + patchId + '/decision', { accept });
   },

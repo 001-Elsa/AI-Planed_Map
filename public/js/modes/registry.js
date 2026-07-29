@@ -120,7 +120,7 @@ export const MODES = {
     hint: '点起点和终点(2 个点),规划公交/地铁换乘方案',
   },
 
-  plan: { name: '计划模式', emoji: '📝', style: 'amap://styles/normal' },
+  plan: { name: 'AI 计划模式', emoji: '✦', style: 'amap://styles/normal' },
   foot: { name: '足迹模式', emoji: '📔', foot: true, style: 'amap://styles/whitesmoke' },
   friends: { name: '好友', emoji: '👥', style: 'amap://styles/normal' },
   fav:  { name: '我的收藏', emoji: '⭐', style: 'amap://styles/normal' },
@@ -165,7 +165,7 @@ export function initMap() {
   S.map.on('click', onMapClick);
 
   bindMainUI();
-  switchMode('normal');
+  switchMode('plan');
   setTimeout(social.checkNudge, 4000);
 }
 
@@ -392,6 +392,7 @@ export function applyMapDressing() {
 export function switchMode(mode) {
   S.currentMode = mode;
   const cfg = MODES[mode];
+  document.body.classList.toggle('plan-mode', mode === 'plan');
 
   document.querySelectorAll('#tabbar .tab').forEach((b) =>
     b.classList.toggle('active', b.dataset.mode === mode));
@@ -441,7 +442,10 @@ export function refreshModeData() {
   if (!S.map) return;
   if (S.currentMode === 'fav') social.loadFavorites();
   if (MODES[S.currentMode] && MODES[S.currentMode].route) route.loadTracks();
-  if (S.currentMode === 'plan') plan.loadPlans();
+  if (S.currentMode === 'plan') {
+    plan.loadPlans();
+    plan.loadPlanOverview();
+  }
   if (S.currentMode === 'friends') social.loadFriends();
 }
 

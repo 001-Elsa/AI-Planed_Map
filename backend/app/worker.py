@@ -4,10 +4,14 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
+import httpx
 from sqlalchemy import delete, select
 
+from backend.app.clients.amap_client import build_map_provider
+from backend.app.clients.weather_client import build_weather_provider
 from backend.app.core.config import get_settings
 from backend.app.core.observability import metrics
+from backend.app.core.privacy import read_location
 from backend.app.db.session import SessionLocal, engine
 from backend.app.infrastructure.runtime_store import RedisRuntimeStore, build_runtime_store
 from backend.app.models import (
@@ -18,9 +22,11 @@ from backend.app.models import (
     TripSession,
     UserConsent,
 )
-from backend.app.schemas.companion import ConsentScope, TripState
+from backend.app.schemas.companion import ConsentScope
 from backend.app.services.agent_controller import AgentController
+from backend.app.services.agent_decider import AgentDecider, build_agent_decider
 from backend.app.services.notifications import NotificationService, render_event_notification
+from backend.app.services.replanning import PendingReplanRequest, create_pending_replan
 
 logger = logging.getLogger("mapgo.worker")
 TRIP_EVENTS_QUEUE = "mapgo:trip-events"
@@ -63,7 +69,14 @@ async def _consents_for_trip(db, trip: TripSession) -> set[ConsentScope]:
     return scopes
 
 
-async def process_trip_event(store, payload: dict[str, Any]) -> None:
+async def process_trip_event(
+    store,
+    payload: dict[str, Any],
+    *,
+    map_provider=None,
+    weather_provider=None,
+    decider: AgentDecider | None = None,
+) -> None:
     trip_id = int(payload["trip_id"])
     event_id = payload.get("event_id")
     event_type = str(payload.get("event_type") or "")
@@ -84,7 +97,13 @@ async def process_trip_event(store, payload: dict[str, Any]) -> None:
             event = None
             if event_id is not None:
                 event = await db.get(TripEvent, int(event_id))
+            if event is not None and event.status == "worker_processed":
+                metrics.increment(
+                    "mapgo_worker_events_total", {"type": event_type, "result": "deduplicated"}
+                )
+                return
             decision = json.loads(event.decision_json) if event and event.decision_json else {}
+            event_payload = json.loads(event.payload_json) if event and event.payload_json else {}
             should_notify = bool(decision.get("should_notify"))
             impact = event.impact_level if event else "none"
 
@@ -112,6 +131,32 @@ async def process_trip_event(store, payload: dict[str, Any]) -> None:
             )
             if agent is not None and impact in {"high", "critical"}:
                 consents = await _consents_for_trip(db, trip)
+                latest_location = await db.scalar(
+                    select(LocationSnapshot)
+                    .where(LocationSnapshot.trip_session_id == trip.id)
+                    .order_by(LocationSnapshot.captured_at.desc())
+                )
+                current_location = None
+                if latest_location is not None and ConsentScope.precise_location in consents:
+                    lng, lat = read_location(latest_location)
+                    if lng is not None and lat is not None:
+                        from backend.app.schemas.ai_intent import Coordinate
+
+                        current_location = Coordinate(lng=lng, lat=lat)
+                version = await db.scalar(
+                    select(PlanVersion).where(
+                        PlanVersion.planning_run_id == trip.planning_run_id,
+                        PlanVersion.version == trip.current_plan_version,
+                    )
+                )
+                if current_location is None and version is not None:
+                    from backend.app.schemas.ai_intent import Coordinate
+
+                    current_location = Coordinate.model_validate(
+                        json.loads(version.snapshot_json)["origin"]
+                    )
+                weather_observation: dict[str, Any] | None = None
+                replan_result: dict[str, Any] | None = None
 
                 async def tool_executor(tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
                     if tool == "get_trip_state":
@@ -124,30 +169,43 @@ async def process_trip_event(store, payload: dict[str, Any]) -> None:
                         )
                         return {"has_location": snap is not None}
                     if tool == "get_weather":
-                        return {"status": "deferred_to_api", "arguments": arguments}
+                        nonlocal weather_observation
+                        if weather_provider is None or current_location is None:
+                            return {"status": "weather_unavailable"}
+                        weather_observation = (
+                            await weather_provider.current(current_location)
+                        ).model_dump(mode="json")
+                        return weather_observation
                     if tool == "propose_replan":
-                        # Worker proposes; user/API confirms. Enforce replan budget.
-                        settings = get_settings()
-                        replan_count = int(
-                            (json.loads(trip.context_json or "{}") or {}).get("replan_count") or 0
+                        nonlocal replan_result
+                        if map_provider is None or current_location is None:
+                            return {
+                                "status": "replan_unavailable",
+                                "reason": "missing_provider_or_location",
+                            }
+                        replan_result = await create_pending_replan(
+                            db=db,
+                            trip=trip,
+                            provider=map_provider,
+                            request=PendingReplanRequest(
+                                current_location=current_location,
+                                current_time=(
+                                    event.occurred_at if event else datetime.now(timezone.utc)
+                                ),
+                                reason=str(
+                                    arguments.get("reason") or decision.get("reason") or event_type
+                                ),
+                                source_event_id=event.id if event else None,
+                                event_type=event_type,
+                                event_payload=event_payload,
+                                weather=weather_observation,
+                            ),
+                            trace_id=str(payload.get("trace_id") or ""),
                         )
-                        if replan_count >= settings.max_replans_per_trip:
-                            return {"status": "replan_budget_exceeded"}
-                        context = json.loads(trip.context_json or "{}")
-                        context["replan_proposed_at"] = datetime.now(timezone.utc).isoformat()
-                        context["replan_reason"] = arguments.get("reason") or event_type
-                        trip.context_json = json.dumps(context, ensure_ascii=False)
-                        if trip.state not in {
-                            TripState.replanning.value,
-                            TripState.completed.value,
-                            TripState.cancelled.value,
-                        }:
-                            trip.state = TripState.replanning.value
-                        await db.commit()
-                        return {"status": "replan_proposed", "requires_confirmation": True}
+                        return replan_result
                     return {"status": "unsupported_in_worker", "tool": tool}
 
-                controller = AgentController(db)
+                controller = AgentController(db, decider=decider)
                 result = await controller.run_once(
                     trip=trip,
                     agent=agent,
@@ -156,6 +214,8 @@ async def process_trip_event(store, payload: dict[str, Any]) -> None:
                         "event_type": event_type,
                         "reason": decision.get("reason"),
                         "impact_level": impact,
+                        "has_precise_location": current_location is not None,
+                        "event_payload": event_payload,
                     },
                     consents=consents,
                     tool_executor=tool_executor,
@@ -165,6 +225,15 @@ async def process_trip_event(store, payload: dict[str, Any]) -> None:
                     "mapgo_worker_agent_runs_total",
                     {"status": result.get("status") or "unknown"},
                 )
+                if event is not None:
+                    decision["agent_run"] = {
+                        "run_id": result.get("run_id"),
+                        "status": result.get("status"),
+                    }
+                    if replan_result is not None:
+                        decision["replan"] = replan_result
+                    event.decision_json = json.dumps(decision, ensure_ascii=False, default=str)
+                    await db.commit()
 
             # Refresh weather/risk snapshot metadata into trip stream.
             version = await db.scalar(
@@ -180,6 +249,7 @@ async def process_trip_event(store, payload: dict[str, Any]) -> None:
                 "state": trip.state,
                 "impact_level": impact,
                 "decision": decision,
+                "plan_patch": (decision.get("replan") if isinstance(decision, dict) else None),
                 "worker": {"processed": True, "plan_present": version is not None},
                 "occurred_at": datetime.now(timezone.utc).isoformat(),
             }
@@ -234,6 +304,14 @@ async def run_worker() -> None:
     if not settings.redis_url:
         raise RuntimeError("Worker requires REDIS_URL")
     store = await build_runtime_store(settings.redis_url)
+    timeout = httpx.Timeout(
+        settings.external_timeout_seconds,
+        connect=settings.external_connect_timeout_seconds,
+    )
+    client = httpx.AsyncClient(timeout=timeout, follow_redirects=False)
+    map_provider = build_map_provider(settings, client)
+    weather_provider = build_weather_provider(client, settings.mock_weather_provider)
+    decider = build_agent_decider(settings, client)
     logger.info("MapGo worker started")
     try:
         while True:
@@ -244,7 +322,13 @@ async def run_worker() -> None:
             item = await store.dequeue(TRIP_EVENTS_QUEUE, timeout_seconds=2)
             if item:
                 try:
-                    await process_trip_event(store, item)
+                    await process_trip_event(
+                        store,
+                        item,
+                        map_provider=map_provider,
+                        weather_provider=weather_provider,
+                        decider=decider,
+                    )
                 except Exception:
                     logger.exception("trip event handler crashed")
 
@@ -258,6 +342,7 @@ async def run_worker() -> None:
                 metrics.increment("mapgo_worker_location_cleanup_total", value=removed)
             await asyncio.sleep(0)
     finally:
+        await client.aclose()
         await store.close()
         await engine.dispose()
 

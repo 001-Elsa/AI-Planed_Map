@@ -4,6 +4,7 @@
 import { S } from '../state.js';
 import { $, escapeHtml, toast } from '../ui/dom.js';
 import { API } from '../services/api.js';
+import { store } from '../services/store.js';
 import { fmtDist, fmtDur, fmtClock, toXY, copyText } from '../services/format.js';
 import { routeLeg, searchNearestPOI } from '../services/amap.js';
 import { solveOrder, solveOrderExact } from '../services/algo.js';
@@ -17,15 +18,19 @@ let planningConversationId = null;
 let planningConversationRevision = null;
 let eventStreamController = null;
 let lastStreamEventId = 0;
+let draftSaveTimer = null;
+const PLAN_DRAFT_KEY = 'mapgo_plan_draft';
 
 /* ---------------- 生命周期 ---------------- */
 export function activate() {
   $('plan-save-row').classList.add('hidden');
+  if (!$('plan-input').value) $('plan-input').value = store.get(PLAN_DRAFT_KEY) || '';
   if (!$('plan-depart').value) {
     const now = new Date();
     $('plan-depart').value = String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0');
   }
   loadPlans();
+  loadPlanOverview();
 }
 
 export function clearAll() {
@@ -53,6 +58,29 @@ export function bindPlanUI() {
   $('btn-trip-pause').addEventListener('click', pauseTrip);
   $('btn-location-consent').addEventListener('click', toggleLocationConsent);
   $('btn-trip-replan').addEventListener('click', requestDynamicReplan);
+  document.querySelectorAll('[data-plan-template]').forEach((button) => {
+    button.addEventListener('click', () => {
+      $('plan-input').value = button.dataset.planTemplate || '';
+      persistPlanDraft();
+      $('plan-input').focus();
+    });
+  });
+  $('plan-input').addEventListener('input', () => {
+    clearTimeout(draftSaveTimer);
+    draftSaveTimer = setTimeout(persistPlanDraft, 250);
+  });
+  $('plan-input').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+      event.preventDefault();
+      runAIPlan();
+    }
+  });
+}
+
+function persistPlanDraft() {
+  const value = $('plan-input').value.trim();
+  if (value) store.set(PLAN_DRAFT_KEY, value);
+  else store.del(PLAN_DRAFT_KEY);
 }
 
 async function runAIPlan() {
@@ -83,6 +111,7 @@ async function runAIPlan() {
       return;
     }
     await renderAIResult(result, origin, text, out);
+    loadPlanOverview();
   } catch (err) {
     out.innerHTML = '<div class="err">AI 规划失败：' + escapeHtml(err.message || String(err)) + '</div>';
   } finally {
@@ -177,6 +206,7 @@ async function renderAIResult(result, origin, text, out) {
       stay: $('plan-stay').value, aiResult: result,
     };
     activePlanningRunId = result.planning_run_id;
+    persistPlanDraft();
     renderStructuredTimeline(result);
     $('plan-save-row').classList.remove('hidden');
 }
@@ -620,6 +650,61 @@ async function savePlan() {
     toast('计划已保存 💾');
     loadPlans();
   } catch (e) { toast(e.message); }
+}
+
+export async function loadPlanOverview() {
+  const hint = $('plan-overview-hint');
+  const stats = $('plan-overview-stats');
+  const list = $('plan-recent-list');
+  stats.innerHTML = '';
+  list.innerHTML = '';
+  if (!API.user) {
+    hint.textContent = API.offline ? '后端未启动' : '登录后同步正式计划';
+    return;
+  }
+  hint.textContent = '同步中…';
+  try {
+    const overview = await API.getPlanOverview(4);
+    const rate = overview.success_rate == null ? '—' : Math.round(overview.success_rate * 100) + '%';
+    stats.innerHTML =
+      '<div><b>' + overview.formal_plans + '</b><span>正式计划</span></div>' +
+      '<div><b>' + rate + '</b><span>规划成功率</span></div>' +
+      '<div><b>' + overview.active_trips + '</b><span>进行中行程</span></div>';
+    hint.textContent = overview.recent.length ? '点选可继续' : '还没有正式 AI 计划';
+    overview.recent.forEach((item) => {
+      const summary = item.summary || {};
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'plan-recent';
+      const title = String(item.input_text || '未命名计划').replace(/\s+/g, ' ').trim();
+      const meta = (summary.stop_count || 0) + ' 站 · ' +
+        fmtDist(summary.total_distance_meters || 0) +
+        (item.trip_state ? ' · ' + item.trip_state : '');
+      button.innerHTML =
+        '<b>' + escapeHtml(title) + '</b>' +
+        '<span class="recent-version">v' + item.plan_version + '</span>' +
+        '<small>' + escapeHtml(meta) + '</small>' +
+        '<small>' + escapeHtml(String(item.created_at || '').slice(0, 16).replace('T', ' ')) + '</small>';
+      button.addEventListener('click', async () => {
+        const snapshot = { ...(item.snapshot || {}) };
+        snapshot.planning_run_id = item.planning_run_id;
+        snapshot.plan_version = item.plan_version;
+        activeTripId = item.trip_id || null;
+        $('plan-input').value = item.input_text || '';
+        persistPlanDraft();
+        const origin = snapshot.origin || S.myPos || S.map.getCenter();
+        try {
+          await renderAIResult(snapshot, origin, item.input_text || '', $('plan-result'));
+          toast('已继续正式计划 v' + item.plan_version);
+        } catch (error) {
+          toast('恢复计划失败：' + error.message);
+        }
+      });
+      list.appendChild(button);
+    });
+  } catch (error) {
+    hint.textContent = error.message;
+  }
 }
 
 export async function loadPlans() {
