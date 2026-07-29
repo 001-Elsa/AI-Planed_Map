@@ -12,6 +12,9 @@ def utcnow() -> datetime:
 
 class User(Base):
     __tablename__ = "users"
+    # Migration 0001 creates both a unique constraint and a unique index;
+    # declare the constraint explicitly so `alembic check` sees no drift.
+    __table_args__ = (UniqueConstraint("username"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     username: Mapped[str] = mapped_column(String(20), unique=True, index=True)
@@ -212,6 +215,9 @@ class TripEvent(Base):
 
 class AgentSession(Base):
     __tablename__ = "agent_sessions"
+    # Migration 0003 creates both a unique constraint and a unique index;
+    # declare the constraint explicitly so `alembic check` sees no drift.
+    __table_args__ = (UniqueConstraint("trip_session_id"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     trip_session_id: Mapped[int] = mapped_column(

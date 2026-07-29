@@ -46,11 +46,7 @@ async def main() -> None:
         "note": "RuleBased offline gates; live LLM eval is optional via LLM_API_KEY",
     }
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
-    failures = [
-        name
-        for name, threshold in GATES.items()
-        if metrics[name] < threshold
-    ]
+    failures = [name for name, threshold in GATES.items() if metrics[name] < threshold]
     if failures:
         raise SystemExit(f"AI eval quality gates failed: {failures}")
 

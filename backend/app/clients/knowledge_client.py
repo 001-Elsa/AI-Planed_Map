@@ -28,7 +28,7 @@ class CuratedKnowledgeProvider:
         path = Path(__file__).resolve().parents[1] / "knowledge" / "attractions.json"
         self.records = json.loads(path.read_text(encoding="utf-8"))
         self.chunks = self._build_chunks(self.records)
-        self._df = Counter()
+        self._df: Counter[str] = Counter()
         for chunk in self.chunks:
             for term in set(chunk["tokens"]):
                 self._df[term] += 1

@@ -1,6 +1,7 @@
 import asyncio
 import json
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
@@ -555,9 +556,9 @@ async def trip_summary(trip_id: int, user: CurrentUser, db: Db):
                     arrived_at[stop_id] = payload["arrived_at"]
                 if payload.get("planned_arrival") and payload.get("arrived_at"):
                     try:
-                        planned = datetime.fromisoformat(payload["planned_arrival"])
-                        actual = datetime.fromisoformat(payload["arrived_at"])
-                        eta_errors.append(abs((actual - planned).total_seconds()))
+                        planned_dt = datetime.fromisoformat(payload["planned_arrival"])
+                        actual_dt = datetime.fromisoformat(payload["arrived_at"])
+                        eta_errors.append(abs((actual_dt - planned_dt).total_seconds()))
                     except ValueError:
                         pass
         elif event.event_type == "PlanStopSkipped":
@@ -901,13 +902,14 @@ async def _replan_remaining_trip_locked(
     for alt in (TransportMode.driving, TransportMode.transit, TransportMode.walking):
         if alt not in modes_to_try:
             modes_to_try.append(alt)
-    alternatives = []
+    alternatives: list[dict[str, Any]] = []
     primary = None
     for candidate_mode in modes_to_try[:3]:
         try:
             matrix = await request.app.state.map_provider.route_matrix(points, candidate_mode)
         except Exception:  # noqa: BLE001
-            continue
+            # Intentionally skip transport modes whose matrix lookup fails.
+            continue  # nosec B112
         tasks = [PlanningTask.model_validate(stop["task"]) for stop in remaining]
         # Drop optional (required=False) stops as a differentiated option.
         for drop_optional in (False, True):
@@ -940,7 +942,7 @@ async def _replan_remaining_trip_locked(
                 "label": (
                     f"方案{'ABC'[len(alternatives)]}"
                     if len(alternatives) < 3
-                    else f"方案{len(alternatives)+1}"
+                    else f"方案{len(alternatives) + 1}"
                 ),
                 "transport_mode": candidate_mode.value,
                 "drop_optional": drop_optional,

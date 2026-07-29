@@ -1,5 +1,8 @@
 from backend.app.schemas.ai_intent import AIPlanRequest, PlanningIntent, PlanningTask
-from backend.app.services.clarification import apply_clarification_answer, select_clarification_questions
+from backend.app.services.clarification import (
+    apply_clarification_answer,
+    select_clarification_questions,
+)
 
 
 def test_dynamic_clarification_covers_party_and_poi_choice():
@@ -12,10 +15,13 @@ def test_dynamic_clarification_covers_party_and_poi_choice():
         max_questions=5,
     )
     fields = {item.field for item in questions}
-    assert "constraints.hard.wheelchair_accessible" in fields or "constraints.hard.party.elderly" in fields
-    assert any("max_walking" in field or field == "constraints.hard.max_walking_meters" for field in fields) or any(
-        "别太累" in item.reason or "步行" in item.question for item in questions
+    assert (
+        "constraints.hard.wheelchair_accessible" in fields
+        or "constraints.hard.party.elderly" in fields
     )
+    assert any(
+        "max_walking" in field or field == "constraints.hard.max_walking_meters" for field in fields
+    ) or any("别太累" in item.reason or "步行" in item.question for item in questions)
 
     data = {"text": "去公园"}
     apply_clarification_answer(data, "constraints.hard.max_walking_meters", 2000)
