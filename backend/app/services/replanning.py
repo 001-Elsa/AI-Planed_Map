@@ -377,8 +377,12 @@ async def create_pending_replan(
             trace_id=trace_id,
         )
     )
-    await db.flush()
-    await db.commit()
+    try:
+        await db.flush()
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
     return {
         "status": "patch_pending_confirmation",
         "patch_created": True,

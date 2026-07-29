@@ -165,7 +165,7 @@ class DecisionAuditLog(Base):
     action: Mapped[str] = mapped_column(String(80))
     reason: Mapped[str] = mapped_column(String(500))
     evidence_json: Mapped[str] = mapped_column(Text, default="{}")
-    policy_result: Mapped[str] = mapped_column(String(30))
+    policy_result: Mapped[str] = mapped_column(String(80))
     trace_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
