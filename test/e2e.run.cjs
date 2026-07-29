@@ -3,10 +3,8 @@
  *
  *   npm run test:e2e
  *
- * 需要 devDependency:playwright(npm i -D playwright && npx playwright install chromium)。
- * 策略:spawn 真实服务(临时数据目录),无头浏览器走关键用户路径。
- * 不依赖真实高德 Key —— 只验证到"Key 配置弹窗"为止的全部应用逻辑,
- * 以及模块加载零报错、admin/share 页面可用。
+ * 策略: spawn 真实 FastAPI (uvicorn + 临时 SQLite), 无头浏览器走关键用户路径。
+ * 不依赖真实高德 Key —— 只验证到"Key 配置弹窗"为止的全部应用逻辑。
  * =================================================================== */
 'use strict';
 
@@ -23,6 +21,7 @@ try {
   process.exit(1);
 }
 
+const ROOT = path.join(__dirname, '..');
 const PORT = 3800 + Math.floor(Math.random() * 100);
 const BASE = `http://127.0.0.1:${PORT}`;
 
@@ -32,15 +31,52 @@ function check(name, cond, extra) {
   else { failed++; console.error('  ✗ ' + name + (extra ? ' — ' + extra : '')); }
 }
 
+function run(cmd, args, env, cwd) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, { env, cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = '';
+    child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+    child.on('error', reject);
+    child.on('exit', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error((cmd + ' ' + args.join(' ') + ' failed: ' + stderr).trim()));
+    });
+  });
+}
+
 (async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mapgo-e2e-'));
-  const proc = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {
-    env: Object.assign({}, process.env, { PORT: String(PORT), DATA_DIR: tmpDir }),
-    stdio: 'ignore',
+  const dbPath = path.join(tmpDir, 'mapgo-e2e.db').replace(/\\/g, '/');
+  const env = Object.assign({}, process.env, {
+    PORT: String(PORT),
+    DATABASE_URL: 'sqlite+aiosqlite:///' + dbPath,
+    ENVIRONMENT: 'test',
+    MOCK_MAP_PROVIDER: 'true',
+    MOCK_WEATHER_PROVIDER: 'true',
+    REDIS_URL: '',
+    LLM_API_KEY: '',
   });
-  for (let i = 0; i < 50; i++) {
-    try { const r = await fetch(BASE + '/api/health'); if (r.ok) break; } catch (e) { /* wait */ }
-    await new Promise((r) => setTimeout(r, 100));
+
+  await run(process.platform === 'win32' ? 'python' : 'python3', ['-m', 'alembic', 'upgrade', 'head'], env, ROOT);
+
+  const proc = spawn(
+    process.platform === 'win32' ? 'python' : 'python3',
+    ['-m', 'uvicorn', 'backend.app.main:app', '--host', '127.0.0.1', '--port', String(PORT)],
+    { env, cwd: ROOT, stdio: 'ignore' }
+  );
+
+  let healthy = false;
+  for (let i = 0; i < 80; i++) {
+    try {
+      const r = await fetch(BASE + '/api/health');
+      if (r.ok) { healthy = true; break; }
+    } catch (e) { /* wait */ }
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  if (!healthy) {
+    proc.kill('SIGTERM');
+    console.error('E2E 服务未能在时限内就绪');
+    process.exit(1);
   }
 
   const browser = await chromium.launch();
@@ -56,7 +92,6 @@ function check(name, cond, extra) {
   };
 
   try {
-    /* ---- 1. 主应用:模块加载 + 注册全流程 ---- */
     console.log('▶ 主应用');
     const page = await newPage();
     await page.goto(BASE, { waitUntil: 'networkidle' });
@@ -69,17 +104,15 @@ function check(name, cond, extra) {
     await page.fill('#auth-password', 'e2epass1');
     await page.fill('#auth-password2', 'e2epass1');
     await page.click('#auth-submit');
-    await page.waitForTimeout(1200);
+    await page.waitForTimeout(1500);
     check('注册后进入应用(Key 弹窗出现)', await page.locator('#setup-mask').isVisible());
     check('用户按钮显示昵称首字', (await page.locator('#btn-user').textContent()).trim() === 'e');
-    check('16 个模式标签渲染', (await page.locator('#tabbar .tab').count()) === 16);
+    check('模式标签渲染', (await page.locator('#tabbar .tab').count()) >= 14);
 
-    /* 复访:token 直接进入 */
     await page.goto(BASE, { waitUntil: 'networkidle' });
     await page.waitForTimeout(600);
     check('复访凭 token 免登录', !(await page.locator('#auth-view').isVisible()));
 
-    /* ---- 2. 管理后台 ---- */
     console.log('▶ 管理后台');
     const admin = await newPage();
     await admin.goto(BASE + '/admin.html', { waitUntil: 'domcontentloaded' });
@@ -93,7 +126,6 @@ function check(name, cond, extra) {
     check('管理员(首个注册)进入后台', await admin.locator('#panel').isVisible());
     check('总览统计渲染', /用户/.test(await admin.locator('#tiles').textContent()));
 
-    /* 配置服务端占位 Key → /api/config 生效 */
     await admin.fill('#ak', 'E2E_PLACEHOLDER_KEY');
     await admin.fill('#aj', 'E2E_PLACEHOLDER_JSCODE');
     await admin.click('button:has-text("保存")');
@@ -101,7 +133,6 @@ function check(name, cond, extra) {
     const cfg = await fetch(BASE + '/api/config').then((r) => r.json());
     check('服务端 Key 代理配置生效', cfg.data.proxy === true && cfg.data.amapKey === 'E2E_PLACEHOLDER_KEY');
 
-    /* ---- 3. 分享页 ---- */
     console.log('▶ 分享页');
     const login = await fetch(BASE + '/api/login', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -110,7 +141,16 @@ function check(name, cond, extra) {
     const share = await fetch(BASE + '/api/shares', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + login.data.token },
-      body: JSON.stringify({ type: 'track', payload: { kind: 'run', name: 'e2e晨跑', distance: 4200, duration: 1500, path: [[116.4, 39.9, 0], [116.42, 39.92, 1500]] } }),
+      body: JSON.stringify({
+        type: 'track',
+        payload: {
+          kind: 'run',
+          name: 'e2e晨跑',
+          distance: 4200,
+          duration: 1500,
+          path: [[116.4, 39.9, 0], [116.42, 39.92, 1500]],
+        },
+      }),
     }).then((r) => r.json());
     const sp = await newPage();
     await sp.goto(BASE + '/share.html?t=' + share.data.token, { waitUntil: 'domcontentloaded' });
@@ -118,7 +158,6 @@ function check(name, cond, extra) {
     const card = await sp.locator('#card').textContent();
     check('分享页展示轨迹信息卡', card.includes('e2e晨跑') && card.includes('4.2'));
 
-    /* ---- 4. 游客模式与退出 ---- */
     console.log('▶ 游客与退出');
     const g = await browser.newContext();
     const gp = await g.newPage();

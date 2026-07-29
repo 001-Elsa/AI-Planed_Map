@@ -13,12 +13,12 @@
 |---|---|---|
 | 模型生成虚假 POI | POI 只接受 Map Provider 返回值 | Provider 签名快照与新鲜度 SLA |
 | Prompt 注入修改正式计划 | LLM 无数据库写权限；Patch 需确认和验证 | 工具参数污点标记 |
-| 重放产生重复规划/费用 | 用户隔离的幂等键、指纹和 TTL | Redis 分布式锁 |
-| 旧 Patch 覆盖新版本 | base version 乐观锁 | 数据库行级锁 |
-| 上游失败被包装成精确 ETA | 每条边带 fallback 和 confidence | 前端统一可信度策略 |
+| 重放产生重复规划/费用 | 用户隔离的幂等键、指纹和 TTL；Runtime Store 分布式锁 | Redis 锁指标与告警 |
+| 旧 Patch 覆盖新版本 | base version 乐观锁；行程级 mutate 锁 | 数据库行级锁 |
+| 上游失败被包装成精确 ETA | 每条边带 fallback 和 confidence；启发式/残差区间 | 前端统一可信度策略 |
 | 密钥进入镜像或前端 | 仅环境变量注入，代理不返回 jscode | Secret Manager |
 | 未授权读取他人计划 | 所有版本/Patch 查询绑定 user_id | 租户级 RLS |
-| 持续保存精确位置 | 当前版本尚未实现后台定位 | P2 默认短期 TTL、显式 Consent |
+| 持续保存精确位置 | 显式 Consent、加密字段、短期 TTL、可导出/清除 | 更细粒度设备级授权 |
 
 ## 明确禁止
 

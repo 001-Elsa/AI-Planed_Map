@@ -90,7 +90,7 @@ function bindAuthUI() {
       hideAuth();
       if (S.map) refreshUserUI(); else startApp();
     } catch (e) {
-      authErr(API.offline ? '后端服务不可用,请先 node server.js' : e.message);
+      authErr(API.offline ? '后端服务不可用,请先启动 uvicorn' : e.message);
       if (API.offline) $('auth-offline').classList.remove('hidden');
     } finally {
       $('auth-submit').disabled = false;

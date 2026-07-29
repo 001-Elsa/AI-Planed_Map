@@ -1,4 +1,4 @@
-"""Run the committed intent set and print measured (not invented) metrics."""
+"""Run the committed intent set and fail CI when quality gates regress."""
 
 import asyncio
 import json
@@ -8,6 +8,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from backend.app.services.intent_parser import RuleBasedIntentParser
+
+GATES = {
+    "structured_output_valid_rate": 0.98,
+    "task_count_accuracy": 0.70,
+    "transport_mode_accuracy": 0.80,
+    "deadline_accuracy": 0.70,
+}
 
 
 async def main() -> None:
@@ -29,19 +36,23 @@ async def main() -> None:
             expected_hour is None and not actual_hours or expected_hour in actual_hours
         )
     total = len(cases)
-    print(
-        json.dumps(
-            {
-                "cases": total,
-                "structured_output_valid_rate": valid / total,
-                "task_count_accuracy": task_correct / total,
-                "transport_mode_accuracy": mode_correct / total,
-                "deadline_accuracy": deadline_correct / total,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
+    metrics = {
+        "cases": total,
+        "structured_output_valid_rate": valid / total,
+        "task_count_accuracy": task_correct / total,
+        "transport_mode_accuracy": mode_correct / total,
+        "deadline_accuracy": deadline_correct / total,
+        "parser": parser.name,
+        "note": "RuleBased offline gates; live LLM eval is optional via LLM_API_KEY",
+    }
+    print(json.dumps(metrics, ensure_ascii=False, indent=2))
+    failures = [
+        name
+        for name, threshold in GATES.items()
+        if metrics[name] < threshold
+    ]
+    if failures:
+        raise SystemExit(f"AI eval quality gates failed: {failures}")
 
 
 if __name__ == "__main__":

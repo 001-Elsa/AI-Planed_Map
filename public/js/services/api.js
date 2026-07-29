@@ -96,6 +96,7 @@ export const API = {
   replanTrip(tripId, payload) {
     return API.req('POST', '/companion/trips/' + tripId + '/replan', payload);
   },
+  getTripSummary(tripId) { return API.req('GET', '/companion/trips/' + tripId + '/summary'); },
   deleteTripLocations(tripId) { return API.req('DELETE', '/companion/trips/' + tripId + '/locations'); },
 
   listTracks(kind, limit) {

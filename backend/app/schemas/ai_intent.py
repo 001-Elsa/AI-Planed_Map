@@ -207,6 +207,7 @@ class ScoreBreakdown(StrictModel):
     low_rating: float = 0
     uncertainty: float = 0
     monetary_cost: float = 0
+    change: float = 0
     total: float = 0
 
 
@@ -216,6 +217,10 @@ class UncertaintySummary(StrictModel):
     upper_duration_seconds: float = Field(ge=0)
     on_time_probability: float | None = Field(default=None, ge=0, le=1)
     method: str
+    calibration_sample_size: int = 0
+    mae_seconds: float | None = None
+    p90_error_seconds: float | None = None
+    coverage: float | None = Field(default=None, ge=0, le=1)
 
 
 class AIPlanResult(StrictModel):

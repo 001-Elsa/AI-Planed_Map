@@ -102,6 +102,10 @@ async def _execute_conversation_plan(
     await _enforce_ai_budget(request, user.id, body.text)
     parser = build_intent_parser(settings, request.app.state.http_client)
     result = await PlanningService(parser, request.app.state.map_provider, settings).plan(body)
+    if getattr(parser, "fallback_used", False):
+        metrics.increment(
+            "mapgo_llm_fallback_total", {"parser": getattr(parser, "last_parser", "unknown")}
+        )
     data = result.model_dump(mode="json")
     input_tokens = int(getattr(parser, "input_tokens", 0))
     output_tokens = int(getattr(parser, "output_tokens", 0))
@@ -197,16 +201,14 @@ async def continue_planning_conversation(
             {"current_revision": conversation.revision},
         )
     request_data = json.loads(conversation.request_json)
-    supported = {
-        "origin",
-        "departure_time",
-        "transport_mode",
-        "constraints.hard.max_walking_meters",
-        "constraints.hard.max_total_duration_minutes",
-        "constraints.hard.latest_return_time",
-        "constraints.hard.max_total_cost_yuan",
-    }
-    unsupported = sorted(set(body.answers) - supported)
+    from backend.app.services.clarification import apply_clarification_answer
+
+    unsupported = [
+        field
+        for field in body.answers
+        if field not in {"origin", "departure_time", "transport_mode"}
+        and not field.startswith(("constraints.hard.", "preferences.", "tasks."))
+    ]
     if unsupported:
         raise AppError(
             422,
@@ -215,16 +217,23 @@ async def continue_planning_conversation(
             {"fields": unsupported},
         )
     for field, value in body.answers.items():
-        if field in {"origin", "departure_time", "transport_mode"}:
-            request_data[field] = value
-            continue
-        _, _, hard_field = field.partition("constraints.hard.")
-        constraints = request_data.setdefault("constraints", {"hard": {}, "uncertain": []})
-        if constraints is None:
-            constraints = {"hard": {}, "uncertain": []}
-            request_data["constraints"] = constraints
-        constraints.setdefault("hard", {})[hard_field] = value
+        try:
+            apply_clarification_answer(request_data, field, value)
+        except (KeyError, ValueError, IndexError) as exc:
+            raise AppError(
+                422,
+                "UNSUPPORTED_CLARIFICATION_FIELD",
+                "澄清字段无法应用",
+                {"field": field, "reason": str(exc)},
+            ) from exc
+    known_fields = set(AIPlanRequest.model_fields)
+    extras = {key: request_data.pop(key) for key in list(request_data) if key not in known_fields}
     updated_request = AIPlanRequest.model_validate(request_data)
+    if extras:
+        conversation.request_json = json.dumps(
+            {**updated_request.model_dump(mode="json"), **extras},
+            ensure_ascii=False,
+        )
     data = await _execute_conversation_plan(updated_request, request, user, db, conversation)
     return {"ok": True, "data": data}
 
@@ -303,6 +312,11 @@ async def create_ai_plan(
             record.error_code = exc.code if isinstance(exc, AppError) else "UNEXPECTED_ERROR"
             await db.commit()
         raise
+    if getattr(parser, "fallback_used", False):
+        metrics.increment(
+            "mapgo_llm_fallback_total",
+            {"parser": getattr(parser, "last_parser", "unknown")},
+        )
     response_data = result.model_dump(mode="json")
     planning_seconds = time.perf_counter() - started
     metrics.observe(

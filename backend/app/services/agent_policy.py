@@ -19,12 +19,33 @@ TOOL_POLICIES = {
         frozenset({TripState.planning, TripState.active_trip, TripState.replanning})
     ),
     "get_weather": ToolPolicy(
-        frozenset({TripState.plan_ready, TripState.active_trip, TripState.replanning})
+        frozenset(
+            {
+                TripState.plan_ready,
+                TripState.active_trip,
+                TripState.at_risk,
+                TripState.off_route,
+                TripState.replanning,
+            }
+        )
     ),
     "generate_attraction_brief": ToolPolicy(frozenset({TripState.active_trip})),
     "get_current_location": ToolPolicy(
-        frozenset({TripState.active_trip, TripState.off_route, TripState.replanning}),
+        frozenset(
+            {
+                TripState.active_trip,
+                TripState.off_route,
+                TripState.at_risk,
+                TripState.replanning,
+            }
+        ),
         consent_scope=ConsentScope.precise_location,
+    ),
+    "propose_replan": ToolPolicy(
+        frozenset(
+            {TripState.active_trip, TripState.off_route, TripState.at_risk, TripState.replanning}
+        ),
+        confirmation_required=True,
     ),
     "create_plan_patch": ToolPolicy(
         frozenset(

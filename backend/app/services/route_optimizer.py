@@ -53,12 +53,17 @@ def evaluate_joint_order(
     preferences: PlanningPreferences,
     constraints: HardConstraints,
     mode: TransportMode,
+    *,
+    safety_buffer_minutes: int = 0,
+    previous_order: list[int] | None = None,
+    baseline_distance_meters: float | None = None,
 ) -> RouteEvaluation:
     cursor = departure
     previous = 0
     arrivals: list[datetime] = []
     departures: list[datetime] = []
     conflicts: list[str] = []
+    soft_penalties: list[str] = []
     selected_nodes: list[CandidateNode] = []
     total_distance = 0.0
     total_seconds = 0.0
@@ -66,6 +71,8 @@ def evaluate_joint_order(
     rating_penalty = 0.0
     total_cost = 0.0
     cost_unknown = False
+    buffer = timedelta(minutes=max(0, safety_buffer_minutes))
+    visited_districts: list[str] = []
 
     if constraints.required_task_order and not _relative_order_satisfied(
         order, constraints.required_task_order
@@ -90,9 +97,12 @@ def evaluate_joint_order(
         if task.earliest_arrival and cursor < task.earliest_arrival:
             cursor = task.earliest_arrival
         arrivals.append(cursor)
-        if task.deadline and cursor > task.deadline:
+        effective_deadline = task.deadline - buffer if task.deadline else None
+        if effective_deadline and cursor > effective_deadline:
             conflicts.append(
-                f"“{task.description}”预计 {cursor:%H:%M} 到达，超过截止时间 {task.deadline:%H:%M}"
+                f"“{task.description}”预计 {cursor:%H:%M} 到达，超过截止时间"
+                f"{'（含不确定缓冲）' if safety_buffer_minutes else ''} "
+                f"{effective_deadline:%H:%M}"
             )
         if task.min_rating is not None and (node.rating is None or node.rating < task.min_rating):
             conflicts.append(f"“{task.description}”没有满足最低评分 {task.min_rating:g} 的候选地点")
@@ -109,6 +119,8 @@ def evaluate_joint_order(
             conflicts.append(f"“{task.description}”不在允许区域内")
         if node.district and any(area in node.district for area in constraints.avoid_areas):
             conflicts.append(f"“{task.description}”位于需要避开的区域")
+        if node.district:
+            visited_districts.append(node.district)
         if node.estimated_cost_yuan is None:
             cost_unknown = True
         else:
@@ -141,9 +153,12 @@ def evaluate_joint_order(
         conflicts.append(
             f"总行程约 {elapsed_minutes:.0f} 分钟，超过上限 {constraints.max_total_duration_minutes} 分钟"
         )
-    if constraints.latest_return_time is not None and cursor > constraints.latest_return_time:
+    effective_latest_return = (
+        constraints.latest_return_time - buffer if constraints.latest_return_time else None
+    )
+    if effective_latest_return is not None and cursor > effective_latest_return:
         conflicts.append(
-            f"预计 {cursor:%H:%M} 完成，超过最晚返回时间 {constraints.latest_return_time:%H:%M}"
+            f"预计 {cursor:%H:%M} 完成，超过最晚返回时间 {effective_latest_return:%H:%M}"
         )
     if (
         constraints.max_walking_meters is not None
@@ -161,9 +176,25 @@ def evaluate_joint_order(
                 f"预计费用 {total_cost:.2f} 元，超过总预算 {constraints.max_total_cost_yuan:.2f} 元"
             )
     if constraints.must_pass_areas:
-        conflicts.append("当前路线矩阵不含完整路径几何，无法验证必须经过区域")
+        if not visited_districts:
+            conflicts.append("当前候选缺少行政区信息，无法验证必须经过区域")
+        else:
+            missing_areas = [
+                area
+                for area in constraints.must_pass_areas
+                if not any(area in district for district in visited_districts)
+            ]
+            if missing_areas:
+                conflicts.append("方案未覆盖必须经过区域：" + "、".join(missing_areas))
     if constraints.max_detour_meters is not None:
-        conflicts.append("缺少无绕行基准路线，无法验证最大绕行距离")
+        if baseline_distance_meters is None:
+            soft_penalties.append("缺少无绕行基准路线，最大绕行按软约束惩罚处理")
+        else:
+            detour = max(0.0, total_distance - baseline_distance_meters)
+            if detour > constraints.max_detour_meters:
+                conflicts.append(
+                    f"绕行约 {detour:.0f} 米，超过上限 {constraints.max_detour_meters:.0f} 米"
+                )
     if any(
         budget is not None
         for budget in (
@@ -172,23 +203,44 @@ def evaluate_joint_order(
             constraints.ticket_budget_yuan,
         )
     ):
-        conflicts.append("Provider 尚未返回分类费用，无法验证分类预算硬约束")
+        # Soften: keep as conflict only when no cost data exists; otherwise warn via penalty.
+        if cost_unknown:
+            soft_penalties.append("Provider 尚未返回分类费用，分类预算仅作软约束提示")
+        else:
+            soft_penalties.append("分类预算缺少可靠拆分，已并入总费用软惩罚")
 
     weights = preferences.weights
     distance_component = total_distance / 10
     walking_component = total_seconds if mode == TransportMode.walking else 0
     rating_component = rating_penalty * 600
     uncertainty_component = confidence_penalty * 600
+    change_component = 0.0
+    if previous_order:
+        # Kendall-tau style pairwise disagreement penalty.
+        position = {task_index: idx for idx, task_index in enumerate(order)}
+        prev_pos = {task_index: idx for idx, task_index in enumerate(previous_order)}
+        shared = [task_index for task_index in order if task_index in prev_pos]
+        disagreements = 0
+        for left_idx, left in enumerate(shared):
+            for right in shared[left_idx + 1 :]:
+                if (position[left] - position[right]) * (prev_pos[left] - prev_pos[right]) < 0:
+                    disagreements += 1
+        change_component = disagreements * 120
     distance_weight = weights.distance * (2 if preferences.minimize_distance else 1)
     walking_weight = weights.walking_time * (2 if preferences.minimize_walking else 1)
     rating_weight = weights.low_rating * (2 if preferences.prefer_high_rating else 1)
+    soft_penalty_score = 180.0 * len(soft_penalties)
     breakdown = ScoreBreakdown(
         travel_time=total_seconds * weights.travel_time,
         walking_time=walking_component * walking_weight,
         distance=distance_component * distance_weight,
         low_rating=rating_component * rating_weight,
         uncertainty=uncertainty_component * weights.uncertainty,
-        monetary_cost=total_cost * 60 * weights.monetary_cost,
+        monetary_cost=total_cost
+        * 60
+        * weights.monetary_cost
+        * (2 if preferences.minimize_cost else 1),
+        change=change_component * weights.change,
     )
     breakdown.total = (
         breakdown.travel_time
@@ -197,6 +249,8 @@ def evaluate_joint_order(
         + breakdown.low_rating
         + breakdown.uncertainty
         + breakdown.monetary_cost
+        + breakdown.change
+        + soft_penalty_score
     )
     return RouteEvaluation(
         order=order,
@@ -206,7 +260,7 @@ def evaluate_joint_order(
         total_distance=total_distance,
         total_travel_seconds=total_seconds,
         feasible=not conflicts,
-        conflicts=conflicts,
+        conflicts=conflicts + soft_penalties,
         cost=breakdown.total,
         score=breakdown,
     )
@@ -355,6 +409,9 @@ def optimize_joint_route(
     preferences: PlanningPreferences,
     constraints: HardConstraints,
     mode: TransportMode,
+    *,
+    safety_buffer_minutes: int = 0,
+    previous_order: list[int] | None = None,
 ) -> tuple[RouteEvaluation, str]:
     count = len(tasks)
     search_size = 1
@@ -362,23 +419,34 @@ def optimize_joint_route(
         search_size *= len(group)
     exact = count <= 6 and search_size * max(1, _factorial(count)) <= 60_000
 
+    baseline_distance = 0.0
+    cursor_index = 0
+    baseline_nodes = [group[0] for group in candidate_groups if group]
+    for node in baseline_nodes:
+        baseline_distance += matrix.edges[cursor_index][node.matrix_index].distance_meters
+        cursor_index = node.matrix_index
+
+    def _evaluate(order: list[int], selected: dict[int, CandidateNode]) -> RouteEvaluation:
+        return evaluate_joint_order(
+            order,
+            selected,
+            departure,
+            tasks,
+            matrix,
+            preferences,
+            constraints,
+            mode,
+            safety_buffer_minutes=safety_buffer_minutes,
+            previous_order=previous_order,
+            baseline_distance_meters=baseline_distance,
+        )
+
     evaluations: list[RouteEvaluation] = []
     if exact:
         for selection in product(*candidate_groups):
             selected = {node.task_index: node for node in selection}
             for permutation_order in permutations(range(count)):
-                evaluations.append(
-                    evaluate_joint_order(
-                        list(permutation_order),
-                        selected,
-                        departure,
-                        tasks,
-                        matrix,
-                        preferences,
-                        constraints,
-                        mode,
-                    )
-                )
+                evaluations.append(_evaluate(list(permutation_order), selected))
         algorithm = "joint-exact-enumeration"
     else:
         ortools_solution = _ortools_joint(departure, tasks, candidate_groups, matrix)
@@ -388,18 +456,7 @@ def optimize_joint_route(
             else _beam_joint(candidate_groups, matrix)
         )
         for beam_order, selected in candidates_to_evaluate:
-            evaluations.append(
-                evaluate_joint_order(
-                    beam_order,
-                    selected,
-                    departure,
-                    tasks,
-                    matrix,
-                    preferences,
-                    constraints,
-                    mode,
-                )
-            )
+            evaluations.append(_evaluate(list(beam_order), selected))
         algorithm = (
             "ortools-routing-time-windows"
             if ortools_solution is not None

@@ -36,24 +36,31 @@ async def main(args) -> None:
             async with semaphore:
                 return await one(client, args.url, args.token, index)
 
+        wall_started = time.perf_counter()
         results = await asyncio.gather(*(bounded(index) for index in range(args.requests)))
+        wall_seconds = time.perf_counter() - wall_started
     latencies = sorted(item[1] for item in results)
 
     def percentile(value: float) -> float:
-        return latencies[min(len(latencies) - 1, int(len(latencies) * value))]
+        if not latencies:
+            return 0.0
+        return latencies[min(len(latencies) - 1, max(0, int(len(latencies) * value) - 1))]
 
+    successes = sum(1 for status, _ in results if status < 400)
     print(
         json.dumps(
             {
                 "requests": len(results),
                 "concurrency": args.concurrency,
-                "successes": sum(1 for status, _ in results if status < 400),
-                "errors": sum(1 for status, _ in results if status >= 400),
+                "successes": successes,
+                "errors": len(results) - successes,
+                "throughput_rps": round(len(results) / wall_seconds, 2) if wall_seconds else 0,
                 "latency_ms": {
-                    "mean": statistics.fmean(latencies),
+                    "mean": statistics.fmean(latencies) if latencies else 0,
                     "p50": percentile(0.50),
                     "p95": percentile(0.95),
-                    "max": max(latencies),
+                    "p99": percentile(0.99),
+                    "max": max(latencies) if latencies else 0,
                 },
             },
             ensure_ascii=False,

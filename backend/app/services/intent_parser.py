@@ -14,6 +14,7 @@ from backend.app.schemas.ai_intent import (
     PlanningPreferences,
     PlanningTask,
     TransportMode,
+    UncertainConstraint,
 )
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -204,11 +205,62 @@ class OpenAICompatibleIntentParser:
             self.input_tokens = int(usage.get("prompt_tokens") or 0)
             self.output_tokens = int(usage.get("completion_tokens") or 0)
             return PlanningIntent.model_validate(json.loads(content))
-        except (httpx.HTTPError, KeyError, json.JSONDecodeError, ValidationError) as exc:
+        except (
+            httpx.HTTPError,
+            KeyError,
+            json.JSONDecodeError,
+            ValidationError,
+            TimeoutError,
+        ) as exc:
             raise UpstreamError("模型输出未通过结构校验", {"reason": str(exc)}) from exc
+
+
+class FallbackIntentParser:
+    """Try the primary LLM parser, then degrade to deterministic rules."""
+
+    name = "llm-with-rule-fallback"
+
+    def __init__(self, primary: IntentParser, fallback: IntentParser | None = None) -> None:
+        self.primary = primary
+        self.fallback = fallback or RuleBasedIntentParser()
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.last_parser = primary.name
+        self.fallback_used = False
+        self.fallback_reason: str | None = None
+
+    async def parse(self, text: str) -> PlanningIntent:
+        try:
+            intent = await self.primary.parse(text)
+            self.input_tokens = int(getattr(self.primary, "input_tokens", 0) or 0)
+            self.output_tokens = int(getattr(self.primary, "output_tokens", 0) or 0)
+            self.last_parser = self.primary.name
+            self.fallback_used = False
+            self.fallback_reason = None
+            # Lower confidence signal: leave preferences intact but mark uncertain if sparse.
+            if not intent.tasks:
+                raise UpstreamError("模型未提取到任务")
+            return intent
+        except Exception as exc:  # noqa: BLE001 - any LLM fault triggers deterministic degrade
+            self.fallback_used = True
+            self.fallback_reason = str(exc)
+            self.last_parser = self.fallback.name
+            self.input_tokens = int(getattr(self.primary, "input_tokens", 0) or 0)
+            self.output_tokens = int(getattr(self.primary, "output_tokens", 0) or 0)
+            intent = await self.fallback.parse(text)
+            # Degraded parse: push uncertainty so planner prefers clarification.
+            intent.constraints.uncertain.append(
+                UncertainConstraint(
+                    field="intent_parser",
+                    reason=f"LLM 解析失败，已降级到规则解析器：{self.fallback_reason}"[:300],
+                    confidence=0.45,
+                    safety_buffer_minutes=10,
+                )
+            )
+            return intent
 
 
 def build_intent_parser(settings: Settings, client: httpx.AsyncClient) -> IntentParser:
     if settings.llm_api_key:
-        return OpenAICompatibleIntentParser(settings, client)
+        return FallbackIntentParser(OpenAICompatibleIntentParser(settings, client))
     return RuleBasedIntentParser()

@@ -71,6 +71,8 @@ jobs:
           alembic check
       - name: Tests and coverage
         run: python -m pytest -c backend/pytest.ini --cov --cov-report=term-missing --cov-report=xml
+      - name: Chaos / fault injection smoke
+        run: python backend/tests/chaos/run_chaos.py
       - name: AI offline evaluation
         run: python backend/tests/evaluation/evaluate_intent.py
       - uses: actions/upload-artifact@v4

@@ -40,6 +40,7 @@ from backend.app.schemas.companion import (
     PrivacyPurgeRequest,
     ReplanTripRequest,
     TripEventRequest,
+    TripEventType,
     TripState,
     TripTransitionRequest,
 )
@@ -198,7 +199,13 @@ async def set_consent(trip_id: int, body: ConsentRequest, user: CurrentUser, db:
 
 
 @router.post("/trips/{trip_id}/location")
-async def update_location(trip_id: int, body: LocationUpdateRequest, user: CurrentUser, db: Db):
+async def update_location(
+    trip_id: int,
+    body: LocationUpdateRequest,
+    request: Request,
+    user: CurrentUser,
+    db: Db,
+):
     trip = await _trip(db, trip_id, user.id)
     if TripState(trip.state) not in {
         TripState.active_trip,
@@ -241,10 +248,111 @@ async def update_location(trip_id: int, body: LocationUpdateRequest, user: Curre
             processed_at=datetime.now(timezone.utc),
         )
     )
+
+    off_route_event = None
+    version = await db.scalar(
+        select(PlanVersion).where(
+            PlanVersion.planning_run_id == trip.planning_run_id,
+            PlanVersion.version == trip.current_plan_version,
+        )
+    )
+    if version is not None:
+        from backend.app.services.offroute import evaluate_off_route, polyline_from_plan_snapshot
+
+        snapshot_json = json.loads(version.snapshot_json)
+        polyline = polyline_from_plan_snapshot(snapshot_json)
+        context = json.loads(trip.context_json or "{}")
+        previous_off = float(context.get("off_route_seconds") or 0)
+        interval = float(context.get("location_interval_seconds") or 5)
+        verdict = evaluate_off_route(
+            lng=body.location.lng,
+            lat=body.location.lat,
+            polyline=polyline,
+            previous_off_route_seconds=previous_off,
+            sample_interval_seconds=interval,
+        )
+        context["off_route_seconds"] = verdict.sustained_seconds
+        context["last_off_route_distance_m"] = verdict.distance_meters
+        trip.context_json = json.dumps(context, ensure_ascii=False)
+        if verdict.off_route and TripState(trip.state) != TripState.off_route:
+            now = datetime.now(timezone.utc)
+            decision = evaluate_trip_event(
+                TripState(trip.state),
+                TripEventType.user_off_route,
+                {
+                    "distance_meters": verdict.distance_meters,
+                    "sustained_seconds": verdict.sustained_seconds,
+                },
+                trip.last_notification_at,
+                trip.reminder_cooldown_minutes,
+                now,
+            )
+            trip.state = decision.next_state.value
+            if decision.should_notify:
+                trip.last_notification_at = now
+            off_route_event = TripEvent(
+                trip_session_id=trip.id,
+                event_id=f"auto-offroute-{body.event_id}",
+                event_type="UserOffRoute",
+                payload_json=json.dumps(
+                    {
+                        "distance_meters": verdict.distance_meters,
+                        "sustained_seconds": verdict.sustained_seconds,
+                        "reason": verdict.reason,
+                    },
+                    ensure_ascii=False,
+                ),
+                occurred_at=body.captured_at,
+                status="processed",
+                impact_level=decision.impact_level,
+                decision_json=json.dumps(
+                    {
+                        "reason": decision.reason,
+                        "should_notify": decision.should_notify,
+                        "proposals": decision.proposals,
+                    },
+                    ensure_ascii=False,
+                ),
+                processed_at=now,
+            )
+            db.add(off_route_event)
+            await db.flush()
+
     await db.commit()
+    if off_route_event is not None:
+        await request.app.state.runtime_store.enqueue(
+            "mapgo:trip-events",
+            {
+                "trip_id": trip.id,
+                "event_id": off_route_event.id,
+                "event_type": "UserOffRoute",
+            },
+        )
+        await request.app.state.runtime_store.set_json(
+            f"trip-stream:{trip.id}",
+            {
+                "sequence": off_route_event.id,
+                "event_id": off_route_event.event_id,
+                "type": "UserOffRoute",
+                "state": trip.state,
+                "impact_level": off_route_event.impact_level,
+                "decision": json.loads(off_route_event.decision_json),
+                "occurred_at": body.captured_at.isoformat(),
+            },
+            86_400,
+        )
+        await request.app.state.runtime_store.publish(
+            f"trip:{trip.id}",
+            {"type": "UserOffRoute", "trip_id": trip.id, "event_id": off_route_event.id},
+        )
     return {
         "ok": True,
-        "data": {"stored_until": snapshot.expires_at, "deduplicated": False},
+        "data": {
+            "stored_until": snapshot.expires_at,
+            "deduplicated": False,
+            "off_route_detected": off_route_event is not None,
+            "off_route_event_id": off_route_event.event_id if off_route_event else None,
+        },
     }
 
 
@@ -320,6 +428,15 @@ async def ingest_event(
             "occurred_at": body.occurred_at.isoformat(),
         },
         86_400,
+    )
+    await request.app.state.runtime_store.publish(
+        f"trip:{trip.id}",
+        {
+            "sequence": event.id,
+            "event_id": body.event_id,
+            "type": body.type.value,
+            "state": trip.state,
+        },
     )
     return {
         "ok": True,
@@ -423,30 +540,105 @@ async def trip_summary(trip_id: int, user: CurrentUser, db: Db):
         )
     ).all()
     completed_ids = []
+    skipped_ids = []
+    arrived_at: dict[str, str] = {}
+    accepted_patches = 0
+    rejected_patches = 0
+    eta_errors: list[float] = []
     for event in events:
+        payload = json.loads(event.payload_json or "{}")
         if event.event_type == "PlanStopCompleted":
-            payload = json.loads(event.payload_json)
+            stop_id = payload.get("stop_id")
+            if stop_id:
+                completed_ids.append(stop_id)
+                if payload.get("arrived_at"):
+                    arrived_at[stop_id] = payload["arrived_at"]
+                if payload.get("planned_arrival") and payload.get("arrived_at"):
+                    try:
+                        planned = datetime.fromisoformat(payload["planned_arrival"])
+                        actual = datetime.fromisoformat(payload["arrived_at"])
+                        eta_errors.append(abs((actual - planned).total_seconds()))
+                    except ValueError:
+                        pass
+        elif event.event_type == "PlanStopSkipped":
             if payload.get("stop_id"):
-                completed_ids.append(payload["stop_id"])
-    planned_ids = [stop["poi"]["id"] for stop in snapshot.get("stops", [])]
+                skipped_ids.append(payload["stop_id"])
+        elif event.event_type == "PlanPatchAccepted":
+            accepted_patches += 1
+        elif event.event_type == "PlanPatchRejected":
+            rejected_patches += 1
+    planned_stops = snapshot.get("stops", [])
+    planned_ids = [stop["poi"]["id"] for stop in planned_stops]
+    planned_walk_meters = float(snapshot.get("total_distance_meters") or 0)
+    planned_cost = 0.0
+    for stop in planned_stops:
+        cost = (stop.get("poi") or {}).get("estimated_cost_yuan")
+        if cost is not None:
+            planned_cost += float(cost)
+    stop_deviations = []
+    for stop in planned_stops:
+        stop_id = stop["poi"]["id"]
+        planned_arrival = stop.get("arrival_time")
+        actual = arrived_at.get(stop_id)
+        deviation = None
+        if planned_arrival and actual:
+            try:
+                deviation = (
+                    datetime.fromisoformat(actual) - datetime.fromisoformat(planned_arrival)
+                ).total_seconds()
+            except ValueError:
+                deviation = None
+        stop_deviations.append(
+            {
+                "stop_id": stop_id,
+                "name": stop["poi"].get("name"),
+                "planned_arrival": planned_arrival,
+                "actual_arrival": actual,
+                "deviation_seconds": deviation,
+                "completed": stop_id in completed_ids,
+                "skipped": stop_id in skipped_ids,
+            }
+        )
     actual_seconds = None
     if trip.started_at and trip.ended_at:
         actual_seconds = (trip.ended_at - trip.started_at).total_seconds()
+    context = json.loads(trip.context_json or "{}")
+    replan_count = int(context.get("replan_count") or 0) + sum(
+        1 for event in events if event.impact_level in {"high", "critical"}
+    )
+    mae = sum(eta_errors) / len(eta_errors) if eta_errors else None
+    lessons = []
+    if skipped_ids:
+        lessons.append(f"跳过了 {len(set(skipped_ids))} 个地点，下次可降低必经任务密度")
+    if mae and mae > 600:
+        lessons.append("ETA 误差较大，建议提高不确定约束安全缓冲")
+    if rejected_patches > accepted_patches and rejected_patches:
+        lessons.append("多次拒绝重规划建议，说明初始偏好或约束需要更早澄清")
+    if not lessons:
+        lessons.append("本次行程按计划推进较好，可将显式偏好保存为长期设置")
     return {
         "ok": True,
         "data": {
             "plan_version": trip.current_plan_version,
             "planned_stops": len(planned_ids),
             "completed_stops": len(set(completed_ids)),
+            "skipped_stop_ids": sorted(set(skipped_ids)),
             "uncompleted_stop_ids": [
-                stop_id for stop_id in planned_ids if stop_id not in completed_ids
+                stop_id
+                for stop_id in planned_ids
+                if stop_id not in completed_ids and stop_id not in skipped_ids
             ],
             "planned_travel_seconds": snapshot.get("total_travel_seconds"),
             "actual_trip_seconds": actual_seconds,
+            "planned_walking_meters": planned_walk_meters,
+            "estimated_cost_yuan": planned_cost,
             "event_count": len(events),
-            "replan_events": sum(
-                1 for event in events if event.impact_level in {"high", "critical"}
-            ),
+            "replan_events": replan_count,
+            "accepted_suggestions": accepted_patches,
+            "rejected_suggestions": rejected_patches,
+            "stop_deviations": stop_deviations,
+            "eta_error_mae_seconds": mae,
+            "lessons": lessons,
             "preference_followup": "这次行程中，你是否觉得步行安排仍然偏多？",
             "preference_saved": False,
         },
@@ -658,6 +850,32 @@ async def replan_remaining_trip(
         TripState.replanning,
     }:
         raise AppError(409, "REPLAN_STATE_DENIED", "当前状态不允许动态重规划")
+    settings = get_settings()
+    context = json.loads(trip.context_json or "{}")
+    replan_count = int(context.get("replan_count") or 0)
+    if replan_count >= settings.max_replans_per_trip:
+        raise AppError(429, "REPLAN_BUDGET_EXCEEDED", "本次行程重规划次数已达上限")
+    lock_token = await request.app.state.runtime_store.acquire_lock(f"trip-mutate:{trip.id}", 20)
+    if lock_token is None:
+        raise AppError(409, "TRIP_LOCKED", "行程正在被其他实例修改，请稍后重试")
+    try:
+        return await _replan_remaining_trip_locked(
+            trip_id, body, request, user, db, trip, context, replan_count
+        )
+    finally:
+        await request.app.state.runtime_store.release_lock(f"trip-mutate:{trip.id}", lock_token)
+
+
+async def _replan_remaining_trip_locked(
+    trip_id: int,
+    body: ReplanTripRequest,
+    request: Request,
+    user: CurrentUser,
+    db: Db,
+    trip: TripSession,
+    context: dict,
+    replan_count: int,
+):
     version = await db.scalar(
         select(PlanVersion).where(
             PlanVersion.planning_run_id == trip.planning_run_id,
@@ -679,12 +897,86 @@ async def replan_remaining_trip(
         *(Coordinate.model_validate(stop["poi"]["location"]) for stop in remaining),
     ]
     mode = TransportMode(snapshot["intent"]["transport_mode"])
-    matrix = await request.app.state.map_provider.route_matrix(points, mode)
-    tasks = [PlanningTask.model_validate(stop["task"]) for stop in remaining]
-    evaluation, algorithm = optimize_route(
-        body.current_time, tasks, matrix.distances, matrix.durations
-    )
-    reordered = [remaining[index] for index in evaluation.order]
+    modes_to_try = [mode]
+    for alt in (TransportMode.driving, TransportMode.transit, TransportMode.walking):
+        if alt not in modes_to_try:
+            modes_to_try.append(alt)
+    alternatives = []
+    primary = None
+    for candidate_mode in modes_to_try[:3]:
+        try:
+            matrix = await request.app.state.map_provider.route_matrix(points, candidate_mode)
+        except Exception:  # noqa: BLE001
+            continue
+        tasks = [PlanningTask.model_validate(stop["task"]) for stop in remaining]
+        # Drop optional (required=False) stops as a differentiated option.
+        for drop_optional in (False, True):
+            active_remaining = remaining
+            active_tasks = tasks
+            if drop_optional:
+                keep = [
+                    (stop, task)
+                    for stop, task in zip(remaining, tasks, strict=False)
+                    if task.required
+                ]
+                if len(keep) == len(remaining) or not keep:
+                    continue
+                active_remaining = [item[0] for item in keep]
+                active_tasks = [item[1] for item in keep]
+                active_points = [
+                    body.current_location,
+                    *(
+                        Coordinate.model_validate(stop["poi"]["location"])
+                        for stop in active_remaining
+                    ),
+                ]
+                matrix = await request.app.state.map_provider.route_matrix(
+                    active_points, candidate_mode
+                )
+            evaluation, algorithm = optimize_route(
+                body.current_time, active_tasks, matrix.distances, matrix.durations
+            )
+            option = {
+                "label": (
+                    f"方案{'ABC'[len(alternatives)]}"
+                    if len(alternatives) < 3
+                    else f"方案{len(alternatives)+1}"
+                ),
+                "transport_mode": candidate_mode.value,
+                "drop_optional": drop_optional,
+                "feasible": evaluation.feasible,
+                "total_travel_seconds": evaluation.total_travel_seconds,
+                "total_distance_meters": evaluation.total_distance,
+                "conflicts": evaluation.conflicts,
+                "algorithm": algorithm,
+                "stop_ids": [active_remaining[index]["poi"]["id"] for index in evaluation.order],
+            }
+            alternatives.append(option)
+            if (
+                primary is None
+                and evaluation.feasible
+                and candidate_mode == mode
+                and not drop_optional
+            ):
+                primary = (evaluation, algorithm, active_remaining, matrix)
+            if len(alternatives) >= 3:
+                break
+        if len(alternatives) >= 3:
+            break
+
+    if primary is None:
+        # Fall back to first feasible alternative's reorder on original mode.
+        matrix = await request.app.state.map_provider.route_matrix(points, mode)
+        tasks = [PlanningTask.model_validate(stop["task"]) for stop in remaining]
+        evaluation, algorithm = optimize_route(
+            body.current_time, tasks, matrix.distances, matrix.durations
+        )
+        reordered = [remaining[index] for index in evaluation.order]
+    else:
+        evaluation, algorithm, active_remaining, matrix = primary
+        reordered = [active_remaining[index] for index in evaluation.order]
+        remaining = active_remaining
+
     original_ids = [stop["poi"]["id"] for stop in snapshot["stops"]]
     operations = [
         {
@@ -699,6 +991,8 @@ async def replan_remaining_trip(
     target_ids = [stop["poi"]["id"] for stop in reordered]
     working = [stop_id for stop_id in original_ids if stop_id not in completed]
     for target_position, stop_id in enumerate(target_ids):
+        if stop_id not in working:
+            continue
         source_position = working.index(stop_id)
         if source_position != target_position:
             operations.append(
@@ -722,11 +1016,14 @@ async def replan_remaining_trip(
             "conflicts": evaluation.conflicts,
         },
         "algorithm": algorithm,
+        "alternatives": alternatives,
         "replan_context": {
             "origin": body.current_location.model_dump(mode="json"),
             "departure_time": body.current_time.isoformat(),
         },
     }
+    context["replan_count"] = replan_count + 1
+    trip.context_json = json.dumps(context, ensure_ascii=False)
     if not evaluation.feasible:
         trip.state = TripState.at_risk.value
         await db.commit()
@@ -736,6 +1033,7 @@ async def replan_remaining_trip(
                 "status": "no_feasible_reorder",
                 "patch_created": False,
                 "impact": impact,
+                "alternatives": alternatives,
                 "options": [
                     {"action": "remove_optional_stop", "requires_confirmation": True},
                     {"action": "change_transport_mode", "requires_confirmation": True},
@@ -752,6 +1050,7 @@ async def replan_remaining_trip(
                 "status": "current_order_still_optimal",
                 "patch_created": False,
                 "impact": impact,
+                "alternatives": alternatives,
             },
         }
     patch = PlanPatch(
@@ -774,6 +1073,7 @@ async def replan_remaining_trip(
             "patch_created": True,
             "patch_id": patch.id,
             "impact": impact,
+            "alternatives": alternatives,
         },
     }
 

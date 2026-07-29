@@ -14,8 +14,10 @@ from backend.app.schemas.ai_intent import (
     PlanningState,
     UncertaintySummary,
 )
+from backend.app.services.clarification import select_clarification_questions
 from backend.app.services.intent_parser import IntentParser
 from backend.app.services.route_optimizer import CandidateNode, optimize_joint_route
+from backend.app.services.uncertainty import calibrate_from_history
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
@@ -53,33 +55,31 @@ class PlanningService:
             if task.service_duration_minutes == 0:
                 task.service_duration_minutes = request.default_service_duration_minutes
 
-        questions: list[ClarificationQuestion] = []
-        if request.origin is None:
-            questions.append(
+        questions: list[ClarificationQuestion] = select_clarification_questions(
+            request=request,
+            intent=intent,
+            text=request.text,
+            max_questions=3,
+        )
+        # Keep the critical origin gate even if dynamic selector omitted it.
+        if request.origin is None and not any(item.field == "origin" for item in questions):
+            questions.insert(
+                0,
                 ClarificationQuestion(
                     field="origin",
                     reason="路线矩阵和候选地点召回必须有可信起点",
                     question="请提供出发位置，或允许使用当前定位。",
-                )
+                ),
             )
-        if (
-            intent.preferences.minimize_walking
-            and intent.constraints.hard.max_walking_meters is None
-        ):
-            questions.append(
-                ClarificationQuestion(
-                    field="constraints.hard.max_walking_meters",
-                    reason="用户要求少走路，但没有可验证的步行上限",
-                    question="本次行程最多能接受多少米步行？",
-                )
-            )
-        if questions:
+        # Prefer required questions before optional preference probes.
+        required_questions = [item for item in questions if item.required]
+        if required_questions:
             return AIPlanResult(
                 status="need_clarification",
                 planning_state=PlanningState.need_clarification,
                 intent=intent,
                 origin=request.origin,
-                questions=questions,
+                questions=required_questions[:3],
             )
         origin = request.origin
         if origin is None:
@@ -91,6 +91,13 @@ class PlanningService:
         search_results = await asyncio.gather(
             *(self.map_provider.search_poi(keyword, origin, request.city) for keyword in keywords)
         )
+        ambiguous = {
+            index: found[:5]
+            for index, found in enumerate(search_results)
+            if found
+            and len(found) >= 2
+            and len({item.name.strip().casefold() for item in found[:3]}) == 1
+        }
         missing = [
             ClarificationQuestion(
                 field=f"tasks.{index}.location",
@@ -100,6 +107,14 @@ class PlanningService:
             for index, found in enumerate(search_results)
             if not found
         ]
+        if not missing and ambiguous:
+            missing = select_clarification_questions(
+                request=request,
+                intent=intent,
+                ambiguous_pois=ambiguous,
+                text=request.text,
+                max_questions=2,
+            )
         if missing:
             return AIPlanResult(
                 status="need_clarification",
@@ -145,6 +160,10 @@ class PlanningService:
         departure = intent.departure_time or datetime.now(SHANGHAI).replace(second=0, microsecond=0)
         if departure.tzinfo is None:
             departure = departure.replace(tzinfo=SHANGHAI)
+        safety_buffer = max(
+            (item.safety_buffer_minutes for item in intent.constraints.uncertain),
+            default=0,
+        )
         evaluation, algorithm = optimize_joint_route(
             departure,
             intent.tasks,
@@ -153,6 +172,7 @@ class PlanningService:
             intent.preferences,
             intent.constraints.hard,
             intent.transport_mode,
+            safety_buffer_minutes=safety_buffer,
         )
 
         planned_stops: list[PlannedStop] = []
@@ -183,23 +203,30 @@ class PlanningService:
             previous = node.matrix_index
 
         confidence = sum(confidences) / len(confidences) if confidences else 0
-        spread = 1 - confidence
-        uncertainty = UncertaintySummary(
-            expected_duration_seconds=evaluation.total_travel_seconds,
-            lower_duration_seconds=max(0, evaluation.total_travel_seconds * (1 - 0.15 * spread)),
-            upper_duration_seconds=evaluation.total_travel_seconds * (1 + 0.60 * spread),
-            on_time_probability=(
-                confidence if any(task.deadline for task in intent.tasks) else None
-            ),
-            method="provider-confidence-safety-envelope-v1",
+        envelope = calibrate_from_history(
+            expected_seconds=evaluation.total_travel_seconds,
+            mean_confidence=confidence,
+            fallback_used=bool(estimated_edges),
+            history=[],
+            safety_buffer_minutes=safety_buffer,
+            has_deadline=any(task.deadline for task in intent.tasks),
         )
-        warnings = []
+        uncertainty = UncertaintySummary(
+            expected_duration_seconds=envelope.expected_seconds,
+            lower_duration_seconds=envelope.lower_seconds,
+            upper_duration_seconds=envelope.upper_seconds,
+            on_time_probability=envelope.on_time_probability,
+            method=envelope.method,
+        )
+        warnings = list(envelope.warnings)
         if estimated_edges:
             warnings.append(
                 f"{estimated_edges} 段路线使用估算数据，时间仅供参考，前端应显示估算标记。"
             )
         if intent.constraints.uncertain:
             warnings.extend(item.reason for item in intent.constraints.uncertain)
+        if evaluation.feasible and evaluation.conflicts:
+            warnings.extend(evaluation.conflicts)
 
         if not evaluation.feasible:
             return AIPlanResult(
