@@ -48,7 +48,9 @@ class HeavyRainWeather:
         )
 
 
-async def _active_trip(client: httpx.AsyncClient, username: str, text: str) -> tuple[dict, dict, int]:
+async def _active_trip(
+    client: httpx.AsyncClient, username: str, text: str
+) -> tuple[dict, dict, int]:
     registered = await client.post(
         "/api/register",
         json={"username": username, "password": "secret12", "nickname": "Agent 测试"},
@@ -185,247 +187,242 @@ async def _exercise_controller(trip_id: int, decider: ScriptedDecider, max_steps
 
 
 @pytest.mark.asyncio
-async def test_worker_llm_tool_loop_creates_one_pending_patch_and_transport_switches():
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        headers, plan, trip_id = await _active_trip(
-            client,
-            "agentloop",
-            "明天下午从酒店出发去博物馆，再去商场",
-        )
-        event_response = await client.post(
-            f"/api/companion/trips/{trip_id}/events",
-            headers=headers,
-            json={
-                "event_id": "delay-agent-loop-001",
-                "type": "ScheduleDelayDetected",
-                "occurred_at": "2026-07-29T14:30:00+08:00",
-                "payload": {"delay_minutes": 45, "allow_transport_switch": True},
-            },
-        )
-        assert event_response.status_code == 200
-        event = await _latest_event(trip_id)
-        store = InMemoryRuntimeStore()
-        decider = ScriptedDecider(
-            [
-                AgentDecision(action="call_tool", tool="get_trip_state", reason="核对状态"),
-                AgentDecision(action="call_tool", tool="propose_replan", reason="延误后重规划"),
-                AgentDecision(action="finish", reason="已产生待确认方案"),
-            ]
-        )
-        # Simulate a second worker holding the per-trip distributed lock.
-        lock_name = f"agent-run:trip:{trip_id}"
-        token = await store.acquire_lock(lock_name, 30)
-        assert token is not None
-        await process_trip_event(
-            store,
-            {"trip_id": trip_id, "event_id": event.id, "event_type": event.event_type},
-            map_provider=app.state.map_provider,
-            weather_provider=app.state.weather_provider,
-            decider=decider,
-        )
-        assert await store.dequeue("mapgo:trip-events:retry", timeout_seconds=0) is not None
-        assert await store.release_lock(lock_name, token)
-        await process_trip_event(
-            store,
-            {"trip_id": trip_id, "event_id": event.id, "event_type": event.event_type},
-            map_provider=app.state.map_provider,
-            weather_provider=app.state.weather_provider,
-            decider=decider,
-        )
-        event, patch, run_id, calls, run_status = await _event_and_patch(trip_id)
-        assert patch is not None
-        assert patch.status == "pending"
-        operations = json.loads(patch.operations_json)
-        assert any(item["operation"] == "change_transport_mode" for item in operations)
-        assert calls >= 2
-        assert run_status == "succeeded"
-        stream = await store.get_json(f"trip-stream:{trip_id}")
-        assert stream["plan_patch"]["patch_id"] == patch.id
-        assert any(
-            item["operation"] == "change_transport_mode"
-            for item in stream["plan_patch"]["operations"]
-        )
-
-        # Re-consuming the same durable event is idempotent: no second patch.
-        await process_trip_event(
-            store,
-            {"trip_id": trip_id, "event_id": event.id, "event_type": event.event_type},
-            map_provider=app.state.map_provider,
-            weather_provider=app.state.weather_provider,
-            decider=decider,
-        )
-        _, same_patch, _, _, _ = await _event_and_patch(trip_id)
-        assert same_patch is not None and same_patch.id == patch.id
-
-        accepted = await client.post(
-            f"/api/ai/plans/{run_id}/patches/{patch.id}/decision",
-            headers=headers,
-            json={"accept": True},
-        )
-        assert accepted.status_code == 200, accepted.text
-        assert accepted.json()["data"]["plan_version"] == 2
-        assert accepted.json()["data"]["snapshot"]["intent"]["transport_mode"] == "driving"
-        assert plan["plan_version"] == 1
-        rejected_patch = await client.post(
-            f"/api/ai/plans/{run_id}/patches",
-            headers=headers,
-            json={
-                "base_version": 2,
-                "operations": [{"operation": "move_stop", "from_position": 0, "to_position": 1}],
-                "reason": "测试用户拒绝方案不改变正式计划",
-            },
-        )
-        assert rejected_patch.status_code == 200, rejected_patch.text
-        rejected = await client.post(
-            f"/api/ai/plans/{run_id}/patches/{rejected_patch.json()['data']['patch_id']}/decision",
-            headers=headers,
-            json={"accept": False},
-        )
-        assert rejected.status_code == 200
-        versions = (await client.get(f"/api/ai/plans/{run_id}/versions", headers=headers)).json()[
-            "data"
+async def test_worker_llm_tool_loop_creates_one_pending_patch_and_transport_switches(
+    async_client: httpx.AsyncClient,
+):
+    headers, plan, trip_id = await _active_trip(
+        async_client, "agentloop", "明天下午从酒店出发去博物馆，再去商场"
+    )
+    event_response = await async_client.post(
+        f"/api/companion/trips/{trip_id}/events",
+        headers=headers,
+        json={
+            "event_id": "delay-agent-loop-001",
+            "type": "ScheduleDelayDetected",
+            "occurred_at": "2026-07-29T14:30:00+08:00",
+            "payload": {"delay_minutes": 45, "allow_transport_switch": True},
+        },
+    )
+    assert event_response.status_code == 200
+    event = await _latest_event(trip_id)
+    store = InMemoryRuntimeStore()
+    decider = ScriptedDecider(
+        [
+            AgentDecision(action="call_tool", tool="get_trip_state", reason="核对状态"),
+            AgentDecision(action="call_tool", tool="propose_replan", reason="延误后重规划"),
+            AgentDecision(action="finish", reason="已产生待确认方案"),
         ]
-        assert [version["version"] for version in versions] == [2, 1]
+    )
+    # Simulate a second worker holding the per-trip distributed lock.
+    lock_name = f"agent-run:trip:{trip_id}"
+    token = await store.acquire_lock(lock_name, 30)
+    assert token is not None
+    await process_trip_event(
+        store,
+        {"trip_id": trip_id, "event_id": event.id, "event_type": event.event_type},
+        map_provider=app.state.map_provider,
+        weather_provider=app.state.weather_provider,
+        decider=decider,
+    )
+    assert await store.dequeue("mapgo:trip-events:retry", timeout_seconds=0) is not None
+    assert await store.release_lock(lock_name, token)
+    await process_trip_event(
+        store,
+        {"trip_id": trip_id, "event_id": event.id, "event_type": event.event_type},
+        map_provider=app.state.map_provider,
+        weather_provider=app.state.weather_provider,
+        decider=decider,
+    )
+    event, patch, run_id, calls, run_status = await _event_and_patch(trip_id)
+    assert patch is not None
+    assert patch.status == "pending"
+    operations = json.loads(patch.operations_json)
+    assert any(item["operation"] == "change_transport_mode" for item in operations)
+    assert calls >= 2
+    assert run_status == "succeeded"
+    stream = await store.get_json(f"trip-stream:{trip_id}")
+    assert stream["plan_patch"]["patch_id"] == patch.id
+    assert any(
+        item["operation"] == "change_transport_mode" for item in stream["plan_patch"]["operations"]
+    )
+
+    # Re-consuming the same durable event is idempotent: no second patch.
+    await process_trip_event(
+        store,
+        {"trip_id": trip_id, "event_id": event.id, "event_type": event.event_type},
+        map_provider=app.state.map_provider,
+        weather_provider=app.state.weather_provider,
+        decider=decider,
+    )
+    _, same_patch, _, _, _ = await _event_and_patch(trip_id)
+    assert same_patch is not None and same_patch.id == patch.id
+
+    accepted = await async_client.post(
+        f"/api/ai/plans/{run_id}/patches/{patch.id}/decision",
+        headers=headers,
+        json={"accept": True},
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["data"]["plan_version"] == 2
+    assert accepted.json()["data"]["snapshot"]["intent"]["transport_mode"] == "driving"
+    assert plan["plan_version"] == 1
+    rejected_patch = await async_client.post(
+        f"/api/ai/plans/{run_id}/patches",
+        headers=headers,
+        json={
+            "base_version": 2,
+            "operations": [{"operation": "move_stop", "from_position": 0, "to_position": 1}],
+            "reason": "测试用户拒绝方案不改变正式计划",
+        },
+    )
+    assert rejected_patch.status_code == 200, rejected_patch.text
+    rejected = await async_client.post(
+        f"/api/ai/plans/{run_id}/patches/{rejected_patch.json()['data']['patch_id']}/decision",
+        headers=headers,
+        json={"accept": False},
+    )
+    assert rejected.status_code == 200
+    versions = (await async_client.get(f"/api/ai/plans/{run_id}/versions", headers=headers)).json()[
+        "data"
+    ]
+    assert [version["version"] for version in versions] == [2, 1]
 
 
 @pytest.mark.asyncio
-async def test_weather_event_replaces_outdoor_poi_only_after_user_accepts_patch():
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        headers, plan, trip_id = await _active_trip(client, "weatherguard", "明天从酒店出发去户外公园")
-        original_id = plan["stops"][0]["poi"]["id"]
-        event_response = await client.post(
-            f"/api/companion/trips/{trip_id}/events",
-            headers=headers,
-            json={
-                "event_id": "weather-agent-loop-001",
-                "type": "WeatherAlertReceived",
-                "occurred_at": "2026-07-29T14:30:00+08:00",
-                "payload": {"severity": "severe", "outdoor_stop_ids": [original_id]},
-            },
-        )
-        assert event_response.status_code == 200
-        event = await _latest_event(trip_id)
-        store = InMemoryRuntimeStore()
-        decider = ScriptedDecider(
+async def test_weather_event_replaces_outdoor_poi_only_after_user_accepts_patch(
+    async_client: httpx.AsyncClient,
+):
+    headers, plan, trip_id = await _active_trip(
+        async_client, "weatherguard", "明天从酒店出发去户外公园"
+    )
+    original_id = plan["stops"][0]["poi"]["id"]
+    event_response = await async_client.post(
+        f"/api/companion/trips/{trip_id}/events",
+        headers=headers,
+        json={
+            "event_id": "weather-agent-loop-001",
+            "type": "WeatherAlertReceived",
+            "occurred_at": "2026-07-29T14:30:00+08:00",
+            "payload": {"severity": "severe", "outdoor_stop_ids": [original_id]},
+        },
+    )
+    assert event_response.status_code == 200
+    event = await _latest_event(trip_id)
+    store = InMemoryRuntimeStore()
+    decider = ScriptedDecider(
+        [
+            AgentDecision(action="call_tool", tool="get_weather", reason="查询暴雨风险"),
+            AgentDecision(action="call_tool", tool="propose_replan", reason="切换室内备选"),
+            AgentDecision(action="finish", reason="等待用户确认"),
+        ]
+    )
+    await process_trip_event(
+        store,
+        {"trip_id": trip_id, "event_id": event.id, "event_type": event.event_type},
+        map_provider=app.state.map_provider,
+        weather_provider=HeavyRainWeather(),
+        decider=decider,
+    )
+    processed_event, patch, run_id, _, _ = await _event_and_patch(trip_id)
+    assert patch is not None, (
+        f"{processed_event.decision_json}; {await _latest_tool_output(trip_id)}"
+    )
+    operations = json.loads(patch.operations_json)
+    replacement = next(item for item in operations if item["operation"] == "replace_stop")
+    assert replacement["stop_id"] == original_id
+    assert replacement["replacement_stop"]["poi"]["id"] != original_id
+
+    # Formal V1 remains intact until the explicit user decision.
+    before = (await async_client.get(f"/api/ai/plans/{run_id}/versions", headers=headers)).json()[
+        "data"
+    ]
+    assert before[0]["version"] == 1
+    accepted = await async_client.post(
+        f"/api/ai/plans/{run_id}/patches/{patch.id}/decision",
+        headers=headers,
+        json={"accept": True},
+    )
+    assert accepted.status_code == 200, accepted.text
+    after = (await async_client.get(f"/api/ai/plans/{run_id}/versions", headers=headers)).json()[
+        "data"
+    ]
+    assert [item["version"] for item in after] == [2, 1]
+    assert after[0]["snapshot"]["stops"][0]["poi"]["id"] != original_id
+
+
+@pytest.mark.asyncio
+async def test_agent_rejects_illegal_tool_and_stops_at_step_limit(
+    async_client: httpx.AsyncClient,
+):
+    _, _, trip_id = await _active_trip(async_client, "agentpolicy", "明天从酒店出发去博物馆")
+    denied, denied_calls = await _exercise_controller(
+        trip_id,
+        ScriptedDecider(
             [
-                AgentDecision(action="call_tool", tool="get_weather", reason="查询暴雨风险"),
-                AgentDecision(action="call_tool", tool="propose_replan", reason="切换室内备选"),
+                AgentDecision(action="call_tool", tool="delete_plan", reason="非法工具"),
+                AgentDecision(action="finish", reason="已拒绝"),
+            ]
+        ),
+        max_steps=2,
+    )
+    assert denied["status"] == "succeeded"
+    assert denied_calls[0].status == "policy_denied"
+    assert denied_calls[0].error_type == "tool_not_registered"
+
+    limited, calls = await _exercise_controller(
+        trip_id,
+        ScriptedDecider(
+            [AgentDecision(action="call_tool", tool="get_trip_state", reason="继续观察")]
+        ),
+        max_steps=2,
+    )
+    assert limited["status"] == "step_limit_reached"
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_closed_poi_is_replaced_and_deadline_is_revalidated_before_v2(
+    async_client: httpx.AsyncClient,
+):
+    headers, plan, trip_id = await _active_trip(
+        async_client, "closedpoi", "明天下午两点从酒店出发去公园，晚上十一点前到医院"
+    )
+    closed_id = plan["stops"][0]["poi"]["id"]
+    event_response = await async_client.post(
+        f"/api/companion/trips/{trip_id}/events",
+        headers=headers,
+        json={
+            "event_id": "closed-poi-agent-loop-001",
+            "type": "PoiStatusChanged",
+            "occurred_at": "2026-07-29T14:30:00+08:00",
+            "payload": {"closed_poi_id": closed_id},
+        },
+    )
+    assert event_response.status_code == 200
+    event = await _latest_event(trip_id)
+    await process_trip_event(
+        InMemoryRuntimeStore(),
+        {"trip_id": trip_id, "event_id": event.id, "event_type": event.event_type},
+        map_provider=app.state.map_provider,
+        weather_provider=app.state.weather_provider,
+        decider=ScriptedDecider(
+            [
+                AgentDecision(action="call_tool", tool="propose_replan", reason="地点关闭"),
                 AgentDecision(action="finish", reason="等待用户确认"),
             ]
-        )
-        await process_trip_event(
-            store,
-            {"trip_id": trip_id, "event_id": event.id, "event_type": event.event_type},
-            map_provider=app.state.map_provider,
-            weather_provider=HeavyRainWeather(),
-            decider=decider,
-        )
-        processed_event, patch, run_id, _, _ = await _event_and_patch(trip_id)
-        assert patch is not None, (
-            f"{processed_event.decision_json}; {await _latest_tool_output(trip_id)}"
-        )
-        operations = json.loads(patch.operations_json)
-        replacement = next(item for item in operations if item["operation"] == "replace_stop")
-        assert replacement["stop_id"] == original_id
-        assert replacement["replacement_stop"]["poi"]["id"] != original_id
-
-        # Formal V1 remains intact until the explicit user decision.
-        before = (await client.get(f"/api/ai/plans/{run_id}/versions", headers=headers)).json()[
-            "data"
-        ]
-        assert before[0]["version"] == 1
-        accepted = await client.post(
-            f"/api/ai/plans/{run_id}/patches/{patch.id}/decision",
-            headers=headers,
-            json={"accept": True},
-        )
-        assert accepted.status_code == 200, accepted.text
-        after = (await client.get(f"/api/ai/plans/{run_id}/versions", headers=headers)).json()[
-            "data"
-        ]
-        assert [item["version"] for item in after] == [2, 1]
-        assert after[0]["snapshot"]["stops"][0]["poi"]["id"] != original_id
-
-
-@pytest.mark.asyncio
-async def test_agent_rejects_illegal_tool_and_stops_at_step_limit():
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        _, _, trip_id = await _active_trip(client, "agentpolicy", "明天从酒店出发去博物馆")
-        denied, denied_calls = await _exercise_controller(
-            trip_id,
-            ScriptedDecider(
-                [
-                    AgentDecision(action="call_tool", tool="delete_plan", reason="非法工具"),
-                    AgentDecision(action="finish", reason="已拒绝"),
-                ]
-            ),
-            max_steps=2,
-        )
-        assert denied["status"] == "succeeded"
-        assert denied_calls[0].status == "policy_denied"
-        assert denied_calls[0].error_type == "tool_not_registered"
-
-        limited, calls = await _exercise_controller(
-            trip_id,
-            ScriptedDecider(
-                [AgentDecision(action="call_tool", tool="get_trip_state", reason="继续观察")]
-            ),
-            max_steps=2,
-        )
-        assert limited["status"] == "step_limit_reached"
-        assert len(calls) == 2
-
-
-@pytest.mark.asyncio
-async def test_closed_poi_is_replaced_and_deadline_is_revalidated_before_v2():
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        headers, plan, trip_id = await _active_trip(
-            client,
-            "closedpoi",
-            "明天下午两点从酒店出发去公园，晚上十一点前到医院",
-        )
-        closed_id = plan["stops"][0]["poi"]["id"]
-        event_response = await client.post(
-            f"/api/companion/trips/{trip_id}/events",
-            headers=headers,
-            json={
-                "event_id": "closed-poi-agent-loop-001",
-                "type": "PoiStatusChanged",
-                "occurred_at": "2026-07-29T14:30:00+08:00",
-                "payload": {"closed_poi_id": closed_id},
-            },
-        )
-        assert event_response.status_code == 200
-        event = await _latest_event(trip_id)
-        await process_trip_event(
-            InMemoryRuntimeStore(),
-            {"trip_id": trip_id, "event_id": event.id, "event_type": event.event_type},
-            map_provider=app.state.map_provider,
-            weather_provider=app.state.weather_provider,
-            decider=ScriptedDecider(
-                [
-                    AgentDecision(action="call_tool", tool="propose_replan", reason="地点关闭"),
-                    AgentDecision(action="finish", reason="等待用户确认"),
-                ]
-            ),
-        )
-        processed_event, patch, run_id, _, _ = await _event_and_patch(trip_id)
-        assert patch is not None, (
-            f"{processed_event.decision_json}; {await _latest_tool_output(trip_id)}"
-        )
-        impact = json.loads(patch.impact_json)
-        assert impact["after"]["constraint_conflicts"] == []
-        assert any(
-            item["operation"] == "replace_stop" for item in json.loads(patch.operations_json)
-        )
-        accepted = await client.post(
-            f"/api/ai/plans/{run_id}/patches/{patch.id}/decision",
-            headers=headers,
-            json={"accept": True},
-        )
-        assert accepted.status_code == 200, accepted.text
-        assert accepted.json()["data"]["snapshot"]["stops"][-1]["constraint_satisfied"] is True
+        ),
+    )
+    processed_event, patch, run_id, _, _ = await _event_and_patch(trip_id)
+    assert patch is not None, (
+        f"{processed_event.decision_json}; {await _latest_tool_output(trip_id)}"
+    )
+    impact = json.loads(patch.impact_json)
+    assert impact["after"]["constraint_conflicts"] == []
+    assert any(item["operation"] == "replace_stop" for item in json.loads(patch.operations_json))
+    accepted = await async_client.post(
+        f"/api/ai/plans/{run_id}/patches/{patch.id}/decision",
+        headers=headers,
+        json={"accept": True},
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["data"]["snapshot"]["stops"][-1]["constraint_satisfied"] is True

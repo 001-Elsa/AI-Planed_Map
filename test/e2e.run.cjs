@@ -62,8 +62,11 @@ function run(cmd, args, env, cwd) {
   const proc = spawn(
     process.platform === 'win32' ? 'python' : 'python3',
     ['-m', 'uvicorn', 'backend.app.main:app', '--host', '127.0.0.1', '--port', String(PORT)],
-    { env, cwd: ROOT, stdio: 'ignore' }
+    { env, cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'] }
   );
+
+  let serverStderr = '';
+  proc.stderr.on('data', (chunk) => { serverStderr += chunk.toString(); });
 
   let healthy = false;
   for (let i = 0; i < 80; i++) {
@@ -76,6 +79,11 @@ function run(cmd, args, env, cwd) {
   if (!healthy) {
     proc.kill('SIGTERM');
     console.error('E2E 服务未能在时限内就绪');
+    if (serverStderr) {
+      console.error('--- 服务端 stderr ---');
+      console.error(serverStderr);
+      console.error('--- stderr 结束 ---');
+    }
     process.exit(1);
   }
 

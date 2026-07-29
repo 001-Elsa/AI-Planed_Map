@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     max_request_bytes: int = 1_000_000
     max_route_matrix_points: int = 25
     idempotency_ttl_seconds: int = 86_400
-    required_schema_revision: str = "0006"
+    required_schema_revision: str = "0007"
     precise_location_ttl_minutes: int = 120
     location_encryption_key: str = ""
     max_agent_tool_calls: int = 8
