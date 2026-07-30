@@ -55,6 +55,7 @@ jobs:
       MOCK_MAP_PROVIDER: "true"
       ENVIRONMENT: test
       REDIS_URL: redis://localhost:6379/15
+      LOCATION_ENCRYPTION_KEY: test-only-location-key-for-field-encryption
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

@@ -10,8 +10,9 @@ from alembic import command
 from alembic.config import Config
 from asgi_lifespan import LifespanManager
 
-from backend.app.main import app
-
+# ── environment must be set before importing `backend.app.main` ──────────
+# `get_settings()` is decorated with @lru_cache; the first call wins and
+# caches the result.  Setting env vars after the import is a no-op.
 DATABASE_FILE = None
 if "DATABASE_URL" not in os.environ:
     DATABASE_FILE = Path(tempfile.gettempdir()) / f"mapgo-test-{uuid.uuid4().hex}.db"
@@ -20,6 +21,8 @@ os.environ["MOCK_MAP_PROVIDER"] = "true"
 os.environ["ADMIN_INIT_TOKEN"] = ""
 os.environ["ENVIRONMENT"] = "test"
 os.environ["LOCATION_ENCRYPTION_KEY"] = "test-only-location-key-for-field-encryption"
+
+from backend.app.main import app  # noqa: E402
 
 alembic_config = Config("alembic.ini")
 command.upgrade(alembic_config, "head")
