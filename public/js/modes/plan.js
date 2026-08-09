@@ -3,12 +3,12 @@
 
 import { S } from '../state.js';
 import { $, escapeHtml, toast } from '../ui/dom.js';
-import { API } from '../services/api.js';
+import { API } from '../services/api.js?v=33';
 import { store } from '../services/store.js';
 import { fmtDist, fmtDur, fmtClock, toXY, copyText } from '../services/format.js';
-import { routeLeg, searchNearestPOI } from '../services/amap.js';
+import { routeLeg, searchNearestPOI } from '../services/amap.js?v=33';
 import { solveOrder, solveOrderExact } from '../services/algo.js';
-import { requireLogin } from '../ui/auth.js';
+import { requireLogin } from '../ui/auth.js?v=33';
 
 let activeTripId = null;
 let activePlanningRunId = null;
@@ -19,6 +19,7 @@ let planningConversationRevision = null;
 let eventStreamController = null;
 let lastStreamEventId = 0;
 let draftSaveTimer = null;
+let plannerCapabilities = null;
 const PLAN_DRAFT_KEY = 'mapgo_plan_draft';
 
 /* ---------------- 生命周期 ---------------- */
@@ -31,6 +32,37 @@ export function activate() {
   }
   loadPlans();
   loadPlanOverview();
+  loadPlannerCapabilities();
+}
+
+async function loadPlannerCapabilities() {
+  const badge = $('planner-runtime-badge');
+  try {
+    plannerCapabilities = await API.planningCapabilities();
+    badge.className = plannerCapabilities.configuration_warning
+      ? 'planner-runtime-badge'
+      : 'planner-runtime-badge ready';
+    badge.querySelector('b').textContent = plannerCapabilities.configuration_warning
+      ? '需配置高德 Web 服务 Key'
+      : plannerCapabilities.map_provider + ' · 后端在线';
+    if (!API.user) renderGuestPlanningOverview(plannerCapabilities);
+  } catch (error) {
+    badge.className = 'planner-runtime-badge offline';
+    badge.querySelector('b').textContent = '规划后端不可用';
+  }
+}
+
+function renderGuestPlanningOverview(capabilities) {
+  $('plan-overview-hint').textContent = '后端能力已就绪 · 登录后保存正式版本';
+  $('plan-overview-stats').innerHTML =
+    '<div><b>' + capabilities.max_tasks + '</b><span>最多任务</span></div>' +
+    '<div><b>' + capabilities.max_route_matrix_points + '</b><span>路网矩阵点</span></div>' +
+    '<div><b>v∞</b><span>版本可回滚</span></div>';
+  $('plan-recent-list').innerHTML = '<div class="planner-guest-note"><b>这里不是聊天框壳子</b>' +
+    '<span>' + (capabilities.configuration_warning
+      ? escapeHtml(capabilities.configuration_warning) + '。当前后端会明确标记估算数据，不伪装成高德结果。'
+      : '登录后会调用 ' + escapeHtml(capabilities.map_provider) +
+        ' 核验地点，计算真实路网并由后端约束求解器生成正式计划。') + '</span></div>';
 }
 
 export function clearAll() {
@@ -38,10 +70,35 @@ export function clearAll() {
   S.planOverlays = [];
 }
 
+function setTripControls(state) {
+  const active = ['ACTIVE_TRIP', 'OFF_ROUTE', 'AT_RISK', 'REPLANNING'].includes(state);
+  const resumable = state === 'PAUSED';
+  const executable = state === 'PLAN_READY';
+  const terminal = ['COMPLETED', 'CANCELLED', 'INFEASIBLE'].includes(state);
+  $('btn-trip-start').classList.toggle('hidden', !(executable || resumable));
+  $('btn-trip-pause').classList.toggle('hidden', !active);
+  $('btn-trip-complete').classList.toggle('hidden', !(active || resumable));
+  $('btn-trip-cancel').classList.toggle('hidden', terminal || !active && !resumable && !executable);
+  $('btn-trip-replan').classList.toggle('hidden', !active);
+}
+
+function switchActiveTrip(nextTripId, trackingEnabled = false) {
+  if (activeTripId !== nextTripId) {
+    stopLocationTracking();
+    stopTripEventStream();
+    lastStreamEventId = 0;
+  }
+  activeTripId = nextTripId;
+  locationConsentGranted = Boolean(trackingEnabled);
+  $('btn-location-consent').textContent = '精确定位：' +
+    (locationConsentGranted ? '已授权' : '未授权');
+}
+
 export function bindPlanUI() {
   document.querySelectorAll('#plan-mode-seg .seg-btn').forEach((b) => {
     b.addEventListener('click', () => {
       S.planTravelMode = b.dataset.tmode;
+      S.planTravelModeExplicit = true;
       document.querySelectorAll('#plan-mode-seg .seg-btn').forEach((x) => x.classList.toggle('active', x === b));
     });
   });
@@ -56,6 +113,8 @@ export function bindPlanUI() {
   });
   $('btn-trip-start').addEventListener('click', startTrip);
   $('btn-trip-pause').addEventListener('click', pauseTrip);
+  $('btn-trip-complete').addEventListener('click', () => finishTrip('COMPLETED'));
+  $('btn-trip-cancel').addEventListener('click', () => finishTrip('CANCELLED'));
   $('btn-location-consent').addEventListener('click', toggleLocationConsent);
   $('btn-trip-replan').addEventListener('click', requestDynamicReplan);
   document.querySelectorAll('[data-plan-template]').forEach((button) => {
@@ -83,6 +142,68 @@ function persistPlanDraft() {
   else store.del(PLAN_DRAFT_KEY);
 }
 
+function planRequestOptions(departureTime) {
+  const hard = {};
+  const maxWalk = Number($('plan-max-walk').value || 0);
+  const budget = Number($('plan-budget').value || 0);
+  if (maxWalk > 0) hard.max_walking_meters = maxWalk;
+  if (budget > 0) hard.max_total_cost_yuan = budget;
+  const latestValue = $('plan-latest').value;
+  if (latestValue) {
+    const latest = departureTime ? new Date(departureTime) : new Date();
+    const [hours, minutes] = latestValue.split(':').map(Number);
+    latest.setHours(hours, minutes, 0, 0);
+    if (departureTime && latest <= new Date(departureTime)) latest.setDate(latest.getDate() + 1);
+    hard.latest_return_time = latest.toISOString();
+  }
+  return {
+    constraints: Object.keys(hard).length ? { hard, uncertain: [] } : null,
+    preferences_answers: {
+      prefer_high_rating: $('plan-high-rating').checked,
+      minimize_walking: maxWalk > 0,
+      minimize_cost: budget > 0,
+    },
+  };
+}
+
+function planningCity() {
+  const locationName = String(S.myPosName || '');
+  const provinceCity = locationName.match(/(?:省|自治区)([\u4e00-\u9fa5]{2,8}市)/);
+  if (provinceCity) return provinceCity[1];
+  const directCity = locationName.match(/(?:^|[，,\s])([\u4e00-\u9fa5]{2,8}市)/);
+  return directCity ? directCity[1] : '';
+}
+
+function inferTravelModeFromText(text) {
+  if (/(?:公共交通|公交|地铁|轻轨|坐车|换乘)/.test(text)) return 'transit';
+  if (/(?:开车|驾车|自驾)/.test(text)) return 'drive';
+  if (/(?:骑车|骑行|自行车)/.test(text)) return 'ride';
+  if (/(?:步行|走路)/.test(text)) return 'walk';
+  return '';
+}
+
+function showPlanningExecutionPending() {
+  const execution = $('planning-execution');
+  execution.classList.remove('hidden');
+  execution.innerHTML = '<div class="execution-head"><b>后端规划流水线</b><span>请求已提交，正在核验真实数据…</span></div>' +
+    '<div class="execution-stages">' + ['理解需求', '核验地点', '计算路网', '约束求解', '保存版本']
+      .map((label, index) => '<div class="execution-stage ' + (index === 0 ? 'attention' : '') + '">' +
+        '<b>' + label + '</b><small>' + (index === 0 ? '处理中' : '等待上一步') + '</small></div>').join('') + '</div>';
+}
+
+function renderPlanningExecution(result) {
+  const execution = $('planning-execution');
+  const trace = result.execution;
+  if (!trace) { execution.classList.add('hidden'); return; }
+  execution.classList.remove('hidden');
+  execution.innerHTML = '<div class="execution-head"><b>后端执行凭证</b><span>' +
+    escapeHtml(trace.map_provider || 'Map Provider') + ' · ' + escapeHtml(trace.intent_parser || 'parser') +
+    ' · ' + Number(trace.latency_ms || 0) + ' ms</span></div><div class="execution-stages">' +
+    (trace.stages || []).map((stage) => '<div class="execution-stage ' + escapeHtml(stage.status || '') + '">' +
+      '<b>' + escapeHtml(stage.label || stage.key) + '</b><small title="' + escapeHtml(stage.detail || '') + '">' +
+      escapeHtml(stage.detail || '') + '</small></div>').join('') + '</div>';
+}
+
 async function runAIPlan() {
   if (!requireLogin()) return;
   const text = $('plan-input').value.trim();
@@ -91,33 +212,92 @@ async function runAIPlan() {
     const center = S.map.getCenter();
     return { lng: center.lng, lat: center.lat };
   })();
+  const requestOrigin = { lng: Number(origin.lng), lat: Number(origin.lat) };
   const button = $('btn-ai-plan');
   const out = $('plan-result');
   button.disabled = true;
-  button.textContent = '理解需求中…';
+  button.textContent = '后端规划中…';
   clearAll();
+  switchActiveTrip(null);
+  showPlanningExecutionPending();
   try {
-    const mode = S.planTravelMode === 'drive' ? 'driving' : S.planTravelMode === 'ride' ? 'cycling' : 'walking';
+    const inferredMode = inferTravelModeFromText(text);
+    if (!S.planTravelModeExplicit && inferredMode) {
+      S.planTravelMode = inferredMode;
+      document.querySelectorAll('#plan-mode-seg .seg-btn').forEach((item) =>
+        item.classList.toggle('active', item.dataset.tmode === inferredMode));
+    }
+    const mode = {
+      drive: 'driving',
+      ride: 'cycling',
+      transit: 'transit',
+      walk: 'walking',
+    }[S.planTravelMode] || 'walking';
+    const departValue = $('plan-depart').value;
+    let departureTime = null;
+    if (departValue) {
+      const [hours, minutes] = departValue.split(':').map(Number);
+      const selected = new Date();
+      selected.setHours(hours, minutes, 0, 0);
+      departureTime = selected.toISOString();
+    }
+    const requestOptions = planRequestOptions(departureTime);
     const result = await API.startPlanningConversation({
       text,
-      origin,
+      origin: requestOrigin,
+      departure_time: departureTime,
       transport_mode: mode,
+      city: planningCity() || null,
       default_service_duration_minutes: Math.max(0, parseInt($('plan-stay').value, 10) || 0),
+      constraints: requestOptions.constraints,
+      preferences_answers: requestOptions.preferences_answers,
     });
+    renderPlanningExecution(result);
     planningConversationId = result.conversation_id;
     planningConversationRevision = result.conversation_revision;
     if (result.status === 'need_clarification') {
       renderClarification(result, out);
       return;
     }
-    await renderAIResult(result, origin, text, out);
+    await renderAIResult(result, requestOrigin, text, out);
     loadPlanOverview();
   } catch (err) {
+    $('planning-execution').classList.add('hidden');
     out.innerHTML = '<div class="err">AI 规划失败：' + escapeHtml(err.message || String(err)) + '</div>';
   } finally {
     button.disabled = false;
-    button.textContent = '✨ AI 规划';
+    button.textContent = '生成可执行计划';
   }
+}
+
+function clarificationControl(question, index) {
+  const field = String(question.field || '');
+  const name = 'q-' + index;
+  if (Array.isArray(question.candidates) && question.candidates.length) {
+    return '<select name="' + name + '" data-field="' + escapeHtml(field) + '" data-value-type="string" required>' +
+      '<option value="">请选择地点</option>' + question.candidates.map((candidate) =>
+        '<option value="' + escapeHtml(candidate.id) + '">' + escapeHtml(candidate.name) +
+        (candidate.address ? ' · ' + escapeHtml(candidate.address) : '') + '</option>').join('') + '</select>';
+  }
+  if (field === 'origin') {
+    return '<div class="clarification-coordinate">' +
+      '<input name="' + name + '-lng" data-field="origin.lng" data-value-type="number" required placeholder="经度">' +
+      '<input name="' + name + '-lat" data-field="origin.lat" data-value-type="number" required placeholder="纬度"></div>';
+  }
+  if (/minimize_|wheelchair_accessible$|has_luggage$/.test(field)) {
+    return '<select name="' + name + '" data-field="' + escapeHtml(field) + '" data-value-type="boolean" required>' +
+      '<option value="">请选择</option><option value="true">是</option><option value="false">否</option></select>';
+  }
+  if (/dietary_restrictions|areas$/.test(field)) {
+    return '<input name="' + name + '" data-field="' + escapeHtml(field) + '" data-value-type="list" required placeholder="多个值请用逗号分隔">';
+  }
+  if (/meters|minutes|yuan|\.adults$|\.elderly$|\.children$|wheelchair_users$|\.pets$/.test(field)) {
+    return '<input type="number" name="' + name + '" data-field="' + escapeHtml(field) + '" data-value-type="number" required>';
+  }
+  if (/time$/.test(field)) {
+    return '<input type="datetime-local" name="' + name + '" data-field="' + escapeHtml(field) + '" data-value-type="datetime" required>';
+  }
+  return '<input name="' + name + '" data-field="' + escapeHtml(field) + '" data-value-type="string" required placeholder="请输入明确值">';
 }
 
 function renderClarification(result, out) {
@@ -127,8 +307,7 @@ function renderClarification(result, out) {
       (q.reason ? '<small>' + escapeHtml(q.reason) + '</small>' : '') + '</p>').join('') +
     '<form id="clarification-form" class="clarification-form">' +
     result.questions.map((q, index) => '<label>' + escapeHtml(q.field) +
-      '<input name="q-' + index + '" data-field="' + escapeHtml(q.field) +
-      '" required placeholder="请输入明确值"></label>').join('') +
+      clarificationControl(q, index) + '</label>').join('') +
     '<button class="primary-btn" type="submit">确认约束并继续规划</button></form></div>';
   $('clarification-form').addEventListener('submit', continueAIConversation);
 }
@@ -137,17 +316,27 @@ async function continueAIConversation(event) {
   event.preventDefault();
   const form = event.currentTarget;
   const answers = {};
-  form.querySelectorAll('input[data-field]').forEach((input) => {
+  form.querySelectorAll('[data-field]').forEach((input) => {
     const field = input.dataset.field;
     let value = input.value.trim();
-    if (/meters|minutes|yuan/.test(field)) value = Number(value);
-    answers[field] = value;
+    const valueType = input.dataset.valueType;
+    if (valueType === 'number') value = Number(value);
+    else if (valueType === 'boolean') value = value === 'true';
+    else if (valueType === 'list') value = value.split(/[,，、]/).map((item) => item.trim()).filter(Boolean);
+    else if (valueType === 'datetime') value = new Date(value).toISOString();
+    if (field === 'origin.lng' || field === 'origin.lat') {
+      answers.origin = answers.origin || {};
+      answers.origin[field.endsWith('.lng') ? 'lng' : 'lat'] = value;
+    } else {
+      answers[field] = value;
+    }
   });
   const out = $('plan-result');
   try {
     const result = await API.continuePlanningConversation(
       planningConversationId, planningConversationRevision, answers,
     );
+    renderPlanningExecution(result);
     planningConversationRevision = result.conversation_revision;
     if (result.status === 'need_clarification') {
       renderClarification(result, out);
@@ -168,13 +357,14 @@ async function renderAIResult(result, origin, text, out) {
       loc: stop.poi.location,
       confidence: stop.poi.confidence,
     }));
-    const legs = [];
-    let previous = origin;
-    for (let index = 0; index < ordered.length; index += 1) {
-      const stop = ordered[index];
-      const visualLeg = await routeLeg(previous, stop.loc, S.planTravelMode);
+    const visualLegs = await Promise.all(ordered.map((stop, index) => {
+      const previous = index === 0 ? origin : ordered[index - 1].loc;
+      return routeLeg(previous, stop.loc, S.planTravelMode, planningCity());
+    }));
+    const legs = ordered.map((_stop, index) => {
+      const visualLeg = visualLegs[index];
       const verified = result.stops[index].travel;
-      legs.push({
+      return {
         ...visualLeg,
         distance: verified.distance_meters,
         time: verified.duration_seconds,
@@ -182,11 +372,23 @@ async function renderAIResult(result, origin, text, out) {
         quality: verified.quality,
         confidence: verified.confidence,
         fallbackUsed: verified.fallback_used,
-      });
-      previous = stop.loc;
-    }
+      };
+    });
     S.lastPlanCtx = { origin, stops: ordered, legs, missed: [] };
-    renderPlanResult(origin, ordered, legs, [], result.algorithm === 'exact-permutation', false);
+    try {
+      renderPlanResult(
+        origin,
+        ordered,
+        legs,
+        [],
+        result.algorithm === 'joint-exact-enumeration',
+        false,
+      );
+    } catch (renderError) {
+      clearAll();
+      out.innerHTML = '<div class="estimate-warning">正式计划已保存，但地图图层暂时无法绘制。' +
+        '可以稍后重新打开；这不会再次创建计划。</div>';
+    }
     const banner = document.createElement('div');
     banner.className = result.status === 'infeasible' ? 'ai-card err' : 'ai-card';
     banner.innerHTML = '<b>' + (result.status === 'infeasible' ? '约束冲突' : '规划说明') + '</b><p>' +
@@ -196,11 +398,12 @@ async function renderAIResult(result, origin, text, out) {
       (result.uncertainty ? '<p>耗时合理区间 ' +
         fmtDur(result.uncertainty.lower_duration_seconds) + '～' +
         fmtDur(result.uncertainty.upper_duration_seconds) +
-        (result.uncertainty.on_time_probability != null ? ' · 按时概率 ' +
+        (result.uncertainty.on_time_probability != null ? ' · 启发式按时置信度 ' +
           Math.round(result.uncertainty.on_time_probability * 100) + '%' : '') + '</p>' : '') +
       (result.conflicts || []).map((item) => '<p>• ' + escapeHtml(item) + '</p>').join('') +
       (result.warnings || []).map((item) => '<p class="estimate-warning">⚠ ' + escapeHtml(item) + '</p>').join('');
     out.prepend(banner);
+    renderPlanInsights(result, out);
     S.lastPlan = {
       text, travelMode: S.planTravelMode, depart: $('plan-depart').value,
       stay: $('plan-stay').value, aiResult: result,
@@ -211,10 +414,65 @@ async function renderAIResult(result, origin, text, out) {
     $('plan-save-row').classList.remove('hidden');
 }
 
+function constraintSummary(result) {
+  const hard = result.intent && result.intent.constraints && result.intent.constraints.hard || {};
+  const labels = [];
+  if (hard.latest_return_time) labels.push('最晚 ' + new Date(hard.latest_return_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+  if (hard.max_walking_meters != null) labels.push('步行 ≤ ' + fmtDist(hard.max_walking_meters));
+  if (hard.max_total_cost_yuan != null) labels.push('预算 ≤ ¥' + hard.max_total_cost_yuan);
+  if (hard.wheelchair_accessible) labels.push('无障碍');
+  const preferences = result.intent && result.intent.preferences || {};
+  if (preferences.prefer_high_rating) labels.push('优先高评分');
+  if (preferences.minimize_distance) labels.push('少绕路');
+  if (preferences.optimization_goal === 'shortest_time') labels.push('最短时间');
+  if (preferences.optimization_goal === 'shortest_distance') labels.push('最短距离');
+  return labels;
+}
+
+function renderPlanInsights(result, out) {
+  const tasks = result.intent && result.intent.tasks || [];
+  const reviews = result.candidate_reviews || [];
+  const constraints = constraintSummary(result);
+  const score = result.score || {};
+  const scoreItems = [
+    ['行驶时间', score.travel_time], ['步行成本', score.walking_time],
+    ['路线距离', score.distance], ['评分偏好', score.low_rating], ['不确定性', score.uncertainty],
+  ].filter((item) => Number(item[1]) > 0);
+  const maxScore = Math.max(1, ...scoreItems.map((item) => Number(item[1])));
+  const section = document.createElement('div');
+  section.className = 'plan-insight-grid';
+  section.innerHTML = '<section class="plan-insight"><b>后端理解的任务与硬约束</b>' +
+    '<div class="candidate-pills">' + (constraints.length
+      ? constraints.map((item) => '<span>' + escapeHtml(item) + '</span>').join('')
+      : '<span>未设置额外硬约束</span>') + '</div><div class="intent-task-list">' +
+    tasks.map((task, index) => '<div class="intent-task"><b>' + (index + 1) + '. ' +
+      escapeHtml(task.description) + '</b><small>' +
+      escapeHtml(task.location_name || task.category || '由 Provider 匹配地点') +
+      ' · 停留 ' + task.service_duration_minutes + ' 分钟</small></div>').join('') + '</div></section>' +
+    '<section class="plan-insight"><b>真实候选地点核验</b><div class="candidate-review-list">' +
+    (reviews.length ? reviews.map((review) => '<div class="candidate-review"><b>' +
+      escapeHtml(review.task_description) + ' · 比较 ' + review.considered_count + ' 个</b><div class="candidate-pills">' +
+      (review.candidates || []).slice(0, 4).map((candidate) => '<span class="' +
+        (candidate.id === review.selected_poi_id ? 'selected' : '') + '" title="' +
+        escapeHtml(candidate.address || '') + '">' + escapeHtml(candidate.name) +
+        (candidate.rating != null ? ' ' + candidate.rating + '分' : '') + '</span>').join('') +
+      '</div></div>').join('') : '<div class="candidate-review">等待地点核验</div>') + '</div></section>' +
+    (scoreItems.length ? '<section class="plan-insight"><b>求解器评分构成</b><div class="score-bars">' +
+      scoreItems.map((item) => '<div class="score-bar"><span>' + item[0] + '</span><i style="--score-width:' +
+        Math.max(3, Math.round(Number(item[1]) / maxScore * 100)) + '%"></i><b>' +
+        Math.round(Number(item[1])) + '</b></div>').join('') + '</div></section>' : '') +
+    '<section class="plan-insight"><b>数据可信度</b><div class="candidate-pills">' +
+      '<span class="selected">Provider 路线 ' + Number(result.execution && result.execution.verified_route_edges || 0) + ' 段</span>' +
+      '<span>估算路线 ' + Number(result.execution && result.execution.estimated_route_edges || 0) + ' 段</span>' +
+      '<span>综合 ' + Math.round((result.confidence || 0) * 100) + '%</span></div></section>';
+  out.appendChild(section);
+}
+
 function renderStructuredTimeline(result) {
   const aside = $('agent-timeline');
   aside.classList.remove('hidden');
   $('trip-state-badge').textContent = result.planning_state || 'PLAN_READY';
+  setTripControls(result.status === 'success' ? (result.planning_state || 'PLAN_READY') : 'INFEASIBLE');
   $('timeline-data-dot').className = result.confidence >= .8 ? 'ok' : result.confidence >= .6 ? 'warn' : 'bad';
   $('timeline-proof').innerHTML =
     '<div><b>' + Math.round((result.confidence || 0) * 100) + '%</b><span>综合置信度</span></div>' +
@@ -227,8 +485,15 @@ function renderStructuredTimeline(result) {
       escapeHtml(new Date(stop.arrival_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })) +
       ' 到达 · 停留 ' + stop.task.service_duration_minutes + ' 分钟</small>' +
       '<em class="' + sourceClass + '">' + escapeHtml(stop.travel.source) + ' · ' +
-      Math.round(stop.travel.confidence * 100) + '%</em></div></article>';
+      Math.round(stop.travel.confidence * 100) + '%</em>' +
+      '<span class="timeline-stop-actions"><button type="button" class="small-btn btn-stop-complete" ' +
+      'data-stop-id="' + escapeHtml(stop.poi.id) + '" data-planned-arrival="' +
+      escapeHtml(stop.arrival_time) + '">完成</button><button type="button" class="small-btn btn-stop-skip" ' +
+      'data-stop-id="' + escapeHtml(stop.poi.id) + '">跳过</button></span></div></article>';
   }).join('');
+  $('structured-timeline').querySelectorAll('.btn-stop-complete, .btn-stop-skip').forEach((button) => {
+    button.addEventListener('click', () => reportStopOutcome(button));
+  });
   const risk = $('agent-risk-card');
   if (result.status === 'infeasible' || (result.warnings || []).length) {
     risk.classList.remove('hidden');
@@ -245,16 +510,15 @@ async function startTrip() {
   try {
     if (!activeTripId) {
       const created = await API.createTrip(activePlanningRunId);
-      activeTripId = created.trip_id;
+      switchActiveTrip(created.trip_id);
     }
     const trip = await API.getTrip(activeTripId);
+    switchActiveTrip(trip.id, trip.tracking_enabled);
     if (trip.state === 'PLAN_READY' || trip.state === 'PAUSED') {
       await API.transitionTrip(activeTripId, 'ACTIVE_TRIP', '用户在时间线确认开始行程');
     }
     $('trip-state-badge').textContent = 'ACTIVE_TRIP';
-    $('btn-trip-start').classList.add('hidden');
-    $('btn-trip-pause').classList.remove('hidden');
-    $('btn-trip-replan').classList.remove('hidden');
+    setTripControls('ACTIVE_TRIP');
     startTripEventStream();
     toast('随行 Agent 已启动；未授权前不会读取精确位置');
   } catch (error) { toast(error.message); }
@@ -265,23 +529,59 @@ async function pauseTrip() {
   try {
     await API.transitionTrip(activeTripId, 'PAUSED', '用户主动暂停');
     $('trip-state-badge').textContent = 'PAUSED';
-    $('btn-trip-pause').classList.add('hidden');
-    $('btn-trip-start').classList.remove('hidden');
+    setTripControls('PAUSED');
     stopLocationTracking();
     stopTripEventStream();
   } catch (error) { toast(error.message); }
 }
 
+async function finishTrip(targetState) {
+  if (!activeTripId) return;
+  const label = targetState === 'COMPLETED' ? '完成' : '取消';
+  if (!confirm('确认' + label + '本次行程？')) return;
+  try {
+    await API.transitionTrip(activeTripId, targetState, '用户主动' + label + '行程');
+    $('trip-state-badge').textContent = targetState;
+    setTripControls(targetState);
+    stopLocationTracking();
+    stopTripEventStream();
+    const summary = await API.getTripSummary(activeTripId);
+    toast('行程已' + label + ' · 完成 ' + summary.completed_stops + '/' + summary.planned_stops + ' 站');
+  } catch (error) { toast(error.message); }
+}
+
+async function reportStopOutcome(button) {
+  if (!activeTripId) { toast('请先开始行程'); return; }
+  const skipped = button.classList.contains('btn-stop-skip');
+  const now = new Date().toISOString();
+  try {
+    await API.sendTripEvent(activeTripId, {
+      event_id: ((skipped ? 'skip-' : 'complete-') + Date.now() + '-' + button.dataset.stopId).slice(0, 100),
+      type: skipped ? 'PlanStopSkipped' : 'PlanStopCompleted',
+      occurred_at: now,
+      payload: {
+        stop_id: button.dataset.stopId,
+        planned_arrival: button.dataset.plannedArrival || null,
+        arrived_at: skipped ? null : now,
+      },
+    });
+    button.closest('.timeline-stop').classList.add(skipped ? 'skipped' : 'done');
+    button.closest('.timeline-stop-actions').querySelectorAll('button').forEach((item) => { item.disabled = true; });
+  } catch (error) { toast(error.message); }
+}
+
 async function startTripEventStream() {
   if (!activeTripId || eventStreamController) return;
-  eventStreamController = new AbortController();
+  const streamTripId = activeTripId;
+  const controller = new AbortController();
+  eventStreamController = controller;
   try {
-    const response = await fetch('/api/companion/trips/' + activeTripId + '/stream', {
+    const response = await fetch('/api/companion/trips/' + streamTripId + '/stream', {
       headers: {
         Authorization: 'Bearer ' + API.token,
         'Last-Event-ID': String(lastStreamEventId),
       },
-      signal: eventStreamController.signal,
+      signal: controller.signal,
     });
     if (!response.ok || !response.body) throw new Error('事件流连接失败');
     const reader = response.body.getReader();
@@ -293,35 +593,51 @@ async function startTripEventStream() {
       buffer += decoder.decode(chunk.value, { stream: true });
       const frames = buffer.split('\n\n');
       buffer = frames.pop();
-      frames.forEach(handleEventFrame);
+      frames.forEach((frame) => handleEventFrame(frame, streamTripId));
     }
   } catch (error) {
-    if (error.name !== 'AbortError' && eventStreamController) {
-      setTimeout(() => { eventStreamController = null; startTripEventStream(); }, 2000);
+    if (error.name !== 'AbortError' && !controller.signal.aborted && activeTripId === streamTripId) {
+      if (eventStreamController === controller) eventStreamController = null;
+      setTimeout(() => {
+        if (activeTripId === streamTripId) startTripEventStream();
+      }, 2000);
       return;
     }
   }
-  eventStreamController = null;
-  if (activeTripId && $('trip-state-badge').textContent === 'ACTIVE_TRIP') {
-    setTimeout(startTripEventStream, 2000);
+  if (eventStreamController === controller) eventStreamController = null;
+  if (activeTripId === streamTripId && $('trip-state-badge').textContent === 'ACTIVE_TRIP') {
+    setTimeout(() => {
+      if (activeTripId === streamTripId) startTripEventStream();
+    }, 2000);
   }
 }
 
-function handleEventFrame(frame) {
+function handleEventFrame(frame, streamTripId) {
+  if (activeTripId !== streamTripId) return;
   const idLine = frame.split('\n').find((line) => line.startsWith('id:'));
   const dataLine = frame.split('\n').find((line) => line.startsWith('data:'));
   if (idLine) lastStreamEventId = Number(idLine.slice(3).trim()) || lastStreamEventId;
   if (!dataLine) return;
   try {
     const event = JSON.parse(dataLine.slice(5).trim());
-    $('trip-state-badge').textContent = event.state;
+    if (event.state) {
+      $('trip-state-badge').textContent = event.state;
+      setTripControls(event.state);
+      if (['COMPLETED', 'CANCELLED'].includes(event.state)) {
+        stopLocationTracking();
+        stopTripEventStream();
+      }
+    }
     if (event.decision && event.decision.should_notify) {
       const risk = $('agent-risk-card');
       risk.classList.remove('hidden');
       risk.innerHTML = '<b>实时风险：' + escapeHtml(event.type) + '</b><p>' +
         escapeHtml(event.decision.reason || '') + '</p>';
     }
-  } catch (_) { /* 忽略不完整帧，重连会基于事件 ID 恢复 */ }
+    if (event.plan_patch && event.plan_patch.patch_created) {
+      renderPatchProposal(event.plan_patch);
+    }
+  } catch (_) { /* 忽略不完整帧；重连只恢复最新状态快照，不保证逐条重放。 */ }
 }
 
 function stopTripEventStream() {
@@ -351,8 +667,11 @@ function renderPatchProposal(result) {
   card.classList.remove('hidden');
   if (!result.patch_created) {
     card.innerHTML = '<b>重规划评估</b><p>' +
-      escapeHtml(result.status === 'current_order_still_optimal' ? '原计划仍可执行，无需变更。' : '当前没有可行的自动调整。') +
-      '</p>' + (result.options || []).map((option) => '<p>• ' + escapeHtml(option.action) + '</p>').join('');
+      escapeHtml(result.status === 'current_plan_still_feasible'
+        ? '原计划仍可执行，无需变更。'
+        : '当前没有可行的自动调整。') +
+      '</p>' + (result.options || result.alternatives || []).map((option) => '<p>• ' +
+        escapeHtml(option.action || option.label || option.transport_mode || '') + '</p>').join('');
     return;
   }
   const before = result.impact.before || {};
@@ -392,16 +711,21 @@ async function toggleLocationConsent() {
 
 function startLocationTracking() {
   if (!navigator.geolocation || locationWatchId != null || !activeTripId) return;
+  const trackingTripId = activeTripId;
   locationWatchId = navigator.geolocation.watchPosition(async (position) => {
+    if (activeTripId !== trackingTripId || !locationConsentGranted) return;
     try {
-      await API.updateTripLocation(activeTripId, {
+      await API.updateTripLocation(trackingTripId, {
         event_id: 'location-' + Date.now() + '-' + Math.round(position.coords.latitude * 1e5),
         location: { lng: position.coords.longitude, lat: position.coords.latitude },
         accuracy_meters: position.coords.accuracy,
         captured_at: new Date(position.timestamp).toISOString(),
       });
     } catch (error) {
-      if (error.status === 403 || error.status === 409) stopLocationTracking();
+      if (
+        activeTripId === trackingTripId &&
+        (error.status === 403 || error.status === 409)
+      ) stopLocationTracking();
     }
   }, () => {}, { enableHighAccuracy: true, maximumAge: 15000, timeout: 10000 });
 }
@@ -414,7 +738,12 @@ function stopLocationTracking() {
 }
 
 function travelModeName() {
-  return S.planTravelMode === 'drive' ? '驾车' : S.planTravelMode === 'ride' ? '骑行' : '步行';
+  return {
+    drive: '驾车',
+    ride: '骑行',
+    transit: '公共交通',
+    walk: '步行',
+  }[S.planTravelMode] || '步行';
 }
 
 /* ---------------- 主流程 ---------------- */
@@ -464,7 +793,7 @@ async function runPlan() {
     const legs = [];
     let prev = origin;
     for (const s of ordered) {
-      const leg = await routeLeg(prev, s.loc, S.planTravelMode);
+      const leg = await routeLeg(prev, s.loc, S.planTravelMode, planningCity());
       legs.push(leg);
       prev = s.loc;
     }
@@ -478,7 +807,7 @@ async function runPlan() {
     out.innerHTML = '<div class="err">规划出错:' + escapeHtml(err && err.message || String(err)) + '</div>';
   } finally {
     btn.disabled = false;
-    btn.textContent = '最短路径规划';
+    btn.textContent = '快速路线';
   }
 }
 
@@ -489,7 +818,7 @@ async function buildRealMatrix(points, tmode) {
   const pairs = [];
   for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) pairs.push([i, j]);
   await Promise.all(pairs.map(async ([i, j]) => {
-    const leg = await routeLeg(points[i], points[j], tmode);
+    const leg = await routeLeg(points[i], points[j], tmode, planningCity());
     D[i][j] = D[j][i] = leg.distance;
   }));
   return D;
@@ -497,7 +826,7 @@ async function buildRealMatrix(points, tmode) {
 
 function legTimeEst(leg, tmode) {
   if (leg.time != null) return leg.time;
-  const speed = tmode === 'drive' ? 8.3 : tmode === 'ride' ? 4 : 1.2; // m/s
+  const speed = tmode === 'drive' ? 8.3 : tmode === 'ride' ? 4 : tmode === 'transit' ? 6 : 1.2; // m/s
   return leg.distance / speed;
 }
 
@@ -629,7 +958,7 @@ async function moveStop(from, to) {
   const legs = [];
   let prev = ctx.origin;
   for (const s of stops) {
-    const leg = await routeLeg(prev, s.loc, S.planTravelMode);
+    const leg = await routeLeg(prev, s.loc, S.planTravelMode, planningCity());
     legs.push(leg);
     prev = s.loc;
   }
@@ -689,12 +1018,16 @@ export async function loadPlanOverview() {
         const snapshot = { ...(item.snapshot || {}) };
         snapshot.planning_run_id = item.planning_run_id;
         snapshot.plan_version = item.plan_version;
-        activeTripId = item.trip_id || null;
+        switchActiveTrip(item.trip_id || null);
         $('plan-input').value = item.input_text || '';
         persistPlanDraft();
         const origin = snapshot.origin || S.myPos || S.map.getCenter();
         try {
           await renderAIResult(snapshot, origin, item.input_text || '', $('plan-result'));
+          if (item.trip_state) {
+            $('trip-state-badge').textContent = item.trip_state;
+            setTripControls(item.trip_state);
+          }
           toast('已继续正式计划 v' + item.plan_version);
         } catch (error) {
           toast('恢复计划失败：' + error.message);
@@ -733,6 +1066,7 @@ export async function loadPlans() {
         if (!data) { toast('计划数据损坏'); return; }
         $('plan-input').value = data.text || '';
         S.planTravelMode = data.travelMode || 'walk';
+        S.planTravelModeExplicit = true;
         if (data.depart) $('plan-depart').value = data.depart;
         if (data.stay != null) $('plan-stay').value = data.stay;
         document.querySelectorAll('#plan-mode-seg .seg-btn').forEach((x) =>

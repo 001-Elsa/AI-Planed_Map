@@ -19,18 +19,18 @@ def test_exact_solver_respects_deadline_over_shorter_route():
     distances = [[0, 100, 500], [100, 0, 100], [500, 100, 0]]
     durations = [[0, 60, 300], [60, 0, 900], [300, 60, 0]]
     result, algorithm = optimize_route(departure, tasks, distances, durations)
-    assert algorithm == "exact-permutation"
+    assert algorithm == "joint-exact-enumeration"
     assert result.feasible
     assert result.order == [1, 0]
 
 
-def test_two_opt_never_returns_worse_than_initial_shape():
+def test_large_single_candidate_route_uses_the_real_solver_label():
     departure = datetime(2026, 7, 29, 14, 0, tzinfo=timezone.utc)
     tasks = [PlanningTask(description=str(index), location_name=str(index)) for index in range(7)]
     size = 8
     distances = [[abs(i - j) * 100 for j in range(size)] for i in range(size)]
     durations = [[value / 2 for value in row] for row in distances]
     result, algorithm = optimize_route(departure, tasks, distances, durations)
-    assert algorithm == "nearest-neighbor+2-opt"
+    assert algorithm == "ortools-routing-time-windows"
     assert result.order == list(range(7))
     assert result.total_distance == 700

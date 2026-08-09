@@ -25,7 +25,7 @@ def test_fallback_parser_switches_to_rules_and_lowers_confidence():
         parser = FallbackIntentParser(BoomParser())
         intent = await parser.parse("明天下午两点从学校出发，五点前到医院")
         assert parser.fallback_used is True
-        assert parser.last_parser == "rule-based-v1"
+        assert parser.last_parser == "rule-based-v2"
         assert intent.tasks
         assert intent.constraints.uncertain
         assert intent.constraints.uncertain[0].confidence == 0.45

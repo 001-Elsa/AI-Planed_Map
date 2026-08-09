@@ -27,6 +27,7 @@ from backend.app.services.agent_controller import AgentController
 from backend.app.services.agent_decider import AgentDecider, build_agent_decider
 from backend.app.services.notifications import NotificationService, render_event_notification
 from backend.app.services.replanning import PendingReplanRequest, create_pending_replan
+from backend.app.services.trip_stream import publish_trip_stream
 
 logger = logging.getLogger("mapgo.worker")
 TRIP_EVENTS_QUEUE = "mapgo:trip-events"
@@ -133,7 +134,10 @@ async def process_trip_event(
                 consents = await _consents_for_trip(db, trip)
                 latest_location = await db.scalar(
                     select(LocationSnapshot)
-                    .where(LocationSnapshot.trip_session_id == trip.id)
+                    .where(
+                        LocationSnapshot.trip_session_id == trip.id,
+                        LocationSnapshot.expires_at > datetime.now(timezone.utc),
+                    )
                     .order_by(LocationSnapshot.captured_at.desc())
                 )
                 current_location = None
@@ -164,7 +168,10 @@ async def process_trip_event(
                     if tool == "get_current_location":
                         snap = await db.scalar(
                             select(LocationSnapshot)
-                            .where(LocationSnapshot.trip_session_id == trip.id)
+                            .where(
+                                LocationSnapshot.trip_session_id == trip.id,
+                                LocationSnapshot.expires_at > datetime.now(timezone.utc),
+                            )
                             .order_by(LocationSnapshot.captured_at.desc())
                         )
                         return {"has_location": snap is not None}
@@ -243,7 +250,6 @@ async def process_trip_event(
                 )
             )
             stream_payload = {
-                "sequence": int(event.id) if event else int(datetime.now(timezone.utc).timestamp()),
                 "event_id": event.event_id if event else payload.get("client_event_id"),
                 "type": event_type,
                 "state": trip.state,
@@ -253,8 +259,7 @@ async def process_trip_event(
                 "worker": {"processed": True, "plan_present": version is not None},
                 "occurred_at": datetime.now(timezone.utc).isoformat(),
             }
-            await store.set_json(f"trip-stream:{trip.id}", stream_payload, 86_400)
-            await store.publish(f"trip:{trip.id}", stream_payload)
+            await publish_trip_stream(store, trip.id, stream_payload)
 
             if event is not None:
                 event.status = "worker_processed"

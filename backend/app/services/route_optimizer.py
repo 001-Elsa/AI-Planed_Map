@@ -266,13 +266,27 @@ def evaluate_joint_order(
     )
 
 
-def _evaluation_key(item: RouteEvaluation) -> tuple:
-    return (not item.feasible, len(item.conflicts), item.cost, item.total_distance)
+def _evaluation_key(item: RouteEvaluation, preferences: PlanningPreferences) -> tuple:
+    common = (not item.feasible, len(item.conflicts))
+    if preferences.optimization_goal == "shortest_time":
+        return (*common, item.total_travel_seconds, item.total_distance, item.cost)
+    if preferences.optimization_goal == "shortest_distance":
+        return (*common, item.total_distance, item.total_travel_seconds, item.cost)
+    return (*common, item.cost, item.total_distance, item.total_travel_seconds)
+
+
+def _task_order_allowed(prefix: list[int], task_index: int, required: list[int]) -> bool:
+    if task_index not in required:
+        return True
+    chosen_required = [item for item in prefix if item in required]
+    return required.index(task_index) == len(chosen_required)
 
 
 def _beam_joint(
     candidate_groups: list[list[CandidateNode]],
     matrix: RouteMatrix,
+    preferences: PlanningPreferences,
+    constraints: HardConstraints,
     beam_width: int = 250,
 ) -> list[tuple[list[int], dict[int, CandidateNode]]]:
     # State: visited task order, selected candidates, last matrix point, cheap path score.
@@ -284,17 +298,25 @@ def _beam_joint(
             for task_index, group in enumerate(candidate_groups):
                 if task_index in selected:
                     continue
+                if not _task_order_allowed(order, task_index, constraints.required_task_order):
+                    continue
                 for node in group:
                     edge = matrix.edges[previous][node.matrix_index]
                     uncertainty = (1 - min(edge.confidence, node.confidence)) * 600
                     rating = max(0, 4.8 - (node.rating or 3)) * 180
                     monetary = (node.estimated_cost_yuan or 0) * 60
+                    if preferences.optimization_goal == "shortest_distance":
+                        edge_score = edge.distance_meters
+                    elif preferences.optimization_goal == "shortest_time":
+                        edge_score = edge.duration_seconds
+                    else:
+                        edge_score = edge.duration_seconds + uncertainty + rating + monetary
                     expanded.append(
                         (
                             [*order, task_index],
                             {**selected, task_index: node},
                             node.matrix_index,
-                            score + edge.duration_seconds + uncertainty + rating + monetary,
+                            score + edge_score,
                         )
                     )
         expanded.sort(key=lambda state: state[3])
@@ -307,6 +329,8 @@ def _ortools_joint(
     tasks: list[PlanningTask],
     candidate_groups: list[list[CandidateNode]],
     matrix: RouteMatrix,
+    preferences: PlanningPreferences,
+    constraints: HardConstraints,
 ) -> tuple[list[int], dict[int, CandidateNode]] | None:
     """Solve candidate selection + order + time windows as one RoutingModel."""
     try:
@@ -339,6 +363,10 @@ def _ortools_joint(
         rating_penalty = int(max(0, 4.8 - (target.rating or 3.0)) * 180)
         uncertainty_penalty = int((1 - min(edge.confidence, target.confidence)) * 600)
         monetary_penalty = int((target.estimated_cost_yuan or 0) * 60)
+        if preferences.optimization_goal == "shortest_distance":
+            return int(edge.distance_meters)
+        if preferences.optimization_goal == "shortest_time":
+            return int(edge.duration_seconds) + service_seconds(from_node)
         return (
             int(edge.duration_seconds)
             + service_seconds(from_node)
@@ -379,12 +407,30 @@ def _ortools_joint(
         for index in route_indices:
             time_dimension.CumulVar(index).SetRange(lower, upper)
 
+    # Preserve explicit user ordering without fixing unrelated tasks. The big-M
+    # term disables a pairwise precedence constraint when either candidate was
+    # not selected from its group.
+    required = constraints.required_task_order
+    for previous_task, next_task in zip(required, required[1:], strict=False):
+        if previous_task >= len(candidate_groups) or next_task >= len(candidate_groups):
+            continue
+        for previous_node in candidate_groups[previous_task]:
+            previous_index = manager.NodeToIndex(nodes.index(previous_node) + 1)
+            for next_node in candidate_groups[next_task]:
+                next_index = manager.NodeToIndex(nodes.index(next_node) + 1)
+                solver.Add(
+                    time_dimension.CumulVar(previous_index)
+                    <= time_dimension.CumulVar(next_index)
+                    + horizon
+                    * (2 - routing.ActiveVar(previous_index) - routing.ActiveVar(next_index))
+                )
+
     params = pywrapcp.DefaultRoutingSearchParameters()
     params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
     params.local_search_metaheuristic = (
         routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
     )
-    params.time_limit.seconds = 2
+    params.time_limit.seconds = max(2, min(8, len(tasks) // 3 + 2))
     solution = routing.SolveWithParameters(params)
     if solution is None:
         return None
@@ -449,23 +495,42 @@ def optimize_joint_route(
                 evaluations.append(_evaluate(list(permutation_order), selected))
         algorithm = "joint-exact-enumeration"
     else:
-        ortools_solution = _ortools_joint(departure, tasks, candidate_groups, matrix)
+        fixed_user_order = len(constraints.required_task_order) == count and set(
+            constraints.required_task_order
+        ) == set(range(count))
+        ortools_solution = (
+            None
+            if fixed_user_order
+            else _ortools_joint(
+                departure,
+                tasks,
+                candidate_groups,
+                matrix,
+                preferences,
+                constraints,
+            )
+        )
         candidates_to_evaluate = (
             [ortools_solution]
             if ortools_solution is not None
-            else _beam_joint(candidate_groups, matrix)
+            else _beam_joint(candidate_groups, matrix, preferences, constraints)
         )
         for beam_order, selected in candidates_to_evaluate:
             evaluations.append(_evaluate(list(beam_order), selected))
-        algorithm = (
-            "ortools-routing-time-windows"
-            if ortools_solution is not None
-            else "joint-beam-search-fallback"
-        )
+        if ortools_solution is not None:
+            algorithm = (
+                "ortools-routing-time-windows"
+                if preferences.optimization_goal == "balanced"
+                else f"ortools-routing-{preferences.optimization_goal.replace('_', '-')}"
+            )
+        elif fixed_user_order:
+            algorithm = "ordered-layered-beam"
+        else:
+            algorithm = "joint-beam-search-fallback"
 
     if not evaluations:
         raise ValueError("没有可用于联合求解的候选地点")
-    return min(evaluations, key=_evaluation_key), algorithm
+    return min(evaluations, key=lambda item: _evaluation_key(item, preferences)), algorithm
 
 
 def _factorial(value: int) -> int:
@@ -475,7 +540,9 @@ def _factorial(value: int) -> int:
     return result
 
 
-# Compatibility entry point retained for focused optimizer tests and benchmarks.
+# Single-candidate entry point retained for focused optimizer tests, replanning,
+# and benchmarks. Keep the real algorithm name so callers never report a solver
+# that did not actually run.
 def optimize_route(
     departure: datetime,
     tasks: list[PlanningTask],
@@ -521,7 +588,4 @@ def optimize_route(
         HardConstraints(),
         TransportMode.walking,
     )
-    return (
-        result,
-        "exact-permutation" if algorithm == "joint-exact-enumeration" else "nearest-neighbor+2-opt",
-    )
+    return result, algorithm

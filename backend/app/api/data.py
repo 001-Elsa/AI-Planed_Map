@@ -1,16 +1,23 @@
 import json
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import Literal
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 
 from backend.app.api.deps import CurrentUser, Db
 from backend.app.core.exceptions import AppError
 from backend.app.models import Checkin, Favorite, Plan, PlanStop, Track
 
 router = APIRouter(tags=["user-data"])
+SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+def local_date(value: datetime) -> date:
+    aware = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    return aware.astimezone(SHANGHAI).date()
 
 
 def row_dict(row) -> dict:
@@ -217,20 +224,92 @@ async def delete_checkin(item_id: int, user: CurrentUser, db: Db):
 
 @router.get("/stats")
 async def stats(user: CurrentUser, db: Db):
-    tracks = list((await db.scalars(select(Track).where(Track.user_id == user.id))).all())
-    by_kind = []
-    for kind in ("run", "ride"):
-        selected = [item for item in tracks if item.kind == kind]
-        if selected:
-            by_kind.append(
-                {
-                    "kind": kind,
-                    "count": len(selected),
-                    "distance": sum(item.distance for item in selected),
-                    "duration": sum(item.duration or 0 for item in selected),
-                    "realCount": sum(1 for item in selected if item.is_real),
-                }
+    aggregate_rows = (
+        await db.execute(
+            select(
+                Track.kind,
+                func.count(Track.id),
+                func.coalesce(func.sum(Track.distance), 0),
+                func.coalesce(func.sum(Track.duration), 0),
+                func.coalesce(func.sum(case((Track.is_real.is_(True), 1), else_=0)), 0),
             )
+            .where(Track.user_id == user.id)
+            .group_by(Track.kind)
+        )
+    ).all()
+    by_kind = [
+        {
+            "kind": kind,
+            "count": int(count),
+            "distance": float(distance),
+            "duration": float(duration),
+            "realCount": int(real_count),
+        }
+        for kind, count, distance, duration, real_count in aggregate_rows
+    ]
+
+    now_local = datetime.now(SHANGHAI)
+    today = now_local.date()
+    this_week = today - timedelta(days=today.weekday())
+    week_starts = [this_week - timedelta(weeks=offset) for offset in range(7, -1, -1)]
+    activity_cutoff = datetime.combine(week_starts[0], datetime.min.time(), SHANGHAI).astimezone(
+        timezone.utc
+    )
+    activity_rows = (
+        await db.execute(
+            select(Track.distance, Track.duration, Track.created_at).where(
+                Track.user_id == user.id,
+                Track.created_at >= activity_cutoff,
+            )
+        )
+    ).all()
+    weekly_buckets = {start: {"distance": 0.0, "duration": 0.0, "count": 0} for start in week_starts}
+    daily_buckets: dict[date, dict[str, float | int]] = {}
+    for distance, duration, created_at in activity_rows:
+        day = local_date(created_at)
+        week = day - timedelta(days=day.weekday())
+        if week in weekly_buckets:
+            weekly_buckets[week]["distance"] += float(distance)
+            weekly_buckets[week]["duration"] += float(duration or 0)
+            weekly_buckets[week]["count"] += 1
+        bucket = daily_buckets.setdefault(day, {"distance": 0.0, "duration": 0.0, "count": 0})
+        bucket["distance"] += float(distance)
+        bucket["duration"] += float(duration or 0)
+        bucket["count"] += 1
+
+    weekly = [
+        {"week": start.isoformat(), **values} for start, values in weekly_buckets.items()
+    ]
+    last_30_days = [today - timedelta(days=offset) for offset in range(29, -1, -1)]
+    daily = [
+        {"date": day.isoformat(), **daily_buckets.get(day, {"distance": 0, "duration": 0, "count": 0})}
+        for day in last_30_days
+    ]
+    activity_days = set(daily_buckets)
+    streak_cursor = today if today in activity_days else today - timedelta(days=1)
+    current_streak = 0
+    while streak_cursor in activity_days:
+        current_streak += 1
+        streak_cursor -= timedelta(days=1)
+
+    recent_checkins = list(
+        (
+            await db.scalars(
+                select(Checkin)
+                .where(Checkin.user_id == user.id)
+                .order_by(Checkin.created_at.desc(), Checkin.id.desc())
+                .limit(5)
+            )
+        ).all()
+    )
+
+    favorite_mode_rows = (
+        await db.execute(
+            select(Favorite.mode, func.count(Favorite.id))
+            .where(Favorite.user_id == user.id)
+            .group_by(Favorite.mode)
+        )
+    ).all()
 
     async def count(model):
         return await db.scalar(select(func.count(model.id)).where(model.user_id == user.id)) or 0
@@ -239,14 +318,22 @@ async def stats(user: CurrentUser, db: Db):
         "ok": True,
         "data": {
             "byKind": by_kind,
-            "weekly": [],
+            "weekly": weekly,
+            "daily": daily,
+            "currentStreakDays": current_streak,
             "counts": {
                 "favorites": await count(Favorite),
                 "plans": await count(Plan),
                 "checkins": await count(Checkin),
-                "tracks": len(tracks),
+                "tracks": sum(item["count"] for item in by_kind),
             },
-            "recentCheckins": [],
+            "favoritesByMode": [
+                {"mode": mode or "other", "count": int(total)}
+                for mode, total in favorite_mode_rows
+            ],
+            "recentCheckins": [row_dict(row) for row in recent_checkins],
             "since": user.created_at.isoformat(sep=" "),
+            "generatedAt": now_local.isoformat(),
+            "timezone": "Asia/Shanghai",
         },
     }

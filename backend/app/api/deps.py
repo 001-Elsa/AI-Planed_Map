@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import Depends, Header
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.exceptions import AppError
@@ -21,16 +22,18 @@ async def current_user(
         raw = authorization[7:]
     if not raw:
         raise AppError(401, "AUTH_REQUIRED", "未登录")
-    session = await db.get(Session, token_hash(raw))
-    if (
-        session is None
-        or session.revoked_at is not None
-        or session.expires_at.replace(tzinfo=timezone.utc) <= datetime.now(timezone.utc)
-    ):
-        raise AppError(401, "SESSION_EXPIRED", "登录已过期，请重新登录")
-    user = await db.get(User, session.user_id)
+    now = datetime.now(timezone.utc)
+    user = await db.scalar(
+        select(User)
+        .join(Session, Session.user_id == User.id)
+        .where(
+            Session.token == token_hash(raw),
+            Session.revoked_at.is_(None),
+            Session.expires_at > now,
+        )
+    )
     if user is None:
-        raise AppError(401, "AUTH_REQUIRED", "未登录")
+        raise AppError(401, "SESSION_EXPIRED", "登录已过期，请重新登录")
     return user
 
 

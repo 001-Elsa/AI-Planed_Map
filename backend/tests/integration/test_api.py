@@ -5,6 +5,11 @@ from backend.app.main import app  # noqa: E402
 
 def test_auth_plan_and_ai_pipeline():
     with TestClient(app) as client:
+        capabilities = client.get("/api/ai/capabilities")
+        assert capabilities.status_code == 200
+        assert capabilities.json()["data"]["persistence"] is True
+        assert capabilities.json()["data"]["max_tasks"] == 24
+
         registered = client.post(
             "/api/register",
             json={"username": "tester", "password": "secret12", "nickname": "测试者"},
@@ -30,6 +35,11 @@ def test_auth_plan_and_ai_pipeline():
         assert payload["plan_version"] == 1
         assert payload["confidence"] > 0
         assert all(stop["travel"]["source"] for stop in payload["stops"])
+        assert len(payload["candidate_reviews"]) == 3
+        assert all(item["considered_count"] > 0 for item in payload["candidate_reviews"])
+        assert payload["execution"]["formal_plan_persisted"] is True
+        assert payload["execution"]["map_provider"]
+        assert payload["execution"]["stages"][-1]["key"] == "persist"
 
         replay = client.post(
             "/api/ai/plans",
@@ -68,7 +78,9 @@ def test_auth_plan_and_ai_pipeline():
             f"/api/ai/plans/{payload['planning_run_id']}/versions",
             headers=headers,
         )
-        assert [item["version"] for item in versions.json()["data"]] == [2, 1]
+        version_data = versions.json()["data"]
+        assert [item["version"] for item in version_data] == [2, 1]
+        assert version_data[1]["snapshot"]["execution"]["formal_plan_persisted"] is True
 
         metrics = client.get("/metrics")
         assert metrics.status_code == 200
@@ -149,8 +161,8 @@ def test_auth_plan_and_ai_pipeline():
         assert replan.status_code == 200, replan.text
         assert replan.json()["data"]["status"] in {
             "patch_pending_confirmation",
-            "current_order_still_optimal",
-            "no_feasible_reorder",
+            "current_plan_still_feasible",
+            "no_feasible_replan",
         }
 
         tool = client.post(

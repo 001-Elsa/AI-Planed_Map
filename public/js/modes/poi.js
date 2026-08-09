@@ -4,12 +4,19 @@
 
 import { S } from '../state.js';
 import { $, escapeHtml, toast } from '../ui/dom.js';
-import { API } from '../services/api.js';
+import { API } from '../services/api.js?v=33';
 import { fmtDist, fmtDur, haversine } from '../services/format.js';
-import { explainAmapError, searchPlaceByKeyword, flattenRoutePath } from '../services/amap.js';
+import {
+  explainAmapError,
+  searchNearbyPlaces,
+  searchPlaceByKeyword,
+  flattenRoutePath,
+} from '../services/amap.js?v=33';
 import { geometricMedian } from '../services/algo.js';
-import { requireLogin } from '../ui/auth.js';
-import { MODES } from './registry.js';
+import { requireLogin } from '../ui/auth.js?v=33';
+import { MODES } from './registry.js?v=33';
+
+let poiSearchSeq = 0;
 
 /* ---------------- 生命周期 ---------------- */
 export function activate(cfg) {
@@ -22,6 +29,7 @@ export function activate(cfg) {
 }
 
 export function clearAll() {
+  poiSearchSeq += 1;
   clearPoiMarkers();
   clearQuickOverlays();
   clearMeetOverlays();
@@ -77,35 +85,45 @@ function currentSearchParams(cfg) {
   return { kw, type };
 }
 
-export function searchPOIsInView() {
+export async function searchPOIsInView() {
   const cfg = MODES[S.currentMode];
   if (!cfg || !cfg.poi || !S.map) return;
 
   const { kw, type } = currentSearchParams(cfg);
   const center = S.map.getCenter();
   const zoom = S.map.getZoom();
-  const radius = Math.min(8000, Math.max(600, Math.round(50000 / Math.pow(1.7, zoom - 10))));
+  const radius = Math.min(10000, Math.max(2000, Math.round(50000 / Math.pow(1.7, zoom - 10))));
   const modeAtCall = S.currentMode;
-
-  const ps = new AMap.PlaceSearch({
-    type: type, pageSize: 25, pageIndex: 1,
-    extensions: cfg.ext || 'base',
-  });
+  const requestSeq = ++poiSearchSeq;
   $('poi-count').textContent = '正在搜索…';
-  ps.searchNearBy(kw, center, radius, (status, result) => {
-    if (S.currentMode !== modeAtCall) return;
+  try {
+    const pois = await searchNearbyPlaces({
+      keyword: kw,
+      type,
+      center,
+      radius,
+      pageSize: 25,
+      // 首屏单请求最多 25 个标记，避免两页并发触发高德限流或慢请求超时。
+      pages: 1,
+      extensions: cfg.ext || 'base',
+    });
+    if (S.currentMode !== modeAtCall || requestSeq !== poiSearchSeq) return;
     clearPoiMarkers();
-    if (status !== 'complete' || !result.poiList || !result.poiList.pois.length) {
-      /* 识别配额/Key 错误,给出明确提示,而不是笼统的“没找到” */
-      const why = explainAmapError(result);
-      $('poi-count').textContent = why || '附近没有找到,试试拖动/缩小地图或换个分类';
-      if (why) toast(why, 4000);
+    if (!pois.length) {
+      $('poi-count').textContent = '这个范围内暂时没有匹配地点，请移动地图或换个分类';
       $('poi-list').innerHTML = '';
       return;
     }
-    S.lastPois = result.poiList.pois.filter((p) => p.location);
+    S.lastPois = pois;
     renderPoiResults();
-  });
+  } catch (error) {
+    if (S.currentMode !== modeAtCall || requestSeq !== poiSearchSeq) return;
+    clearPoiMarkers();
+    const why = explainAmapError(error && (error.amapResult || error)) || error.message || '地图周边搜索失败';
+    $('poi-count').textContent = why;
+    $('poi-list').innerHTML = '';
+    toast(why, 4000);
+  }
 }
 
 function poiRating(p) {
@@ -249,7 +267,7 @@ function clearQuickOverlays() {
 }
 
 /* “最近的一个”:厕所/停车场/加油站/医院 一键直达 */
-function gotoNearest() {
+async function gotoNearest() {
   const cfg = MODES[S.currentMode];
   if (!cfg || !cfg.poi) return;
   if (!S.myPos) { toast('先点 ⌖ 定位到你的位置'); return; }
@@ -262,21 +280,27 @@ function gotoNearest() {
   };
   if (S.lastPois.length) { doPick(S.lastPois); return; }
   const { kw, type } = currentSearchParams(cfg);
-  const ps = new AMap.PlaceSearch({ type: type, pageSize: 20, pageIndex: 1, extensions: 'base' });
-  ps.searchNearBy(kw, [S.myPos.lng, S.myPos.lat], 5000, (status, result) => {
-    doPick(status === 'complete' && result.poiList ? result.poiList.pois.filter((p) => p.location) : []);
-  });
+  try {
+    doPick(await searchNearbyPlaces({ keyword: kw, type, center: S.myPos, radius: 5000, pageSize: 20 }));
+  } catch (error) {
+    toast(explainAmapError(error && (error.amapResult || error)) || error.message || '地图周边搜索失败');
+  }
 }
 
 /* 跑步模式辅助:公园/绿道点位(供 route 模块调用) */
-export function drawAssistPois(cfg) {
+export async function drawAssistPois(cfg) {
   const a = cfg.poiAssist;
-  const ps = new AMap.PlaceSearch({ type: a.type, pageSize: 15, pageIndex: 1, extensions: 'base' });
   const modeAtCall = S.currentMode;
-  ps.searchNearBy(a.kw, S.map.getCenter(), 5000, (status, result) => {
+  try {
+    const pois = await searchNearbyPlaces({
+      keyword: a.kw,
+      type: a.type,
+      center: S.map.getCenter(),
+      radius: 5000,
+      pageSize: 15,
+    });
     if (S.currentMode !== modeAtCall) return;
-    if (status !== 'complete' || !result.poiList) return;
-    result.poiList.pois.filter((p) => p.location).forEach((p) => {
+    pois.forEach((p) => {
       const mk = new AMap.Marker({
         position: [p.location.lng, p.location.lat],
         content: '<div class="poi-marker" style="--mk:#16a34a">🌳</div>',
@@ -287,7 +311,11 @@ export function drawAssistPois(cfg) {
       S.poiMarkers.push(mk);
     });
     S.map.add(S.poiMarkers);
-  });
+  } catch (error) {
+    if (S.currentMode === modeAtCall) {
+      toast(explainAmapError(error && (error.amapResult || error)) || error.message || '附近地点加载失败');
+    }
+  }
 }
 
 /* ---------------- 找中间点(Weiszfeld 几何中位数) ---------------- */

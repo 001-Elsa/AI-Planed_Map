@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from backend.app.infrastructure.runtime_store import RuntimeStore
+from backend.app.services.trip_stream import publish_trip_stream
 
 NOTIFICATION_QUEUE = "mapgo:notifications"
 
@@ -64,17 +65,14 @@ class NotificationService:
             86_400,
         )
         await self.store.enqueue(NOTIFICATION_QUEUE, notification)
-        # Mirror into trip stream for SSE / in-app cards.
-        await self.store.publish(
-            f"trip-stream:{trip_id}",
-            {
-                "sequence": int(datetime.now(timezone.utc).timestamp() * 1000),
-                "type": "NotificationQueued",
-                "event_id": fingerprint,
-                "trip_id": trip_id,
-                "notification": notification,
-            },
-        )
+        # Mirror the latest event into the same snapshot key polled by SSE and
+        # publish on the same live channel used by trip events.
+        stream_event = {
+            "type": "NotificationQueued",
+            "event_id": fingerprint,
+            "notification": notification,
+        }
+        await publish_trip_stream(self.store, trip_id, stream_event)
         return {"deduplicated": False, "notification": notification}
 
     async def mark_delivered(self, notification_id: str, channel_result: dict[str, Any]) -> None:
@@ -110,10 +108,10 @@ class NotificationService:
 def render_event_notification(event_type: str, decision: dict[str, Any]) -> tuple[str, str]:
     reason = str(decision.get("reason") or "行程状态发生变化")
     titles = {
-        "DeadlineRisk": "截止时间风险提醒",
-        "ScheduleDelay": "行程延误提醒",
+        "DeadlineRiskDetected": "截止时间风险提醒",
+        "ScheduleDelayDetected": "行程延误提醒",
         "TrafficChanged": "路况变化提醒",
-        "WeatherAlert": "天气变化提醒",
+        "WeatherAlertReceived": "天气变化提醒",
         "UserOffRoute": "偏航提醒",
         "PoiStatusChanged": "地点状态变化",
     }

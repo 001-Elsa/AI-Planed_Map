@@ -33,9 +33,10 @@ th { color: #889; font-weight: 600; font-size: 12.5px; }
 
   <div class="card" id="login-card">
     <h2>管理员登录</h2>
-    <p class="muted" style="margin-bottom:8px">第一个注册的账号自动成为管理员。</p>
+    <p class="muted" style="margin-bottom:8px">管理员账号仅能使用部署时配置的初始化令牌创建。</p>
     <input id="u" placeholder="用户名">
     <input id="p" type="password" placeholder="密码">
+    <input id="at" type="password" placeholder="管理员令牌" autocomplete="off">
     <button onclick="login()">登录</button>
     <p id="login-err" class="err"></p>
   </div>
@@ -87,7 +88,12 @@ async function api(method, url, body) {
 async function login() {
   document.getElementById('login-err').textContent = '';
   try {
-    const r = await api('POST', '/login', { username: document.getElementById('u').value.trim(), password: document.getElementById('p').value });
+    const r = await api('POST', '/login', {
+      username: document.getElementById('u').value.trim(),
+      password: document.getElementById('p').value,
+      accountType: 'admin',
+      adminInitToken: document.getElementById('at').value.trim(),
+    });
     token = r.token;
     try { localStorage.setItem('mapgo_token', token); } catch (e) {}
     if (!r.user.is_admin) { document.getElementById('login-err').textContent = '该账号不是管理员'; return; }

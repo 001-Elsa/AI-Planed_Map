@@ -4,20 +4,90 @@
 import { S, DEFAULT_CENTER } from '../state.js';
 import { $, escapeHtml, toast } from '../ui/dom.js';
 import { store } from '../services/store.js';
-import { API } from '../services/api.js';
-import { searchPlaceSuggestions } from '../services/amap.js';
-import { showSetup, setupErr } from '../ui/auth.js';
-import * as poi from './poi.js';
-import * as route from './route.js';
-import * as plan from './plan.js';
-import * as social from './social.js';
+import { API } from '../services/api.js?v=33';
+import { searchPlaceSuggestions } from '../services/amap.js?v=33';
+import { showSetup, setupErr } from '../ui/auth.js?v=33';
+import * as poi from './poi.js?v=33';
+import * as route from './route.js?v=33';
+import * as plan from './plan.js?v=33';
+import * as social from './social.js?v=33';
 
 const LAST_POS_KEY = 'mapgo_last_pos';
+const LOCATION_SEARCH_CACHE_KEY = 'mapgo_location_search_cache_v1';
+const LOCATION_SEARCH_CACHE_MAX_AGE = 7 * 24 * 60 * 60 * 1000;
 let locationSuggestions = [];
 let locationSearchTimer = null;
 let locationSearchSeq = 0;
 let activeLocationIndex = -1;
 let locationInputComposing = false;
+
+function loadLocationSearchCache() {
+  try {
+    const entries = JSON.parse(store.get(LOCATION_SEARCH_CACHE_KEY) || '[]');
+    return Array.isArray(entries)
+      ? entries.filter((item) => item && Date.now() - Number(item.time || 0) < LOCATION_SEARCH_CACHE_MAX_AGE)
+      : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+let locationSearchCache = loadLocationSearchCache();
+
+function compactLocationSuggestion(item) {
+  return {
+    id: item.id || '',
+    name: item.name || '',
+    district: item.district || '',
+    pname: item.pname || '',
+    cityname: item.cityname || '',
+    adname: item.adname || '',
+    address: item.address || '',
+    adcode: item.adcode || '',
+    typecode: item.typecode || '',
+    location: { lng: Number(item.location.lng), lat: Number(item.location.lat) },
+  };
+}
+
+function rememberLocationSuggestions(query, items) {
+  if (!items.length) return;
+  const key = String(query || '').trim().toLowerCase();
+  locationSearchCache = locationSearchCache.filter((item) => item.query !== key);
+  locationSearchCache.unshift({
+    query: key,
+    time: Date.now(),
+    items: items.slice(0, 20).map(compactLocationSuggestion),
+  });
+  locationSearchCache = locationSearchCache.slice(0, 30);
+  store.set(LOCATION_SEARCH_CACHE_KEY, JSON.stringify(locationSearchCache));
+}
+
+function cachedLocationSuggestions(query) {
+  const key = String(query || '').trim().toLowerCase();
+  if (!key) return [];
+  const rank = (item) => {
+    const name = String(item.name || '').toLowerCase();
+    const administrativeName = name.replace(/[省市区县]$/, '');
+    if (String(item.id || '').startsWith('district-') && administrativeName === key) return -1;
+    if (name === key) return 0;
+    if (name.startsWith(key)) return 1;
+    if (name.includes(key)) return 2;
+    return 3;
+  };
+  const exact = locationSearchCache.find((item) => item.query === key);
+  if (exact) return exact.items.slice().sort((a, b) => rank(a) - rank(b));
+  const seen = new Set();
+  const matches = [];
+  locationSearchCache.forEach((entry) => entry.items.forEach((item) => {
+    const text = [item.name, item.district, item.address].join(' ').toLowerCase();
+    if (!text.includes(key) && !entry.query.startsWith(key)) return;
+    const candidateKey = item.id || [item.name, item.location.lng, item.location.lat].join('|');
+    if (seen.has(candidateKey)) return;
+    seen.add(candidateKey);
+    matches.push(item);
+  }));
+  return matches.sort((a, b) => rank(a) - rank(b)).slice(0, 20);
+}
 
 /* ---------------- 模式配置 ---------------- */
 export const MODES = {
@@ -140,7 +210,7 @@ export function initMap() {
   S.map.addControl(new AMap.Scale());
   S.infoWindow = new AMap.InfoWindow({ offset: new AMap.Pixel(0, -32) });
   if (cachedPos) {
-    S.myPos = cachedPos;
+    S.myPos = { lng: Number(cachedPos.lng), lat: Number(cachedPos.lat) };
     S.myPosName = cachedPos.name || '';
     drawMyMarker();
   }
@@ -183,7 +253,7 @@ function addressPart(value) {
 }
 
 function getPlaceAddress(p) {
-  const parts = [p.pname, p.cityname, p.adname, p.address]
+  const parts = [p.district, p.pname, p.cityname, p.adname, p.address]
     .map(addressPart)
     .filter(Boolean);
   return parts.filter((part, index) => index === 0 || !parts.slice(0, index).some((prev) => prev === part)).join(' · ');
@@ -248,23 +318,33 @@ async function loadLocationSuggestions(query, chooseFirst) {
   const kw = String(query || '').trim();
   if (!kw) { hideLocationSuggestions(); return; }
   const seq = ++locationSearchSeq;
+  const cached = cachedLocationSuggestions(kw);
   $('btn-my-location-search').disabled = true;
-  renderLocationSuggestions([], '正在搜索地址...');
+  if (cached.length) renderLocationSuggestions(cached);
+  else renderLocationSuggestions([], '正在全国搜索地点...');
   let items = [];
   try {
-    items = await searchPlaceSuggestions(kw, 10);
+    items = await searchPlaceSuggestions(kw, 20, (partial) => {
+      if (seq !== locationSearchSeq || !partial.length) return;
+      renderLocationSuggestions(partial);
+      rememberLocationSuggestions(kw, partial);
+    });
   } catch (e) {
     if (seq !== locationSearchSeq) return;
-    renderLocationSuggestions([], '搜索失败，请检查网络后重试');
     $('btn-my-location-search').disabled = false;
+    if (!locationSuggestions.length) {
+      renderLocationSuggestions([], '地图服务响应较慢，请稍后重试');
+    }
     return;
   }
   if (seq !== locationSearchSeq) return;
   $('btn-my-location-search').disabled = false;
   if (!items.length) {
-    renderLocationSuggestions([], '没有找到，请输入更完整的省、市、区或门牌号');
+    if (cached.length) return;
+    renderLocationSuggestions([], '没有找到匹配地点，请换个名称或关键词');
     return;
   }
+  rememberLocationSuggestions(kw, items);
   renderLocationSuggestions(items);
   if (chooseFirst) chooseLocationSuggestion(0);
 }
@@ -313,20 +393,31 @@ function bindMainUI() {
     setMyPositionBySearch();
   });
   const locationInput = $('my-location-input');
-  locationInput.addEventListener('compositionstart', () => { locationInputComposing = true; });
+  locationInput.addEventListener('compositionstart', () => {
+    locationInputComposing = true;
+    clearTimeout(locationSearchTimer);
+    locationSearchSeq += 1;
+  });
   locationInput.addEventListener('compositionend', () => {
     locationInputComposing = false;
     clearTimeout(locationSearchTimer);
-    locationSearchTimer = setTimeout(() => loadLocationSuggestions(locationInput.value, false), 180);
+    locationSearchSeq += 1;
+    const kw = locationInput.value.trim();
+    const cached = cachedLocationSuggestions(kw);
+    if (cached.length) renderLocationSuggestions(cached);
+    else if (kw) renderLocationSuggestions([], '正在全国搜索地点...');
+    locationSearchTimer = setTimeout(() => loadLocationSuggestions(kw, false), 120);
   });
   locationInput.addEventListener('input', () => {
     if (locationInputComposing) return;
     clearTimeout(locationSearchTimer);
+    locationSearchSeq += 1;
     const kw = locationInput.value.trim();
     if (!kw) { hideLocationSuggestions(); return; }
-    locationSuggestions = [];
-    hideLocationSuggestions();
-    locationSearchTimer = setTimeout(() => loadLocationSuggestions(kw, false), 320);
+    const cached = cachedLocationSuggestions(kw);
+    if (cached.length) renderLocationSuggestions(cached);
+    else renderLocationSuggestions([], '正在全国搜索地点...');
+    locationSearchTimer = setTimeout(() => loadLocationSuggestions(kw, false), 180);
   });
   locationInput.addEventListener('keydown', (e) => {
     if (locationInputComposing || $('location-suggestions').classList.contains('hidden')) return;

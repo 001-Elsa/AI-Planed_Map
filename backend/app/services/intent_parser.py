@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from backend.app.core.config import Settings
 from backend.app.core.exceptions import UpstreamError
 from backend.app.schemas.ai_intent import (
+    MAX_PLANNING_TASKS,
     PlanningIntent,
     PlanningPreferences,
     PlanningTask,
@@ -29,10 +30,60 @@ class IntentParser(Protocol):
 class RuleBasedIntentParser:
     """Deterministic fallback for local development and graceful degradation."""
 
-    name = "rule-based-v1"
+    name = "rule-based-v2"
     input_tokens = 0
     output_tokens = 0
-    _action_split = re.compile(r"(?:，|,|；|;|\n|然后|再|接着|最后|顺路|先)")
+    _action_split = re.compile(
+        r"(?:[，,；;。\n]+|然后(?:去|到|是)?|接着(?:去|到|是)?|"
+        r"最后(?:去|到|是)?|再(?:去|到|是)?|顺路(?:去|到|是)?|先(?:去|到|是)?)"
+    )
+    _ordered_markers = re.compile(r"(?:先|然后|接着|最后|依次|按顺序)")
+    _list_marker = re.compile(r"(?:^|\n)\s*(?:\d{1,2}|[一二三四五六七八九十]+)[.、)）]\s*")
+
+    def _split_actions(self, text: str) -> list[str]:
+        normalized = self._list_marker.sub("\n", text.strip())
+        pieces = [part.strip(" 。.!！\t") for part in self._action_split.split(normalized)]
+        pieces = [part for part in pieces if part]
+        if len(pieces) == 1:
+            whitespace_parts = [part for part in re.split(r"\s+", pieces[0]) if part]
+            # A whitespace-only list is common when users paste place names. Do not split
+            # ordinary prose: every item must look like a compact POI name.
+            if 2 <= len(whitespace_parts) <= MAX_PLANNING_TASKS and all(
+                1 < len(part) <= 30
+                and not re.search(r"(?:出发|分钟|小时|之前|以后|尽量|希望|需要)", part)
+                for part in whitespace_parts
+            ):
+                pieces = whitespace_parts
+        return pieces
+
+    @staticmethod
+    def _location_from_action(piece: str) -> str:
+        location = piece.strip()
+        generic_actions = {
+            "吃饭": "餐厅",
+            "吃东西": "餐厅",
+            "买药": "药店",
+            "买水果": "水果店",
+            "买东西": "商场",
+            "取快递": "快递",
+            "取件": "快递",
+            "购物": "商场",
+            "喝咖啡": "咖啡",
+        }
+        if location in generic_actions:
+            return generic_actions[location]
+        location = re.sub(r"^(?:去|到|前往|前去|找|搜索|查找|游览|参观|逛)\s*", "", location)
+        location = re.sub(
+            r"^(?:(?:一家|一个|附近的|最近的|评分高的|口碑好的)\s*)+",
+            "",
+            location,
+        )
+        location = re.sub(
+            r"(?:买|取|吃|喝|逛|参观|游览|办理)(?:东西|水果|晚饭|午饭|早餐|咖啡|业务|手续|街)?$",
+            "",
+            location,
+        ).strip()
+        return generic_actions.get(location, location)
 
     def _datetime(self, text: str, context: str = "") -> datetime | None:
         for chinese, number in {
@@ -67,13 +118,22 @@ class RuleBasedIntentParser:
         mode = TransportMode.walking
         if any(word in text for word in ("开车", "驾车", "自驾")):
             mode = TransportMode.driving
-        elif any(word in text for word in ("公交", "地铁", "公共交通")):
+        elif any(word in text for word in ("公交", "地铁", "轻轨", "公共交通", "坐车", "换乘")):
             mode = TransportMode.transit
         elif any(word in text for word in ("骑车", "骑行", "自行车")):
             mode = TransportMode.cycling
 
         preferences = PlanningPreferences(
-            minimize_distance=any(word in text for word in ("顺路", "路程最短", "少绕路")),
+            optimization_goal=(
+                "shortest_distance"
+                if any(word in text for word in ("路程最短", "距离最短", "少绕路"))
+                else "shortest_time"
+                if any(word in text for word in ("最快", "最短时间", "用时最少", "尽快"))
+                else "balanced"
+            ),
+            minimize_distance=any(
+                word in text for word in ("顺路", "路程最短", "距离最短", "少绕路")
+            ),
             minimize_walking=any(word in text for word in ("少走路", "不想走路")),
             minimize_cost=any(word in text for word in ("便宜", "省钱", "费用低")),
             prefer_high_rating=any(word in text for word in ("评分高", "口碑好")),
@@ -93,12 +153,31 @@ class RuleBasedIntentParser:
             origin = origin_match.group(1).strip()
 
         cleaned = re.sub(r"^.*?出发[，,\s]*", "", text)
-        pieces = [part.strip(" 。.!！") for part in self._action_split.split(cleaned)]
-        ignored = ("尽量少走路", "尽量省钱", "路程最短")
+        pieces = self._split_actions(cleaned)
+        ignored = (
+            "尽量少走路",
+            "尽量省钱",
+            "路程最短",
+            "距离最短",
+            "最短时间",
+            "用时最少",
+            "尽快",
+        )
         tasks: list[PlanningTask] = []
         for piece in pieces:
             if not piece or piece in ignored:
                 continue
+            piece = re.sub(
+                r"^(?:\d{1,2}|[一二三四五六七八九十]+)[.、)）]\s*",
+                "",
+                piece,
+            )
+            piece = re.sub(
+                r"^(?:(?:坐|乘|搭|换乘)?(?:公共交通|公交|地铁|轻轨|车)|坐车|乘车|换乘)(?:去|到)?\s*",
+                "",
+                piece,
+            ).strip()
+            piece = re.sub(r"^(?:去|到|是|前往|前去)\s*", "", piece).strip()
             piece = re.sub(r"(尽量少走路|尽量省钱|路程最短)$", "", piece).strip()
             deadline = None
             deadline_match = re.search(
@@ -123,10 +202,14 @@ class RuleBasedIntentParser:
                 service = int(service_match.group(1))
             location = re.sub(
                 r"(?:在)?(?:今天|明天|后天)?(?:上午|下午|晚上)?\d{1,2}(?:[:：点时]\d{0,2})?前|"
-                r"(?:停留|待|逛)\d{1,3}分钟|五点前",
+                r"(?:停留|待|逛)\d{1,3}分钟|五点前|"
+                r"(?:尽量少走路|尽量省钱|路程最短|距离最短|最短时间|用时最少|尽快)",
                 "",
                 piece,
             ).strip()
+            location = self._location_from_action(location)
+            if location in {"要求", "希望", "需要", "请安排", "帮我安排"}:
+                location = ""
             if location:
                 tasks.append(
                     PlanningTask(
@@ -138,13 +221,16 @@ class RuleBasedIntentParser:
                 )
         if not tasks:
             tasks = [PlanningTask(description=text, location_name=text)]
-        return PlanningIntent(
+        intent = PlanningIntent(
             origin=origin,
             departure_time=departure,
             transport_mode=mode,
-            tasks=tasks[:10],
+            tasks=tasks[:MAX_PLANNING_TASKS],
             preferences=preferences,
         )
+        if self._ordered_markers.search(text):
+            intent.constraints.hard.required_task_order = list(range(len(intent.tasks)))
+        return intent
 
 
 class OpenAICompatibleIntentParser:

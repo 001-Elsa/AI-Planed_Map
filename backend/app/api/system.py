@@ -1,9 +1,10 @@
 import time
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from sqlalchemy import func, select, text
 
 from backend.app.api.deps import CurrentUser, Db
+from backend.app.clients.amap_client import build_map_provider
 from backend.app.core.config import get_settings
 from backend.app.core.exceptions import AppError
 from backend.app.models import Checkin, Favorite, Plan, Setting, Share, Track, User
@@ -23,6 +24,8 @@ async def health(db: Db):
             "version": settings.app_version,
             "uptimeSec": round(time.monotonic() - BOOT_TIME),
             "runtime": "Python / FastAPI",
+            "database": db.get_bind().dialect.name,
+            "databaseConnected": True,
         },
     }
 
@@ -37,7 +40,15 @@ async def config(db: Db):
     settings = get_settings()
     key = await setting(db, "amap_key") or settings.amap_key
     jscode = await setting(db, "amap_jscode") or settings.amap_jscode
-    return {"ok": True, "data": {"amapKey": key or None, "proxy": bool(key and jscode)}}
+    return {
+        "ok": True,
+        "data": {
+            "amapKey": key or None,
+            "proxy": bool(key and jscode),
+            "registrationNeedsAdminToken": False,
+            "adminAuthTokenRequired": bool(settings.admin_init_token),
+        },
+    }
 
 
 def require_admin(user) -> None:
@@ -48,8 +59,9 @@ def require_admin(user) -> None:
 @router.get("/admin/amapkey")
 async def get_amap_key(user: CurrentUser, db: Db):
     require_admin(user)
-    key = await setting(db, "amap_key")
-    jscode = await setting(db, "amap_jscode")
+    settings = get_settings()
+    key = await setting(db, "amap_key") or settings.amap_key
+    jscode = await setting(db, "amap_jscode") or settings.amap_jscode
     return {
         "ok": True,
         "data": {
@@ -61,17 +73,31 @@ async def get_amap_key(user: CurrentUser, db: Db):
 
 
 @router.post("/admin/amapkey")
-async def set_amap_key(body: dict, user: CurrentUser, db: Db):
+async def set_amap_key(body: dict, request: Request, user: CurrentUser, db: Db):
     require_admin(user)
     key = str(body.get("key") or "").strip()
     jscode = str(body.get("jscode") or "").strip()
-    for name, value in (("amap_key", key), ("amap_jscode", jscode if key else "")):
+    settings = get_settings()
+    previous_jscode = await setting(db, "amap_jscode") or settings.amap_jscode
+    updates = [("amap_key", key)]
+    if not key:
+        updates.append(("amap_jscode", ""))
+    elif jscode:
+        updates.append(("amap_jscode", jscode))
+    for name, value in updates:
         row = await db.get(Setting, name)
         if row:
             row.value = value
         else:
             db.add(Setting(key=name, value=value))
     await db.commit()
+    effective_jscode = jscode or previous_jscode if key else ""
+    runtime_settings = settings.model_copy(
+        update={"amap_key": key, "amap_jscode": effective_jscode}
+    )
+    request.app.state.map_provider = build_map_provider(
+        runtime_settings, request.app.state.http_client
+    )
     return {"ok": True, "data": None}
 
 

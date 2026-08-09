@@ -11,7 +11,7 @@ MapGo 的定位不是“让模型生成一条看起来合理的路线”。系�
   → 类型化意图与澄清问题
     → Provider POI 候选召回
     → 带来源/质量/置信度的路线矩阵
-    → 候选地点 + 访问顺序联合求解（精确枚举 / Beam / OR-Tools）
+    → 候选地点 + 访问顺序联合求解（精确枚举 / OR-Tools / Beam 回退）
     → 硬约束验证 + 不确定约束安全缓冲
     → Plan Version
     → 待确认 Plan Patch
@@ -23,13 +23,13 @@ MapGo 的定位不是“让模型生成一条看起来合理的路线”。系�
 ## 已实现能力（与代码同步）
 
 - 唯一正式后端为 FastAPI；旧 Node API 已移除；
-- SQLAlchemy 2.x 异步会话、PostgreSQL 16、显式 Alembic migration；
-- Runtime Store 抽象（内存 / Redis）：计数、JSON 状态、队列、分布式锁、重试与死信、Pub/Sub；
+- SQLAlchemy 2.x 异步会话与显式 Alembic migration；Compose/CI 使用 PostgreSQL 16，本地开发与 E2E 可使用 SQLite；
+- Runtime Store 抽象（内存 / Redis）：计数、JSON 状态、队列、分布式锁、延迟重试、死信与事件发布；
 - 后台 Worker：消费行程事件、通知去重投递、Agent Controller 编排、过期定位清理；
 - LLM 运行时失败自动降级到 RuleBased 解析器，并写入不确定约束 / 降低置信度；
 - 多轮规划澄清（起点、时间、人群、忌口、区域、候选 POI 选择等）；确认答案会写回类型化意图、重新召回候选并重新求解；
 - 伴游 Agent：LLM 在受限 JSON 输出中根据 Trip State、Observation 和工具结果逐步决定下一工具；Policy、调用步数、Token/费用预算与完整 AgentRun/AgentToolCall 审计始终生效；
-- 高影响事件经 Worker 的分布式锁触发 Agent 工具循环，自动生成 `pending` Plan Patch 并推送 SSE；正式 Version 只能由用户确认后创建；
+- 高影响事件可经 Worker 的行程级分布式锁触发 Agent 工具循环，生成 `pending` Plan Patch，并通过最新状态 SSE 快照通知前端；正式 Version 只能由用户确认后创建；
 - 动态重规划支持 `replace_stop`、`remove_stop`、`move_stop`、`change_transport_mode`；闭馆可找替代 POI，暴雨可将室外地点替为室内候选；
 - 策展知识库 + 本地 TF-IDF RAG 检索与引文；拒绝无来源编造；
 - 行程复盘摘要（站间偏差、重规划、建议接受/拒绝、ETA 误差）；
@@ -43,6 +43,10 @@ MapGo 的定位不是“让模型生成一条看起来合理的路线”。系�
 - RAG 为本地轻量检索，不是托管向量库；
 - 通知的 Web Push / 邮件适配器尚未对接真实厂商；
 - OpenTelemetry 全链路 SDK 仍可继续加深；当前以 Prometheus + Trace ID 为主。
+- Patch 接受阶段当前会重算路线，并复验站点 deadline、最晚返回、步行上限和总费用；尚未复用首次规划的全部评分、营业、无障碍、区域、任务顺序和总时长验证逻辑；
+- Redis List Worker 支持应用层重试和 DLQ，但 `BRPOP` 后进程硬崩溃仍可能丢失在途消息；当前不宣称 Exactly Once 或完整 At-Least-Once；
+- SSE 保存并推送最新行程状态快照，`Last-Event-ID` 用于避免重复展示该快照，不提供逐条、无缺口的历史事件回放；
+- Exact / OR-Tools 求解当前在 API 进程内同步执行；大规模请求尚未隔离到线程池、进程池或独立规划任务。
 
 ## 目录
 
@@ -69,7 +73,8 @@ MapGo/
 
 ```bash
 python -m venv .venv
-# Windows: .venv\Scripts\activate
+# PowerShell: .venv\Scripts\Activate.ps1
+# cmd.exe: .venv\Scripts\activate.bat
 pip install -r backend/requirements.txt
 copy .env.example .env
 alembic upgrade head
@@ -81,6 +86,11 @@ python -m uvicorn backend.app.main:app --reload --port 3000
 ```bash
 docker compose up --build
 ```
+
+Compose 默认按生产环境启动。运行前必须把 `.env` 中的 `POSTGRES_PASSWORD`、
+`GRAFANA_ADMIN_PASSWORD`、`ADMIN_INIT_TOKEN` 和 `LOCATION_ENCRYPTION_KEY`
+替换为独立的强随机值；占位值或空值会使服务拒绝启动。首次注册时需要填写
+`ADMIN_INIT_TOKEN`，后续注册者不会自动获得管理员权限。
 
 Compose 启动 `migrate`、`api`、`worker`、`postgres`、`redis`；可选 `observability` profile 启动 Prometheus/Grafana。
 
@@ -106,7 +116,7 @@ python backend/tests/chaos/run_chaos.py
 
 AI 离线评测对 RuleBased 解析器施加质量门禁（Schema 合法率等）。压测与混沌脚本输出实测 JSON，不在文档中伪造 QPS。
 
-更多设计见 [架构说明](docs/ARCHITECTURE.md)、[威胁模型](docs/THREAT_MODEL.md) 和 [ADR](docs/adr/0001-deterministic-planning-boundary.md)。
+更多设计见 [架构说明](docs/ARCHITECTURE.md)、[威胁模型](docs/THREAT_MODEL.md)、[版本演进](docs/CHANGELOG.md) 和 [ADR](docs/adr/0001-deterministic-planning-boundary.md)。
 
 演示流程、可复现的测试与压测命令见 [演示与运行证据](docs/DEMO.md)。仓库展示名已调整为 **MapGo-AI-Planner**；GitHub 上的远端仓库重命名需在仓库设置中执行后，再同步更新 `origin`。
 

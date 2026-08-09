@@ -35,6 +35,26 @@ body {
   font-size: 14px; border-radius: 9px; cursor: pointer; color: #667;
 }
 .auth-tabs button.active { background: #fff; color: #1f2430; font-weight: 700; box-shadow: 0 1px 5px rgba(0,0,0,.12); }
+.auth-account-types {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 8px;
+}
+.auth-account-types button {
+  min-width: 0; border: 1px solid #dde3f1; border-radius: 12px; background: #fff;
+  padding: 10px 8px; color: #566074; cursor: pointer;
+  display: grid; grid-template-columns: auto 1fr; column-gap: 7px; text-align: left;
+}
+.auth-account-types button span { grid-row: 1 / 3; align-self: center; font-size: 20px; }
+.auth-account-types button strong { font-size: 14px; }
+.auth-account-types button small { color: #8a93a6; font-size: 11px; margin-top: 2px; }
+.auth-account-types button.active {
+  border-color: #4a7cf7; background: #edf3ff; color: #285bcf;
+  box-shadow: 0 0 0 2px rgba(74,124,247,.12);
+}
+.auth-account-types button.admin-active {
+  border-color: #8b5cf6; background: #f3efff; color: #6840c6;
+  box-shadow: 0 0 0 2px rgba(139,92,246,.12);
+}
+.auth-role-note { color: #778; font-size: 12px; margin: 0 0 12px; text-align: left; }
 .auth-form input {
   width: 100%; padding: 12px 14px; margin-bottom: 10px;
   border: 1px solid #dde; border-radius: 12px; font-size: 14px;
@@ -306,7 +326,31 @@ body.plan-mode #mode-title {
   flex: 0 0 auto; border-color: rgba(255,255,255,.3);
   background: rgba(255,255,255,.12); color: #fff;
 }
+.plan-hero-actions { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
+.planner-runtime-badge {
+  display: inline-flex; align-items: center; gap: 5px; padding: 4px 7px;
+  border: 1px solid rgba(255,255,255,.22); border-radius: 999px;
+  background: rgba(12,10,40,.22); color: rgba(255,255,255,.9); font-size: 8.5px;
+}
+.planner-runtime-badge i { width: 6px; height: 6px; border-radius: 50%; background: #fbbf24; box-shadow: 0 0 0 3px rgba(251,191,36,.16); }
+.planner-runtime-badge.ready i { background: #4ade80; box-shadow: 0 0 0 3px rgba(74,222,128,.16); }
+.planner-runtime-badge.offline i { background: #fb7185; box-shadow: 0 0 0 3px rgba(251,113,133,.16); }
 .plan-kicker { color: #d9d5ff; font-size: 9px; font-weight: 800; letter-spacing: .14em; }
+.planner-capability-rail {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-bottom: 10px;
+}
+.planner-capability-rail > span {
+  position: relative; min-width: 0; padding: 8px 7px 8px 30px;
+  border: 1px solid #ebe8fa; border-radius: 10px; background: linear-gradient(180deg, #fff, #faf9ff);
+}
+.planner-capability-rail i {
+  position: absolute; left: 8px; top: 9px; display: grid; place-items: center;
+  width: 16px; height: 16px; border-radius: 5px; background: #6557c7; color: #fff;
+  font-size: 8px; font-style: normal; font-weight: 800;
+}
+.planner-capability-rail b, .planner-capability-rail small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.planner-capability-rail b { color: #3e365f; font-size: 9.5px; }
+.planner-capability-rail small { margin-top: 2px; color: #9892aa; font-size: 7.5px; }
 .plan-starters { display: flex; gap: 6px; overflow-x: auto; margin-bottom: 9px; scrollbar-width: none; }
 .plan-starters::-webkit-scrollbar { display: none; }
 .plan-starters button {
@@ -329,11 +373,70 @@ body.plan-mode #mode-title {
   padding: 1px 4px; border: 1px solid #ddd9eb; border-bottom-width: 2px;
   border-radius: 4px; background: #fff; color: #625c78; font: inherit;
 }
+.plan-constraint-grid {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin: 8px 0 10px;
+}
+.plan-constraint-grid label {
+  min-width: 0; padding: 7px 8px; border: 1px solid #e8e5f3; border-radius: 10px;
+  background: #faf9fe; color: #716b82; font-size: 8.5px;
+}
+.plan-constraint-grid label > span:first-child { display: block; margin-bottom: 3px; }
+.plan-constraint-grid input, .plan-constraint-grid select {
+  width: 100%; min-width: 0; border: 0; outline: 0; background: transparent;
+  color: #29243e; font-family: inherit; font-size: 10.5px; font-weight: 600;
+}
+.plan-constraint-grid .constraint-input { display: flex; align-items: center; gap: 3px; color: #514a65; font-size: 9px; }
+.plan-constraint-grid .constraint-input input { flex: 1; }
+.plan-constraint-grid .plan-check { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+.plan-constraint-grid .plan-check input { width: 14px; height: 14px; accent-color: #6557c7; }
+.plan-constraint-grid .plan-check span { margin: 0; color: #514a65; font-size: 9.5px; font-weight: 600; }
+.plan-action-row { margin-top: 2px; align-items: stretch; }
+#plan-mode-seg {
+  flex: 1 1 260px;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+#plan-mode-seg .seg-btn { min-width: 0; padding: 7px 8px; }
+.plan-run-actions {
+  display: flex; gap: 6px; flex: 1 1 190px; justify-content: flex-end;
+}
+.plan-run-actions > button { min-width: 0; }
 #btn-ai-plan {
   position: relative; padding: 9px 18px;
   background: linear-gradient(135deg, #5b4bd4, #8b5cf6);
   box-shadow: 0 5px 14px rgba(100, 76, 210, .25);
 }
+.planning-execution {
+  margin: 10px 0; padding: 10px; border: 1px solid #ddd7fa; border-radius: 12px;
+  background: linear-gradient(145deg, #f8f7ff, #fff); color: #4a4560;
+}
+.execution-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; font-size: 10px; }
+.execution-head b { color: #312a55; font-size: 11px; }
+.execution-stages { display: grid; grid-template-columns: repeat(5, 1fr); gap: 5px; }
+.execution-stage { min-width: 0; padding: 6px; border-radius: 8px; background: #fff; border: 1px solid #ece9f7; }
+.execution-stage b, .execution-stage small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.execution-stage b { font-size: 8.5px; }
+.execution-stage small { margin-top: 2px; color: #928ca1; font-size: 7px; }
+.execution-stage.complete { border-color: #bbf7d0; background: #f0fdf4; }
+.execution-stage.complete b { color: #166534; }
+.execution-stage.attention { border-color: #fde68a; background: #fffbeb; }
+.execution-stage.blocked { border-color: #fecaca; background: #fff5f5; }
+.plan-insight-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; margin: 8px 0; }
+.plan-insight {
+  min-width: 0; padding: 9px; border: 1px solid #ebe8f6; border-radius: 10px; background: #fff;
+}
+.plan-insight > b { color: #39324f; font-size: 10px; }
+.intent-task-list, .candidate-review-list { display: grid; gap: 5px; margin-top: 6px; }
+.intent-task, .candidate-review { padding: 6px 7px; border-radius: 7px; background: #f8f7fc; font-size: 9px; }
+.intent-task b, .candidate-review b { display: block; color: #3f3856; }
+.intent-task small, .candidate-review small { display: block; margin-top: 2px; color: #858093; }
+.candidate-pills { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.candidate-pills span { padding: 2px 5px; border-radius: 999px; background: #eeeafd; color: #6557b7; font-size: 7.5px; }
+.candidate-pills span.selected { background: #dcfce7; color: #166534; }
+.score-bars { display: grid; gap: 4px; margin-top: 6px; }
+.score-bar { display: grid; grid-template-columns: 48px 1fr 34px; align-items: center; gap: 5px; font-size: 8px; color: #777085; }
+.score-bar i { display: block; height: 5px; border-radius: 999px; background: #ebe8f5; overflow: hidden; }
+.score-bar i::after { content: ''; display: block; width: var(--score-width); height: 100%; border-radius: inherit; background: linear-gradient(90deg, #6557c7, #9b7bf5); }
 .plan-overview {
   margin: 10px 0; padding: 10px; border: 1px solid #ece9f7; border-radius: 12px;
   background: #faf9fe;
@@ -355,7 +458,13 @@ body.plan-mode #mode-title {
 .plan-recent b { overflow: hidden; font-size: 11.5px; text-overflow: ellipsis; white-space: nowrap; }
 .plan-recent small { color: #8b87a0; font-size: 9px; }
 .plan-recent .recent-version { color: #6254bc; font-size: 9px; font-weight: 700; }
-.plan-result { overflow-y: auto; font-size: 13.5px; line-height: 1.55; max-height: 22vh; }
+.planner-guest-note {
+  padding: 9px; border: 1px dashed #d8d2f0; border-radius: 9px; background: #fff;
+}
+.planner-guest-note b, .planner-guest-note span { display: block; }
+.planner-guest-note b { color: #5145a5; font-size: 10px; }
+.planner-guest-note span { margin-top: 3px; color: #817b91; font-size: 8.5px; line-height: 1.45; }
+.plan-result { overflow-y: auto; font-size: 13.5px; line-height: 1.55; max-height: 38vh; }
 .plan-step { display: flex; gap: 8px; padding: 7px 2px; border-top: 1px solid #f0f1f4; align-items: baseline; }
 .plan-step .no {
   min-width: 20px; height: 20px; border-radius: 50%; background: #4a7cf7; color: #fff;
@@ -490,6 +599,15 @@ body.plan-mode #mode-title {
 
 /* 统计 */
 .stats-body { overflow-y: auto; }
+.feature-summary {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin: 4px 0 9px;
+}
+.feature-summary:empty { display: none; }
+.feature-summary div { padding: 7px 6px; border-radius: 9px; background: #f6f7fa; text-align: center; }
+.feature-summary b, .feature-summary span { display: block; }
+.feature-summary b { color: #334155; font-size: 14px; }
+.feature-summary span { margin-top: 1px; color: #8a93a3; font-size: 9px; }
+.feature-freshness { min-height: 15px; color: #8a93a3; font-size: 9px; text-align: right; }
 .stat-tiles { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin-bottom: 10px; }
 .tile { background: #f6f7fa; border-radius: 12px; padding: 10px 12px; }
 .tile b { font-size: 21px; display: block; }
@@ -637,6 +755,18 @@ body.dark .plan-overview { background: #1b202b; border-color: #353b4a; }
 body.dark .plan-overview-stats div, body.dark .plan-recent { background: #242a37; border-color: #393f50; color: #e2e5ec; }
 body.dark .plan-overview-stats b, body.dark .plan-recent .recent-version { color: #aaa1ff; }
 body.dark .plan-recent:hover { background: #2a3040; border-color: #7166ba; }
+body.dark .planner-capability-rail > span,
+body.dark .plan-constraint-grid label,
+body.dark .planning-execution,
+body.dark .plan-insight { background: #1b202b; border-color: #353b4a; color: #d9dce6; }
+body.dark .planner-capability-rail b,
+body.dark .plan-constraint-grid input,
+body.dark .plan-constraint-grid select,
+body.dark .plan-constraint-grid .plan-check span,
+body.dark .execution-head b,
+body.dark .plan-insight > b { color: #e5e7eb; }
+body.dark .execution-stage { background: #242a37; border-color: #393f50; }
+body.dark .intent-task, body.dark .candidate-review { background: #242a37; }
 body.dark .searchbox input { background: transparent; color: #dde2ee; }
 body.dark .searchbox button { background: #2b3345; }
 body.dark .seg { background: #1b202b; }
@@ -649,6 +779,8 @@ body.dark .small-btn.accent { color: #7ea2ff; border-color: #4a7cf7; }
 body.dark .small-btn.danger { color: #f87171; border-color: #7f1d1d; }
 body.dark .weather { background: #1d2536; color: #aab3c7; }
 body.dark .rec-stats, body.dark .tile { background: #1b202b; }
+body.dark .feature-summary div { background: #1b202b; }
+body.dark .feature-summary b { color: #e5e7eb; }
 body.dark .transit-plan { border-color: #3a4356; }
 body.dark .transit-plan.active { background: #123c38; border-color: #0d9488; }
 body.dark .tp-lines, body.dark .step-item { color: #aab3c7; }
@@ -658,8 +790,12 @@ body.dark .emoji-pick button.active { background: #253252; border-color: #4a7cf7
 /* 桌面宽屏 */
 @media (min-width: 820px) {
   .panel { left: 16px; right: auto; width: 400px; max-height: 64vh; bottom: 100px; }
-  #panel-plan { width: 440px; max-height: calc(100vh - 190px); }
-  #tabbar { left: 50%; right: auto; transform: translateX(-50%); border-radius: 18px 18px 0 0; padding-left: 8px; padding-right: 8px; }
+  #panel-plan { width: 520px; max-height: calc(100vh - 190px); }
+  #tabbar {
+    left: 50%; right: auto; width: min(calc(100vw - 24px), 1180px);
+    transform: translateX(-50%); border-radius: 18px 18px 0 0;
+    padding-left: 8px; padding-right: 8px;
+  }
 }
 
 @media (max-width: 640px) {
@@ -679,5 +815,9 @@ body.dark .emoji-pick button.active { background: #253252; border-color: #4a7cf7
   #panel-plan { max-height: min(68vh, 650px); }
   .plan-hero h2 { font-size: 17px; }
   .plan-input-meta span:last-child { display: none; }
+  .planner-capability-rail { grid-template-columns: repeat(2, 1fr); }
+  .plan-constraint-grid { grid-template-columns: repeat(2, 1fr); }
+  .execution-stages { grid-template-columns: repeat(2, 1fr); }
+  .plan-insight-grid { grid-template-columns: 1fr; }
   .agent-timeline { top:auto; left:8px; right:8px; bottom:76px; width:auto; max-height:46vh; }
 }

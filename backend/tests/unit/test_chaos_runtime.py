@@ -14,22 +14,25 @@ def test_notification_dedupe_and_retry_to_dlq():
             trip_id=1,
             user_id=1,
             channel="in_app",
-            event_type="DeadlineRisk",
+            event_type="DeadlineRiskDetected",
             title="t",
             body="b",
-            template_key="DeadlineRisk:critical",
+            template_key="DeadlineRiskDetected:critical",
         )
         second = await service.enqueue(
             trip_id=1,
             user_id=1,
             channel="in_app",
-            event_type="DeadlineRisk",
+            event_type="DeadlineRiskDetected",
             title="t",
             body="b",
-            template_key="DeadlineRisk:critical",
+            template_key="DeadlineRiskDetected:critical",
         )
         assert first["deduplicated"] is False
         assert second["deduplicated"] is True
+        stream_event = await store.get_json("trip-stream:1")
+        assert stream_event["type"] == "NotificationQueued"
+        assert stream_event["notification"]["event_type"] == "DeadlineRiskDetected"
 
         payload = first["notification"]
         for attempt in range(1, 6):

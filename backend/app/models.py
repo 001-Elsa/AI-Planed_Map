@@ -1,6 +1,16 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from backend.app.db.session import Base
@@ -346,6 +356,7 @@ class ExternalDataSnapshot(Base):
 
 class Favorite(Base):
     __tablename__ = "favorites"
+    __table_args__ = (Index("ix_favorites_user_created_at", "user_id", "created_at"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
@@ -359,6 +370,7 @@ class Favorite(Base):
 
 class Track(Base):
     __tablename__ = "tracks"
+    __table_args__ = (Index("ix_tracks_user_created_at", "user_id", "created_at"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
@@ -373,6 +385,7 @@ class Track(Base):
 
 class Checkin(Base):
     __tablename__ = "checkins"
+    __table_args__ = (Index("ix_checkins_user_created_at", "user_id", "created_at"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
@@ -404,10 +417,14 @@ class Setting(Base):
 
 class Friend(Base):
     __tablename__ = "friends"
-    __table_args__ = (UniqueConstraint("user_id", "friend_id"),)
+    __table_args__ = (
+        UniqueConstraint("user_id", "friend_id"),
+        UniqueConstraint("pair_key"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     friend_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    pair_key: Mapped[str] = mapped_column(String(50), unique=True)
     status: Mapped[str] = mapped_column(String(20), default="pending")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

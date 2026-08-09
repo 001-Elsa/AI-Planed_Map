@@ -1,13 +1,13 @@
 /* 随行地图 MapGo — 应用壳缓存(地图与接口数据走网络) */
-const CACHE = 'mapgo-shell-v7';
+const CACHE = 'mapgo-shell-v38';
 const SHELL = [
-  './index.html', './css/style.css?v=7', './manifest.json',
-  './js/main.js?v=7', './js/state.js',
-  './js/services/store.js', './js/services/api.js', './js/services/format.js',
-  './js/services/algo.js', './js/services/amap.js',
-  './js/ui/dom.js', './js/ui/auth.js',
-  './js/modes/registry.js', './js/modes/poi.js', './js/modes/route.js',
-  './js/modes/plan.js', './js/modes/social.js',
+  './index.html', './css/style.css?v=30', './manifest.json',
+  './js/main.js?v=33', './js/state.js',
+  './js/services/store.js', './js/services/api.js?v=33', './js/services/format.js',
+  './js/services/algo.js', './js/services/amap.js?v=33',
+  './js/ui/dom.js', './js/ui/auth.js?v=33',
+  './js/modes/registry.js?v=33', './js/modes/poi.js?v=33', './js/modes/route.js?v=33',
+  './js/modes/plan.js?v=33', './js/modes/social.js?v=33',
 ];
 
 self.addEventListener('install', (e) => {

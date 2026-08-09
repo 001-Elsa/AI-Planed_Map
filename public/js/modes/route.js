@@ -3,13 +3,13 @@
 
 import { S } from '../state.js';
 import { $, escapeHtml, toast, speak } from '../ui/dom.js';
-import { API } from '../services/api.js';
+import { API } from '../services/api.js?v=33';
 import { store } from '../services/store.js';
 import { fmtDist, fmtDur, fmtMMSS, haversine, toXY, downloadGPX, copyText } from '../services/format.js';
-import { routeLeg, getCity, explainAmapError } from '../services/amap.js';
-import { requireLogin } from '../ui/auth.js';
-import { MODES } from './registry.js';
-import { drawAssistPois } from './poi.js';
+import { routeLeg, getCity, getLiveWeather, searchTransitPlans } from '../services/amap.js?v=33';
+import { requireLogin } from '../ui/auth.js?v=33';
+import { MODES } from './registry.js?v=33';
+import { drawAssistPois } from './poi.js?v=33';
 
 /* ---------------- 生命周期 ---------------- */
 export function activate(cfg) {
@@ -179,18 +179,19 @@ async function planTransit() {
   $('route-hint').textContent = '正在规划换乘方案…';
   $('transit-plans').classList.add('hidden');
   const city = await getCity();
-  const transfer = new AMap.Transfer({ city: city || '全国', policy: 0 });
   const from = S.waypoints[0], to = S.waypoints[1];
-  transfer.search([from.lng, from.lat], [to.lng, to.lat], (status, result) => {
-    if (status !== 'complete' || !result.plans || !result.plans.length) {
-      $('route-hint').textContent = explainAmapError(result) || '没有找到换乘方案,距离太近可试试步行/骑行';
+  try {
+    S.transitData = await searchTransitPlans(from, to, city);
+    if (!S.transitData.length) {
+      $('route-hint').textContent = '没有找到换乘方案,距离太近可试试步行/骑行';
       return;
     }
-    S.transitData = result.plans.slice(0, 3);
     renderTransitPlans();
     drawTransitPlan(0);
     $('route-hint').textContent = '共 ' + S.transitData.length + ' 个方案,点击切换';
-  });
+  } catch (error) {
+    $('route-hint').textContent = error.message || '公交换乘规划失败';
+  }
 }
 
 function transitSummary(plan) {
@@ -266,19 +267,16 @@ async function loadWeather() {
   try {
     const city = await getCity();
     if (!city) return;
-    const w = new AMap.Weather();
-    w.getLive(city, (err, data) => {
-      if (err || !data) return;
-      const t = parseFloat(data.temperature);
-      const bad = /雨|雪|雷|霾|沙|暴/.test(data.weather || '');
-      const nice = !bad && t >= 5 && t <= 32;
-      el.classList.remove('hidden');
-      el.innerHTML = '🌤 ' + escapeHtml(data.city || city) + ' ' + escapeHtml(data.weather || '') +
-        ' ' + escapeHtml(data.temperature || '?') + '℃ · ' +
-        escapeHtml(data.windDirection || '') + '风' + escapeHtml(data.windPower || '') + '级 · 湿度' +
-        escapeHtml(data.humidity || '?') + '% — ' +
-        (nice ? '<b class="good">适合出行运动 👍</b>' : '<b class="bad">今天不太适合,注意安全 ⚠</b>');
-    });
+    const data = await getLiveWeather(city);
+    const t = parseFloat(data.temperature);
+    const bad = /雨|雪|雷|霾|沙|暴/.test(data.weather || '');
+    const nice = !bad && t >= 5 && t <= 32;
+    el.classList.remove('hidden');
+    el.innerHTML = '🌤 ' + escapeHtml(data.city || city) + ' ' + escapeHtml(data.weather || '') +
+      ' ' + escapeHtml(data.temperature || '?') + '℃ · ' +
+      escapeHtml(data.windDirection || '') + '风' + escapeHtml(data.windPower || '') + '级 · 湿度' +
+      escapeHtml(data.humidity || '?') + '% — ' +
+      (nice ? '<b class="good">适合出行运动 👍</b>' : '<b class="bad">今天不太适合,注意安全 ⚠</b>');
   } catch (e) { /* 天气失败不影响主功能 */ }
 }
 

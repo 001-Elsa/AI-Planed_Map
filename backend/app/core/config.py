@@ -11,6 +11,10 @@ class Settings(BaseSettings):
     app_version: str = "6.0.0"
     environment: str = "development"
     database_url: str = f"sqlite+aiosqlite:///{(ROOT / 'data' / 'mapgo-python.db').as_posix()}"
+    database_pool_size: int = 20
+    database_max_overflow: int = 20
+    database_pool_timeout_seconds: float = 10.0
+    sqlite_busy_timeout_seconds: float = 15.0
     public_dir: Path = ROOT / "public"
     session_days: int = 30
     admin_init_token: str = ""
@@ -23,7 +27,7 @@ class Settings(BaseSettings):
     max_llm_output_tokens: int = 2_000
     prompt_version: str = "intent-v2"
     external_timeout_seconds: float = 8.0
-    external_connect_timeout_seconds: float = 2.0
+    external_connect_timeout_seconds: float = 5.0
     http_max_connections: int = 100
     http_max_keepalive_connections: int = 20
     map_max_concurrency: int = 8
@@ -34,7 +38,7 @@ class Settings(BaseSettings):
     max_request_bytes: int = 1_000_000
     max_route_matrix_points: int = 25
     idempotency_ttl_seconds: int = 86_400
-    required_schema_revision: str = "0007"
+    required_schema_revision: str = "0009"
     precise_location_ttl_minutes: int = 120
     location_encryption_key: str = ""
     max_agent_tool_calls: int = 8
@@ -48,6 +52,11 @@ class Settings(BaseSettings):
     feature_companion_agent: bool = True
     redis_url: str = ""
     api_requests_per_minute: int = 120
+    api_ip_requests_per_minute: int = 3000
+    auth_device_requests_per_minute: int = 30
+    auth_ip_requests_per_minute: int = 600
+    amap_proxy_requests_per_minute: int = 300
+    amap_proxy_max_response_bytes: int = 2_000_000
     ai_plans_per_day: int = 50
     mock_weather_provider: bool = True
     llm_input_cost_per_million_usd: float = 0.40
@@ -61,7 +70,10 @@ class Settings(BaseSettings):
 
     @property
     def use_mock_map(self) -> bool:
-        return self.mock_map_provider or not self.amap_web_key
+        has_real_credentials = bool(
+            self.amap_web_key or (self.amap_key and self.amap_jscode)
+        )
+        return self.mock_map_provider or not has_real_credentials
 
 
 @lru_cache

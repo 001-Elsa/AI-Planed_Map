@@ -1,17 +1,20 @@
 import json
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter
-from pydantic import BaseModel
+from fastapi import APIRouter, Query
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import or_, select
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from backend.app.api.deps import CurrentUser, Db
 from backend.app.core.exceptions import AppError
 from backend.app.models import Favorite, Friend, Share, Track, User
 
 router = APIRouter(tags=["sharing"])
+SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 class ShareCreate(BaseModel):
@@ -20,7 +23,12 @@ class ShareCreate(BaseModel):
 
 
 class FriendRequest(BaseModel):
-    username: str
+    username: str = Field(min_length=2, max_length=20)
+
+    @field_validator("username", mode="before")
+    @classmethod
+    def normalize_username(cls, value: str) -> str:
+        return str(value).strip()
 
 
 class FriendResponse(BaseModel):
@@ -110,8 +118,28 @@ async def request_friend(body: FriendRequest, user: CurrentUser, db: Db):
     )
     if existing:
         raise AppError(409, "FRIEND_REQUEST_EXISTS", "已有好友关系或待处理请求")
-    db.add(Friend(user_id=user.id, friend_id=target.id))
-    await db.commit()
+    db.add(
+        Friend(
+            user_id=user.id,
+            friend_id=target.id,
+            pair_key=f"{min(user.id, target.id)}:{max(user.id, target.id)}",
+        )
+    )
+    try:
+        await db.commit()
+    except (IntegrityError, OperationalError) as exc:
+        await db.rollback()
+        raced = await db.scalar(
+            select(Friend).where(
+                or_(
+                    (Friend.user_id == user.id) & (Friend.friend_id == target.id),
+                    (Friend.user_id == target.id) & (Friend.friend_id == user.id),
+                )
+            )
+        )
+        if raced:
+            raise AppError(409, "FRIEND_REQUEST_EXISTS", "已有好友关系或待处理请求") from exc
+        raise AppError(503, "SOCIAL_DATABASE_BUSY", "好友服务繁忙，请稍后重试") from exc
     return {"ok": True, "data": {"nickname": target.nickname}}
 
 
@@ -124,10 +152,19 @@ async def list_friends(user: CurrentUser, db: Db):
             )
         ).all()
     )
+    other_ids = {
+        row.friend_id if row.user_id == user.id else row.user_id for row in rows
+    }
+    people = {
+        person.id: person
+        for person in (
+            await db.scalars(select(User).where(User.id.in_(other_ids)))
+        ).all()
+    } if other_ids else {}
     accepted, incoming, outgoing = [], [], []
     for row in rows:
         other_id = row.friend_id if row.user_id == user.id else row.user_id
-        other = await db.get(User, other_id)
+        other = people.get(other_id)
         if other is None:
             continue
         item = {
@@ -211,9 +248,17 @@ async def friend_favorites(friend_id: int, user: CurrentUser, db: Db):
     }
 
 
+def _local_day(value: datetime) -> date:
+    aware = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    return aware.astimezone(SHANGHAI).date()
+
+
 @router.get("/leaderboard")
-async def leaderboard(user: CurrentUser, db: Db, days: int = 7):
-    days = min(365, max(1, days))
+async def leaderboard(
+    user: CurrentUser,
+    db: Db,
+    days: int = Query(7, ge=1, le=90),
+):
     relations = list(
         (
             await db.scalars(
@@ -224,27 +269,85 @@ async def leaderboard(user: CurrentUser, db: Db, days: int = 7):
             )
         ).all()
     )
-    user_ids = [user.id] + [
+    user_ids = list(dict.fromkeys([user.id] + [
         row.friend_id if row.user_id == user.id else row.user_id for row in relations
-    ]
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    result: list[dict[str, Any]] = []
-    for user_id in user_ids:
-        person = await db.get(User, user_id)
-        tracks = list(
-            (
-                await db.scalars(
-                    select(Track).where(Track.user_id == user_id, Track.created_at >= cutoff)
-                )
-            ).all()
+    ]))
+    now_local = datetime.now(SHANGHAI)
+    period_start_date = now_local.date() - timedelta(days=days - 1)
+    period_start = datetime.combine(
+        period_start_date, datetime.min.time(), SHANGHAI
+    ).astimezone(timezone.utc)
+    period_end = datetime.combine(
+        now_local.date() + timedelta(days=1), datetime.min.time(), SHANGHAI
+    ).astimezone(timezone.utc)
+    people = {
+        person.id: person
+        for person in (
+            await db.scalars(select(User).where(User.id.in_(user_ids)))
+        ).all()
+    }
+    track_rows = (
+        await db.execute(
+            select(
+                Track.user_id,
+                Track.distance,
+                Track.duration,
+                Track.created_at,
+            ).where(
+                Track.user_id.in_(user_ids),
+                Track.created_at >= period_start,
+                Track.created_at < period_end,
+            )
         )
+    ).all()
+    totals: dict[int, dict[str, Any]] = {
+        user_id: {"distance": 0.0, "duration": 0.0, "count": 0, "daily": {}}
+        for user_id in user_ids
+    }
+    for user_id, distance, duration, created_at in track_rows:
+        total = totals[user_id]
+        total["distance"] += float(distance)
+        total["duration"] += float(duration or 0)
+        total["count"] += 1
+        day = _local_day(created_at).isoformat()
+        daily = total["daily"].setdefault(day, {"distance": 0.0, "duration": 0.0, "count": 0})
+        daily["distance"] += float(distance)
+        daily["duration"] += float(duration or 0)
+        daily["count"] += 1
+
+    result = []
+    for user_id in user_ids:
+        person = people.get(user_id)
+        total = totals[user_id]
         result.append(
             {
                 "uid": user_id,
                 "nickname": person.nickname if person else "",
-                "distance": sum(item.distance for item in tracks),
-                "count": len(tracks),
+                "distance": total["distance"],
+                "duration": total["duration"],
+                "count": total["count"],
+                "daily": [
+                    {"date": day, **values}
+                    for day, values in sorted(total["daily"].items())
+                ],
             }
         )
-    result.sort(key=lambda item: item["distance"], reverse=True)
-    return {"ok": True, "data": {"days": days, "rows": result, "me": user.id}}
+    result.sort(key=lambda item: (-item["distance"], -item["count"], item["uid"]))
+    for rank, item in enumerate(result, 1):
+        item["rank"] = rank
+    next_update = datetime.combine(
+        now_local.date() + timedelta(days=1), datetime.min.time(), SHANGHAI
+    )
+    return {
+        "ok": True,
+        "data": {
+            "days": days,
+            "rows": result,
+            "me": user.id,
+            "periodStart": period_start_date.isoformat(),
+            "periodEnd": now_local.date().isoformat(),
+            "updatedAt": now_local.isoformat(),
+            "nextDailyRefreshAt": next_update.isoformat(),
+            "timezone": "Asia/Shanghai",
+        },
+    }

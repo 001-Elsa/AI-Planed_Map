@@ -4,12 +4,14 @@
 import { S } from '../state.js';
 import { $, toast } from './dom.js';
 import { store } from '../services/store.js';
-import { API } from '../services/api.js';
-import { loadAMap } from '../services/amap.js';
-import { initMap, refreshModeData } from '../modes/registry.js';
+import { API } from '../services/api.js?v=33';
+import { loadAMap } from '../services/amap.js?v=33';
+import { initMap, refreshModeData } from '../modes/registry.js?v=33';
 
 let authMode = 'login';
+let authAccountType = 'user';
 let localAmapConfigPromise = null;
+let backendRecoveryPromise = null;
 
 export function showAuth() { $('auth-view').classList.remove('hidden'); }
 export function hideAuth() { $('auth-view').classList.add('hidden'); }
@@ -20,9 +22,30 @@ function authErr(msg) {
   e.classList.toggle('hidden', !msg);
 }
 
+function recoverBackend() {
+  if (!API.offline) return Promise.resolve(true);
+  if (backendRecoveryPromise) return backendRecoveryPromise;
+  backendRecoveryPromise = API.probe()
+    .then(() => {
+      $('auth-offline').classList.add('hidden');
+      toast('后端已连接,现在可以登录使用账号功能', 2600);
+      refreshUserUI();
+      return true;
+    })
+    .catch(() => false)
+    .finally(() => { backendRecoveryPromise = null; });
+  return backendRecoveryPromise;
+}
+
 export function requireLogin() {
   if (API.user) return true;
-  toast(API.offline ? '后端未启动,无法使用账号功能' : '请先登录(点右上角 👤)', 3000);
+  showAuth();
+  if (API.offline) {
+    toast('正在重新连接后端,连接后即可登录', 2600);
+    void recoverBackend();
+  } else {
+    toast('请先登录', 2200);
+  }
   return false;
 }
 
@@ -32,10 +55,29 @@ export function refreshUserUI() {
   refreshModeData();
 }
 
+function refreshAccountTypeUI() {
+  const isAdmin = authAccountType === 'admin';
+  $('auth-role-user').classList.toggle('active', !isAdmin);
+  $('auth-role-user').classList.remove('admin-active');
+  $('auth-role-admin').classList.toggle('active', isAdmin);
+  $('auth-role-admin').classList.toggle('admin-active', isAdmin);
+  $('auth-admin-token').classList.toggle('hidden', !isAdmin);
+  $('auth-role-note').textContent = isAdmin
+    ? '管理员注册和登录需要管理员令牌'
+    : '普通用户可直接注册和登录,无需令牌';
+  $('auth-submit').textContent = authMode === 'login'
+    ? (isAdmin ? '管理员登录' : '用户登录')
+    : (isAdmin ? '注册管理员' : '注册用户');
+}
+
 /* ---- 启动流程:登录 → Key → 地图 ---- */
 export function boot() {
   bindAuthUI();
   bindKeyUI();
+  API.config().catch(() => {});
+  window.setInterval(() => {
+    if (API.offline) void recoverBackend();
+  }, 10000);
 
   const proceed = () => { hideAuth(); startApp(); };
 
@@ -61,14 +103,25 @@ function bindAuthUI() {
     authMode = m;
     $('auth-tab-login').classList.toggle('active', m === 'login');
     $('auth-tab-reg').classList.toggle('active', m === 'reg');
-      $('auth-nickname').classList.toggle('hidden', m === 'login');
-      $('auth-password2').classList.toggle('hidden', m === 'login');
-      $('auth-admin-token').classList.toggle('hidden', m === 'login');
-    $('auth-submit').textContent = m === 'login' ? '登 录' : '注 册';
+    $('auth-nickname').classList.toggle('hidden', m === 'login');
+    $('auth-password2').classList.toggle('hidden', m === 'login');
+    refreshAccountTypeUI();
     authErr('');
   };
   $('auth-tab-login').addEventListener('click', () => setMode('login'));
   $('auth-tab-reg').addEventListener('click', () => setMode('reg'));
+  $('auth-role-user').addEventListener('click', () => {
+    authAccountType = 'user';
+    $('auth-admin-token').value = '';
+    refreshAccountTypeUI();
+    authErr('');
+  });
+  $('auth-role-admin').addEventListener('click', () => {
+    authAccountType = 'admin';
+    refreshAccountTypeUI();
+    authErr('');
+  });
+  refreshAccountTypeUI();
 
   $('auth-submit').addEventListener('click', async () => {
     const username = $('auth-username').value.trim();
@@ -78,24 +131,65 @@ function bindAuthUI() {
       if (password.length < 6) { authErr('密码至少 6 位'); return; }
       if (password !== $('auth-password2').value) { authErr('两次密码不一致'); return; }
     }
-    $('auth-submit').disabled = true;
+    const adminInitToken = $('auth-admin-token').value.trim();
+    if (authAccountType === 'admin' && !adminInitToken) {
+      authErr('管理员登录或注册需要填写管理员令牌');
+      return;
+    }
+    const submitMode = authMode;
+    const submitAccountType = authAccountType;
+    const submitButton = $('auth-submit');
+    submitButton.disabled = true;
+    submitButton.textContent = submitMode === 'login' ? '登录中…' : '注册中…';
     try {
-      const r = authMode === 'login'
-        ? await API.login(username, password)
-        : await API.register(username, password, $('auth-nickname').value.trim(), $('auth-admin-token').value.trim());
+      let r;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          r = submitMode === 'login'
+            ? await API.login(username, password, submitAccountType, adminInitToken)
+            : await API.register(
+              username,
+              password,
+              $('auth-nickname').value.trim(),
+              submitAccountType,
+              adminInitToken,
+            );
+          break;
+        } catch (error) {
+          if (error.code !== 'AUTH_DATABASE_BUSY' || attempt === 1) throw error;
+          await new Promise((resolve) => setTimeout(resolve, 350));
+        }
+      }
       API.saveToken(r.token);
       API.user = r.user;
       store.set('mapgo_guest', '0');
-      toast((authMode === 'login' ? '欢迎回来,' : '注册成功,') + r.user.nickname);
+      toast((submitMode === 'login' ? '欢迎回来,' : '注册成功,') + r.user.nickname);
       hideAuth();
       if (S.map) refreshUserUI(); else startApp();
     } catch (e) {
-      authErr(API.offline ? '后端服务不可用,请先启动 uvicorn' : e.message);
+      const message = e.code === 'USERNAME_EXISTS'
+        ? '该用户名已经注册，请切换到登录'
+        : e.code === 'ADMIN_ACCOUNT_REQUIRED'
+          ? '该账号不是管理员账号,请切换为普通用户登录'
+          : e.code === 'ADMIN_LOGIN_REQUIRED'
+            ? '这是管理员账号,请切换为管理员登录'
+            : e.code === 'ADMIN_INIT_INVALID'
+              ? '管理员令牌不正确'
+              : e.message;
+      authErr(API.offline ? '后端服务不可用,请稍后重试' : message);
       if (API.offline) $('auth-offline').classList.remove('hidden');
     } finally {
-      $('auth-submit').disabled = false;
+      submitButton.disabled = false;
+      refreshAccountTypeUI();
     }
   });
+
+  ['auth-username', 'auth-nickname', 'auth-password', 'auth-password2', 'auth-admin-token']
+    .forEach((id) => $(id).addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter') return;
+      event.preventDefault();
+      $('auth-submit').click();
+    }));
 
   $('auth-guest').addEventListener('click', () => {
     store.set('mapgo_guest', '1');

@@ -1,6 +1,8 @@
 import asyncio
 
 from backend.app.infrastructure.runtime_store import InMemoryRuntimeStore
+from backend.app.services.notifications import NotificationService
+from backend.app.services.trip_stream import publish_trip_stream
 
 
 def test_runtime_store_counter_json_queue_lock_and_retry():
@@ -26,6 +28,18 @@ def test_runtime_store_counter_json_queue_lock_and_retry():
         )
         assert dlq == "dlq"
         await store.publish("trip:1", {"hello": "world"})
+        notifications = NotificationService(store)
+        await notifications.enqueue(
+            trip_id=9,
+            user_id=1,
+            channel="in_app",
+            event_type="DeadlineRiskDetected",
+            title="风险",
+            body="测试",
+        )
+        first_stream = await store.get_json("trip-stream:9")
+        second_stream = await publish_trip_stream(store, 9, {"type": "TripStateChanged"})
+        assert second_stream["sequence"] == first_stream["sequence"] + 1
         await store.close()
 
     asyncio.run(scenario())

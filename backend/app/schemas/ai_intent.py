@@ -4,6 +4,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+MAX_PLANNING_TASKS = 24
+
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -48,6 +50,7 @@ class ObjectiveWeights(StrictModel):
 
 
 class PlanningPreferences(StrictModel):
+    optimization_goal: Literal["balanced", "shortest_time", "shortest_distance"] = "balanced"
     minimize_distance: bool = False
     minimize_walking: bool = False
     minimize_cost: bool = False
@@ -118,7 +121,7 @@ class PlanningIntent(StrictModel):
     origin: str | None = Field(default=None, max_length=200)
     departure_time: datetime | None = None
     transport_mode: TransportMode = TransportMode.walking
-    tasks: list[PlanningTask] = Field(min_length=1, max_length=10)
+    tasks: list[PlanningTask] = Field(min_length=1, max_length=MAX_PLANNING_TASKS)
     preferences: PlanningPreferences = Field(default_factory=PlanningPreferences)
     constraints: TripConstraintSet = Field(default_factory=TripConstraintSet)
 
@@ -233,6 +236,14 @@ class UncertaintySummary(StrictModel):
     coverage: float | None = Field(default=None, ge=0, le=1)
 
 
+class CandidateReview(StrictModel):
+    task_index: int = Field(ge=0)
+    task_description: str
+    considered_count: int = Field(ge=0)
+    selected_poi_id: str | None = None
+    candidates: list[PoiCandidate] = Field(default_factory=list)
+
+
 class AIPlanResult(StrictModel):
     status: Literal["success", "need_clarification", "infeasible"]
     planning_state: PlanningState
@@ -250,6 +261,7 @@ class AIPlanResult(StrictModel):
     score: ScoreBreakdown | None = None
     confidence: float = Field(default=0, ge=0, le=1)
     candidate_count: int = 0
+    candidate_reviews: list[CandidateReview] = Field(default_factory=list)
     uncertainty: UncertaintySummary | None = None
 
 

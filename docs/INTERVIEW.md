@@ -1,107 +1,157 @@
-# 面试讲解手册(内部资料,不要提交到公开仓库也无妨,但建议阅读后内化)
+# MapGo v6 面试讲解手册
 
-这份文档帮你把 MapGo 讲成一个有深度的项目:一句话介绍、技术难点、面试官可能的追问和答法、简历写法。**关键是每一条你都要能展开讲 2 分钟**——建议对着代码把每个点走读一遍。
+> 本文只描述当前 FastAPI / AI-Planned 实现。v1～v5 的 Node/SQLite 与经典前端 TSP 是历史能力，见 `CHANGELOG.md`；不要把历史架构当成当前正式后端。
 
-## 一句话介绍(30 秒版)
+## 一句话介绍（30 秒）
 
-> "MapGo 是一个前后端完整的地图生活应用:前端基于高德 JS API 实现了 16 种场景化地图模式(POI 聚焦、路线规划、GPS 实况记录、多任务最短路径等),后端用 **纯 Node.js 内置模块**(http + node:sqlite + crypto)实现了用户系统、社交、分享和管理后台,**零第三方依赖**,带 33 个自动化测试(21 接口 + 12 E2E)、登录限流、Docker 部署和 CI。"
+> MapGo 是一个 AI 行程规划与伴游系统。LLM 只把自然语言解析成严格结构化意图，真实 POI 必须来自地图 Provider，候选地点选择、访问顺序和时间窗由确定性求解器完成。行程中发生偏航、暴雨、延误或地点关闭时，Worker 会驱动受工具白名单、状态机、授权和预算限制的 Agent 生成待确认 Plan Patch；用户确认并通过当前 Patch 复验后，系统才创建新的正式计划版本。
 
-## 技术难点与亮点(重点准备,按被问概率排序)
+当前技术栈：Python 3.12、FastAPI、Pydantic、SQLAlchemy 2.x、Alembic、PostgreSQL 16、Redis 7、OR-Tools、httpx、原生 ES Modules、高德地图、Playwright、Docker Compose、Prometheus/Grafana、GitHub Actions。
 
-### 1. 多任务最短路径(TSP)——算法亮点
+## 核心链路
 
-- 问题:用户输入 N 件要办的事,要求一条总路程最短的顺序。这是开放路径的旅行商问题(TSP),NP-hard。
-- 我的方案分两级:
-  - **N ≤ 6**:并发调用高德路线接口构建**真实路网距离矩阵**(21 次成对请求,`Promise.all` 并发),然后**全排列精确求解**(6! = 720 种,毫秒级);
-  - **N > 6**:退化为球面距离(haversine)矩阵 + **最近邻构造初始解 + 2-opt 迭代优化**的近似算法。
-- 追问"为什么 6 做分界":精确解复杂度 O(n!),7! = 5040 仍可接受但距离矩阵要 28 次网络请求,延迟和配额成本超过收益;近似解在 n 小时质量也很接近。
-- 追问"2-opt 是什么":反转路径中一段看总长是否变短,反复迭代直到无改进;经典局部搜索,实现只有 20 行。
-- 加分:用户可拖拽手动调序,前端按新顺序**实时重算**每段真实路线;还做了出发时间 + 每站停留 → 逐站 ETA。
+### 首次规划
 
-### 2. 高德 Key 安全代理——安全设计亮点
+```text
+POST /api/ai/conversations 或 /api/ai/plans
+  → 配额 / 成本 / 幂等校验
+  → LLM 或 RuleBased Intent Parser
+  → 动态澄清
+  → 并发召回真实 POI
+  → 路线矩阵
+  → Exact / OR-Tools / Beam 联合求解
+  → 初次规划硬约束验证与启发式不确定区间
+  → PlanningRun + PlanVersion V1
+```
 
-- 问题:高德 JS API 需要 Key + 安全密钥(jscode),官方默认写在前端,任何人 F12 可见,盗用后配额被刷。
-- 方案:利用高德官方的 `serviceHost` 机制。前端设 `_AMapSecurityConfig.serviceHost = origin + '/_AMapService'`,JS API 的数据请求全部打到我自己的服务器,服务器**附加 jscode 后转发** `restapi.amap.com`。jscode 永不下发浏览器。
-- 兼容性:服务端没配 Key 时自动回退到"浏览器本地填 Key"的模式,分享页同样两级回退。
-- 追问"Key 本身也在前端可见怎么办":Key 是公开可见的设计(script src 必须带),防盗刷靠 jscode + 高德控制台的域名白名单,两者配合。
+重点代码：
 
-### 3. 零依赖后端——工程取舍亮点(必被追问"为什么不用框架")
+- `backend/app/services/planning_service.py`
+- `backend/app/services/intent_parser.py`
+- `backend/app/services/clarification.py`
+- `backend/app/services/route_optimizer.py`
+- `backend/app/api/ai_planner.py`
 
-- 事实:后端只用 Node 内置模块:`http` 做路由与静态服务、`node:sqlite` 做数据库、`crypto.scrypt` 做密码哈希。
-- 讲法(诚实版):最初用 Express + better-sqlite3,但目标环境 npm 受限,于是重写为零依赖;做完发现收益很大——**部署只需 `node server.js`**、无供应链风险、Docker 镜像小、面试时每一层都能讲清楚,因为都是自己写的。
-- 你要能讲清自己实现了什么:正则路由表 + 鉴权中间件、JSON body 解析(带 2MB 上限防 DoS)、静态文件服务(MIME + `path.normalize` 防路径穿越)、统一 `{ok, data|msg}` 响应格式。
-- 反问预案"生产环境你还会这样吗":会视团队而定;框架带来的生态(中间件、文档、招聘)在多人协作时更重要,这个项目让我理解了框架在底层做了什么,用框架时心里更有数。
+### 动态重规划
 
-### 4. 密码与会话安全
+```text
+TripEvent
+  → Redis trip-events 队列
+  → Worker 行程级锁
+  → Agent Observation / Decision / Policy / Tool
+  → propose_replan
+  → pending PlanPatch
+  → SSE 最新状态快照
+  → 用户接受或拒绝
+  → 路线重算与当前 Patch 约束复验
+  → PlanVersion N+1 或保持 N
+```
 
-- scrypt 加盐(内存难解,优于裸 SHA/MD5),`crypto.timingSafeEqual` 防时序攻击。
-- 会话:64 位随机 hex token,服务端存 `sessions` 表,30 天过期,登出即删,启动清理过期行。选择"服务端会话"而非 JWT 的理由:**可主动吊销**(登出、删用户立即失效——测试第 15 条专门验证了删除用户后其 token 立即 401)。
-- 登录限流:内存滑动窗口,按 `ip+username` 只记**失败**次数,成功清零;注册按 ip 单独限,防批量刷号。追问"多实例部署怎么办":内存桶只对单实例有效,多实例要把桶挪到 Redis/数据库——我在文档里明确标注了这个边界。
+重点代码：
 
-### 5. GPS 实况记录与坐标系问题(体现真实世界复杂度)
+- `backend/app/services/trip_events.py`
+- `backend/app/worker.py`
+- `backend/app/services/agent_controller.py`
+- `backend/app/services/agent_policy.py`
+- `backend/app/services/replanning.py`
+- `backend/app/api/companion.py`
 
-- `watchPosition` 高精度流:< 2m 视为静止抖动丢弃,> 200m 视为信号跳变丢弃;逐点累计 haversine 距离;每点存相对时间戳 `[lng, lat, t]`。
-- **坐标系坑**:浏览器 GPS 是 WGS-84,高德底图是 GCJ-02(国家规定的加偏),直接叠加会偏移几百米。我的取舍:轨迹**形状与里程不受偏移影响**(偏移是近似平移),App 内展示可接受;GPX 导出保持原始 WGS-84,导入 Strava/佳明反而是正确的。若要精确贴图,可加 WGS→GCJ 的开源转换算法(约 20 行),我知道方案但选择了不引入,并在文档写明理由。
-- 回放:requestAnimationFrame 沿轨迹插值,利用逐点时间戳做**变速回放**(真实配速),全程压缩到 8~40 秒,速度倍率动态计算。
+## 技术难点与高频追问
 
-### 6. 测试策略(工程素养的证据)
+### 1. 为什么不让 LLM 直接生成路线？
 
-- `node:test` + 内置 fetch,**黑盒测试真实进程**:spawn 服务子进程(随机端口 + 临时数据目录 + 收紧的限流阈值),测完杀进程删目录,天然隔离、可重复。
-- 后端 21 个用例覆盖:参数校验、权限隔离(A 删不掉 B 的数据)、好友关系鉴权、公开分享、分享配额 429、分页与 X-Total-Count、管理员边界(不能删自己)、**级联删除**(删用户后其 token 立即失效)、限流触发 429、路径穿越、安全响应头。
-- 前端 Playwright E2E 12 个用例(`npm run test:e2e`,CI 独立 job):ES Modules 加载零报错、注册→Key 弹窗全流程、token 复访免登录、管理后台配 Key 生效、分享页渲染、游客模式。
-- 讲法:测试不是为了覆盖率数字,是把"我担心会坏的地方"固化下来——比如重构分层时,这套测试保证了行为完全不变(实际就是这么用的)。
+模型擅长理解“少走路、五点前到医院”等非确定语言，但不能证明 POI 真实存在，也不能稳定满足时间窗。MapGo 把 LLM 限制在意图和行动提案层：POI 来自 Provider，路线来自求解器，正式变更来自用户确认后的 PlanVersion。安全边界是 Schema、Provider、Policy、数据库权限和 Validator 的组合，不是 Prompt。
 
-### 7. 其它可讲的点(每个 30 秒)
+### 2. 求解的到底是什么问题？
 
-- **SQLite 的取舍**:单机应用 WAL 模式足够,省运维;并发写入瓶颈和多实例是明确边界,要横向扩展就换 PostgreSQL,数据层已抽成独立模块方便替换。
-- **找中间点**:多人聚会选址 = 几何中位数(总距离最小),**Weiszfeld 迭代算法** 40 轮收敛,再联动搜周边美食。
-- **外键级联**:`PRAGMA foreign_keys=ON` + `ON DELETE CASCADE`,删用户一条 SQL 清干净所有关联数据。
-- **优雅停机**:SIGTERM → 停止接收新连接 → 关数据库 → 退出,5 秒兜底强退;配合 Docker HEALTHCHECK。
-- **PWA**:manifest + Service Worker 应用壳缓存(高德与 API 请求不缓存),可"添加到主屏幕"。
+不是只给固定地点做 TSP，而是同时为每项任务选择一个候选 POI，并决定任务访问顺序，可视为带候选选择、时间窗和业务约束的开放路径 TSP/VRPTW 扩展。
 
-## 面试官高频追问 & 参考回答
+精确搜索空间约为：
 
-**Q: 项目最难的部分?**
-A: 推荐讲 TSP 两级方案(算法)或坐标系问题(真实世界坑),二选一,讲你真正理解的那个。
+```text
+每项任务候选数的乘积 × 任务数阶乘
+```
 
-**Q: 有多少是你自己写的?**
-A: 如实回答你的参与方式,但确保每个模块你都走读过、能修改、能扩展。面试官常当场让你改需求(如"加一个按评分排序的接口"),提前练习。
+当前仅当任务数不超过 6 且总搜索空间不超过 60,000 时精确枚举；否则尝试 OR-Tools，求解失败才进入 Beam Search。不要把当前后端说成“超过 6 个点就最近邻 + 2-opt”。最近邻 + 2-opt 仍存在于前端“经典规划”备用流程 `public/js/services/algo.js`，不是 AI 后端主求解器。
 
-**Q: 部署过吗?多少用户?**
-A: 如实说。可以说"个人项目,部署在 xx,做了 Docker 化和 CI,重点在工程完整度而非流量"。
+### 3. 硬约束和软目标有什么区别？
 
-**Q: 为什么前端不用 Vue/React?**
-A: 单页地图应用,状态集中在地图实例上。前端做了 **ES Modules 三层架构**(services 纯函数层 / ui 层 / modes 业务层 + registry 模式注册表 + state 单一共享状态),模式切换是注册表驱动的生命周期(清理→面板→激活)——这本质上就是框架解决的问题的手工版,所以我能讲清框架在底层做什么。如果做多人协作或组件复用多的界面,我会用框架(如果你会 Vue/React 一定要提)。
+硬约束决定方案是否可用，例如 deadline、最晚返回、步行上限、任务顺序、营业、无障碍、费用和区域；软目标只在候选方案间排序，例如更短时间、更少步行、更高评分、更低费用和更小改动。软分数不能抵消硬约束冲突。
 
-**Q: 安全上还有什么没做的?**
-A: 主动说边界最加分:CSP 未配(高德内联脚本需要细致的白名单)、限流是单实例内存版、HTTPS 依赖反代、没做 CSRF token(纯 Bearer token API,浏览器不自动携带,风险低但可加)。
+### 4. 为什么既有 Redis 锁又有数据库版本？
 
-## 简历写法(直接可用)
+Redis 锁用于减少同一行程同时运行多个 Agent/重规划任务；`base_version`、数据库事务和 `(planning_run_id, version)` 唯一约束保护最终正式数据。分布式锁只是协调手段，数据库约束才是最后正确性边界。
 
-**项目:MapGo 随行地图 —— 多模式地图生活应用(个人项目)**
-技术栈:原生 JavaScript、高德地图 JS API 2.0、Node.js(零第三方依赖)、SQLite、Docker、GitHub Actions
+### 5. 如何防止模型调用危险工具？
 
-- 设计并实现 16 种场景化地图模式(POI 聚焦筛选、跑步/骑行/公交路线规划、GPS 实况轨迹记录与变速回放、足迹打卡、好友排行榜等)
-- 实现多任务最短路径规划:≤6 站点时并发构建真实路网距离矩阵并全排列精确求解,超过时采用最近邻 + 2-opt 近似算法,支持拖拽调序实时重算与逐站 ETA 预估
-- 基于 Node.js 内置模块实现零依赖后端(HTTP 路由、静态服务、node:sqlite 数据层),含用户认证(scrypt + 会话吊销)、好友/分享/管理员体系、登录防爆破限流
-- 通过高德官方 serviceHost 机制实现 Key 安全代理,安全密钥仅存服务端,前端经 /_AMapService 转发
-- 编写 21 个 node:test 黑盒接口测试与 12 个 Playwright E2E 用例(权限隔离、级联删除、限流、分页、路径穿越),配置 GitHub Actions 双 Node 版本 CI 与 Docker 部署;前端采用 ES Modules 三层架构(services/ui/modes + 模式注册表)
+模型输出先过严格 JSON Schema；工具名必须在白名单中；Controller 根据 Trip State、Consent 和确认要求再次判定；每个 run 还有步数、历史工具次数、Token 和费用限制；工具调用结果写入 AgentRun/AgentToolCall。模型没有直接写 PlanVersion 的工具。
 
-> 提示:把"16 种模式"按目标岗位调整重点——前端岗多讲地图交互与回放动画,后端岗多讲零依赖服务与测试,全栈岗讲 Key 代理这种贯穿前后端的设计。
+### 6. 上游地图失败怎么办？
 
-## 演示动线(面试现场 3 分钟 Demo 建议)
+AMap Provider 有连接池、并发信号量、超时、针对 429/5xx 的指数退避和简单熔断器。路线矩阵先生成显式 haversine 估算矩阵，再用 Provider 返回的边覆盖；缺失或无 duration 的边保留 `quality=estimated`、较低 confidence 和 `fallback_used=true`。系统不会把估算包装成精确实时 ETA。
 
-1. 打开应用 → 登录页(注册一个号,提一句"第一个账号自动成为管理员")
-2. 吃货模式:切分类 chips、评分排序、"到这去" → 说一句灰色底图 + setFeatures 的实现
-3. 计划模式:输入 3 件事 → 最短路径 → 拖拽调序实时重算 → 逐站 ETA
-4. 跑步模式:点几个点规划 → 保存 → **回放**(最有观感的 10 秒)
-5. `/admin.html`:用户总览 + Key 配置 → 讲 Key 代理
-6. 终端:`npm test` 跑一遍 21 个绿点收尾(时间够再加 `npm run test:e2e`)
+### 7. Session 为什么不使用 JWT？
 
-## 提交到 GitHub 前的检查清单
+服务端 Session 便于登出、设备撤销和删除用户后即时失效，适合涉及精确位置和正式计划的数据。原始 64 hex Token 只返回客户端，数据库保存 SHA-256；密码使用 scrypt，并在工作线程计算以免阻塞事件循环。
 
-- [ ] `git init` 后确认 `.gitignore` 生效(data/ 不入库)
-- [ ] README 首屏截图:准备 2-3 张应用截图(吃货模式、计划路线、回放)放进 `docs/screenshots/`
-- [ ] 把真实 Key 从任何文件/历史中排除(本项目 Key 只在数据库或环境变量,天然安全)
-- [ ] 部署一个可访问的在线 Demo(有 Demo 的项目回复率显著更高),README 顶部放链接
-- [ ] CI 徽章:仓库 Settings → Actions 确认工作流跑通,README 加 badge
+### 8. 如何保护精确位置？
+
+必须处于允许定位的 Trip State 并获得明确 Consent；坐标使用 Fernet 字段加密，默认短期 TTL，支持导出和清除，行程完成后停止跟踪。生产环境缺少位置加密密钥时应用拒绝启动。
+
+### 9. 测试策略是什么？
+
+- unit：解析器、约束、Agent Policy、路线算法、隐私；
+- property：随机生成路线验证不变量；
+- contract：Provider 部分数据、非法 POI、熔断；
+- integration：真实 ASGI + SQLite，覆盖规划、版本、Worker、Agent、Patch；
+- evaluation：RuleBased 意图解析质量门禁；
+- chaos/load：锁竞争、重试、DLQ、429 时序与延迟分位数；
+- Playwright：真实 uvicorn + 临时 SQLite 的浏览器冒烟。
+
+测试数量和覆盖率以 `python -m pytest -c backend/pytest.ini --cov` 与 CI artifact 的当次输出为准，不背历史 Node 测试数字。
+
+### 10. 当前最大的技术债是什么？
+
+建议主动说出以下边界：
+
+1. Redis List 没有 ACK/pending reclaim，`BRPOP` 后 Worker 硬崩溃可能丢失在途事件；
+2. 分布式锁没有续租，任务超过 TTL 时可能并发执行；
+3. SSE 只保存最新状态快照，不支持逐条、无缺口回放；
+4. Patch 接受阶段只复验 deadline、最晚返回、步行和总费用，尚未复用首次规划全部约束；
+5. OR-Tools/Beam 搜索使用固定近似代价，大规模问题不保证请求权重下的全局最优；
+6. 同步求解仍运行在 API 进程内，高并发时应隔离到线程池、进程池或独立规划 Worker；
+7. RAG 是本地 TF-IDF，不是向量数据库；真实 Push/邮件、完整 OpenTelemetry 和在线 ETA 校准尚未完成。
+
+## 当前简历写法
+
+**MapGo AI Planner —— AI 行程规划与动态伴游平台**
+
+技术栈：FastAPI、Pydantic、SQLAlchemy、PostgreSQL、Redis、OR-Tools、Alembic、httpx、原生 JavaScript、高德地图、Docker、GitHub Actions
+
+- 设计“LLM 意图理解 / Provider 事实 / 确定性求解 / Plan Version”边界，使用严格结构化输出、规则降级和动态澄清，避免模型虚构 POI 或直接修改正式行程；
+- 实现候选 POI 与访问顺序联合优化：小搜索空间精确枚举，大规模使用 OR-Tools 时间窗路由并以 Beam Search 回退，统一验证时间、评分、步行、费用、无障碍和区域等约束；
+- 实现 Trip Session 与受限 Agent 工具循环，按状态、Consent、步数、Token/费用预算执行；偏航、延误、暴雨和闭馆事件只生成待确认 Plan Patch，用户接受后才创建 Version N+1；
+- 基于 Redis 实现配额计数、事件队列、ZSET 延迟重试、DLQ、行程级分布式锁和最新状态通知；基于 PostgreSQL/Alembic 保存幂等记录、不可变版本和决策审计；
+- 建立 Ruff/Mypy/Bandit/pip-audit、pytest unit/property/contract/integration、AI eval、chaos/load、Playwright E2E 与 Docker build 的 CI 质量门禁。
+
+## 3 分钟演示动线
+
+1. 输入含截止时间和模糊偏好的自然语言；
+2. 回答一次澄清，展示类型化 intent、真实候选、算法名、置信度和 V1；
+3. 创建 Trip Session，注入延误或暴雨事件；
+4. 展示 AgentRun/AgentToolCall 与 pending Patch；
+5. 强调用户确认前 V1 未变化；
+6. 接受 Patch，展示约束重算和 V2；
+7. 用 pytest/CI 收尾，测试数字以现场输出为准。
+
+## 面试禁止使用的旧口径
+
+- “当前后端是纯 Node.js / node:sqlite / 零第三方依赖”；
+- “后端超过 6 个点采用最近邻 + 2-opt”；
+- “所有消息 Exactly Once”；
+- “SSE 支持完整历史事件回放”；
+- “Patch 已复验首次规划的全部硬约束”；
+- “RAG 使用向量数据库”；
+- “ETA 已完成在线历史校准”；
+- “Web Push / 邮件已经真实投递”；
+- “已接入完整 OpenTelemetry 全链路”。

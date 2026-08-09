@@ -3,12 +3,14 @@
 
 import { S } from '../state.js';
 import { $, escapeHtml, toast } from '../ui/dom.js';
-import { API } from '../services/api.js';
+import { API } from '../services/api.js?v=33';
 import { fmtDist, fmtDur, haversine } from '../services/format.js';
-import { searchNearestPOI } from '../services/amap.js';
-import { requireLogin } from '../ui/auth.js';
-import { MODES } from './registry.js';
-import { trackPath } from './route.js';
+import { searchNearestPOI } from '../services/amap.js?v=33';
+import { requireLogin } from '../ui/auth.js?v=33';
+import { MODES } from './registry.js?v=33';
+import { trackPath } from './route.js?v=33';
+
+let leaderboardRefreshTimer = null;
 
 /* ---------------- 生命周期 ---------------- */
 export function clearAll() {
@@ -16,6 +18,8 @@ export function clearAll() {
   clearFavMarkers();
   clearFriendOverlays();
   if (S.heatOn) toggleHeatmap();
+  clearTimeout(leaderboardRefreshTimer);
+  leaderboardRefreshTimer = null;
 }
 
 export function bindSocialUI() {
@@ -40,6 +44,11 @@ export function bindSocialUI() {
 
   /* 热力足迹 */
   $('btn-heatmap').addEventListener('click', toggleHeatmap);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible' || S.currentMode !== 'friends' || !API.user) return;
+    const activeDays = document.querySelector('#lb-seg .seg-btn.active');
+    loadLeaderboard(activeDays ? parseInt(activeDays.dataset.days, 10) : 1);
+  });
 }
 
 /* ---------------- 足迹打卡 ---------------- */
@@ -89,11 +98,21 @@ export async function loadCheckins() {
   if (S.footMarkers.length) { S.map.remove(S.footMarkers); S.footMarkers = []; }
   if (!API.user) {
     $('foot-hint').textContent = API.offline ? '后端未启动' : '登录后开始记录足迹';
+    $('foot-summary').innerHTML = '';
     return;
   }
   try {
     const rows = await API.listCheckins();
     $('foot-hint').textContent = rows.length ? '共 ' + rows.length + ' 个足迹' : '在地图上留下第一个足迹吧';
+    const now = new Date();
+    const monthCount = rows.filter((item) => {
+      const created = new Date(String(item.created_at || '').replace(' ', 'T'));
+      return created.getFullYear() === now.getFullYear() && created.getMonth() === now.getMonth();
+    }).length;
+    const noteCount = rows.filter((item) => item.note).length;
+    $('foot-summary').innerHTML = '<div><b>' + rows.length + '</b><span>永久足迹</span></div>' +
+      '<div><b>' + monthCount + '</b><span>本月新增</span></div>' +
+      '<div><b>' + noteCount + '</b><span>带日记</span></div>';
     rows.forEach((c) => {
       const mk = new AMap.Marker({
         position: [c.lng, c.lat],
@@ -146,11 +165,19 @@ export async function loadFavorites() {
   clearFavMarkers();
   if (!API.user) {
     $('fav-hint').textContent = API.offline ? '后端未启动' : '登录后可在各模式里点 ⭐ 收藏地点';
+    $('fav-summary').innerHTML = '';
     return;
   }
   try {
     const rows = await API.listFavorites();
     $('fav-hint').textContent = rows.length ? rows.length + ' 个地点' : '还没有收藏,去各模式里点 ⭐ 吧';
+    const modeCount = new Set(rows.map((item) => item.mode || 'other')).size;
+    const nearby = S.myPos
+      ? rows.filter((item) => haversine(S.myPos, { lng: item.lng, lat: item.lat }) <= 3000).length
+      : 0;
+    $('fav-summary').innerHTML = '<div><b>' + rows.length + '</b><span>云端收藏</span></div>' +
+      '<div><b>' + modeCount + '</b><span>地点分类</span></div>' +
+      '<div><b>' + (S.myPos ? nearby : '—') + '</b><span>3km 内</span></div>';
     rows.forEach((f) => {
       const emoji = (MODES[f.mode] && MODES[f.mode].emoji) || '⭐';
       const mk = new AMap.Marker({
@@ -301,6 +328,13 @@ async function loadLeaderboard(days) {
       '<span class="lb-name">' + escapeHtml(r.nickname) + (r.uid === d.me ? '(我)' : '') + '</span>' +
       '<span class="lb-val"><b>' + (r.distance / 1000).toFixed(1) + '</b> 公里 · ' + r.count + ' 次</span>' +
       '</div>').join('') || '<p class="muted">近' + days + '天大家都还没动 😴</p>';
+    const updated = new Date(d.updatedAt);
+    $('lb-updated').textContent = '自然日统计 · 更新于 ' +
+      updated.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) +
+      ' · 下次跨日自动刷新';
+    clearTimeout(leaderboardRefreshTimer);
+    const nextRefresh = new Date(d.nextDailyRefreshAt).getTime() - Date.now() + 1000;
+    leaderboardRefreshTimer = setTimeout(() => loadLeaderboard(days), Math.max(1000, nextRefresh));
   } catch (e) { el.innerHTML = '<p class="err">' + escapeHtml(e.message) + '</p>'; }
 }
 
@@ -353,10 +387,12 @@ export async function loadStats() {
       '<div class="tile"><b>' + (ride.distance / 1000).toFixed(1) + '</b><span>骑行公里 · ' + ride.count + ' 次</span></div>' +
       '<div class="tile"><b>' + s.counts.checkins + '</b><span>足迹打卡</span></div>' +
       '<div class="tile"><b>' + s.counts.favorites + '</b><span>收藏地点</span></div>' +
+      '<div class="tile"><b>' + s.currentStreakDays + '</b><span>连续运动天数</span></div>' +
+      '<div class="tile"><b>' + fmtDur((run.duration || 0) + (ride.duration || 0)) + '</b><span>累计运动时长</span></div>' +
       '</div>';
 
     const weekly = s.weekly || [];
-    if (weekly.length) {
+    if (weekly.some((item) => item.distance > 0)) {
       const max = Math.max(...weekly.map((w) => w.distance), 1);
       html += '<div class="chart-title">近 8 周运动里程(公里)</div><div class="bar-chart">';
       weekly.forEach((w) => {
@@ -376,8 +412,10 @@ export async function loadStats() {
           '<div class="mini-row">' + escapeHtml(c.emoji || '📍') + ' ' + escapeHtml(c.name) +
           ' <span class="muted">' + escapeHtml((c.created_at || '').slice(5, 16)) + '</span></div>').join('');
     }
-    html += '<p class="muted" style="margin-top:8px">账号创建于 ' + escapeHtml((s.since || '').slice(0, 10)) +
-      ' · 计划 ' + s.counts.plans + ' 个 · 路线记录 ' + s.counts.tracks + ' 条</p>';
+    html += '<p class="muted" style="margin-top:8px">数据保存在账号数据库中 · ' +
+      escapeHtml(s.timezone || 'Asia/Shanghai') + ' 统计 · 账号创建于 ' +
+      escapeHtml((s.since || '').slice(0, 10)) + ' · 计划 ' + s.counts.plans +
+      ' 个 · 路线记录 ' + s.counts.tracks + ' 条</p>';
     body.innerHTML = html;
   } catch (e) {
     $('stats-hint').textContent = e.message;

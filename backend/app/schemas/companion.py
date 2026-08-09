@@ -31,6 +31,7 @@ class TripEventType(str, Enum):
     user_off_route = "UserOffRoute"
     deadline_risk = "DeadlineRiskDetected"
     stop_completed = "PlanStopCompleted"
+    stop_skipped = "PlanStopSkipped"
     user_paused = "UserPausedTrip"
     user_resumed = "UserResumedTrip"
     trip_completed = "TripCompleted"

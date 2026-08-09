@@ -9,14 +9,22 @@ from backend.app.core.config import Settings
 from backend.app.schemas.ai_intent import (
     AIPlanRequest,
     AIPlanResult,
+    CandidateReview,
     ClarificationQuestion,
+    Coordinate,
     PlannedStop,
     PlanningState,
+    PoiCandidate,
+    TransportMode,
     UncertaintySummary,
 )
 from backend.app.services.clarification import select_clarification_questions
 from backend.app.services.intent_parser import IntentParser
-from backend.app.services.route_optimizer import CandidateNode, optimize_joint_route
+from backend.app.services.route_optimizer import (
+    CandidateNode,
+    evaluate_joint_order,
+    optimize_joint_route,
+)
 from backend.app.services.uncertainty import heuristic_envelope
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -43,6 +51,42 @@ class PlanningService:
         self.map_provider = map_provider
         self.settings = settings
 
+    async def _search_candidates(
+        self,
+        keywords: list[str],
+        origin: Coordinate,
+        city: str | None,
+    ) -> list[list[PoiCandidate]]:
+        recalled = await asyncio.gather(
+            *(self.map_provider.search_poi(keyword, origin, city) for keyword in keywords),
+            return_exceptions=True,
+        )
+        results: list[list[PoiCandidate] | None] = [None] * len(keywords)
+        failures: list[tuple[int, Exception]] = []
+        for index, item in enumerate(recalled):
+            if isinstance(item, BaseException):
+                if isinstance(item, Exception):
+                    failures.append((index, item))
+                else:
+                    raise item
+            else:
+                results[index] = item
+
+        # AMap's JS credential bridge can occasionally time out when several
+        # input-tip requests establish connections simultaneously. Retry only
+        # the failed recalls sequentially so one transient timeout cannot abort
+        # an otherwise valid multi-stop plan.
+        for index, _ in failures:
+            await asyncio.sleep(0.15)
+            try:
+                results[index] = await self.map_provider.search_poi(keywords[index], origin, city)
+            except Exception:
+                results[index] = None
+
+        if results and all(item is None for item in results) and failures:
+            raise failures[0][1]
+        return [item or [] for item in results]
+
     async def plan(self, request: AIPlanRequest) -> AIPlanResult:
         intent = await self.parser.parse(request.text)
         if request.departure_time:
@@ -58,6 +102,12 @@ class PlanningService:
             if key == "dietary_restrictions":
                 values = value if isinstance(value, list) else [value]
                 intent.preferences.dietary_restrictions = [str(item) for item in values if item]
+            elif key == "optimization_goal" and value in {
+                "balanced",
+                "shortest_time",
+                "shortest_distance",
+            }:
+                intent.preferences.optimization_goal = value
             elif key in {
                 "minimize_distance",
                 "minimize_walking",
@@ -126,9 +176,7 @@ class PlanningService:
             raise RuntimeError("澄清阶段结束后仍缺少起点")
 
         keywords = [self._recall_keyword(task, intent) for task in intent.tasks]
-        search_results = await asyncio.gather(
-            *(self.map_provider.search_poi(keyword, origin, request.city) for keyword in keywords)
-        )
+        search_results = await self._search_candidates(keywords, origin, request.city)
         ambiguous = {
             index: found[:5]
             for index, found in enumerate(search_results)
@@ -237,6 +285,60 @@ class PlanningService:
             safety_buffer_minutes=safety_buffer,
         )
 
+        # Public transit uses the same candidate/order solver, then verifies the
+        # chosen sequence with real AMap transfer routes. This keeps upstream
+        # calls linear in the number of stops instead of querying every pair.
+        if intent.transport_mode == TransportMode.transit and evaluation.selected_nodes:
+            selected_by_task_nodes = {node.task_index: node for node in evaluation.selected_nodes}
+            sequence_points = [
+                origin,
+                *(
+                    candidates[node.task_index][node.candidate_rank].location
+                    for node in evaluation.selected_nodes
+                ),
+            ]
+            if intent.constraints.hard.must_return_to_origin:
+                sequence_points.append(origin)
+            transit_edges = await self.map_provider.transit_route_edges(
+                sequence_points, request.city
+            )
+            refined_matrix = matrix.model_copy(deep=True)
+            previous_matrix_index = 0
+            for node, edge in zip(
+                evaluation.selected_nodes,
+                transit_edges,
+                strict=False,
+            ):
+                refined_matrix.edges[previous_matrix_index][node.matrix_index] = edge.model_copy(
+                    update={
+                        "origin_index": previous_matrix_index,
+                        "destination_index": node.matrix_index,
+                    }
+                )
+                previous_matrix_index = node.matrix_index
+            if intent.constraints.hard.must_return_to_origin and len(transit_edges) > len(
+                evaluation.selected_nodes
+            ):
+                refined_matrix.edges[previous_matrix_index][0] = transit_edges[-1].model_copy(
+                    update={
+                        "origin_index": previous_matrix_index,
+                        "destination_index": 0,
+                    }
+                )
+            matrix = refined_matrix
+            evaluation = evaluate_joint_order(
+                evaluation.order,
+                selected_by_task_nodes,
+                departure,
+                intent.tasks,
+                matrix,
+                intent.preferences,
+                intent.constraints.hard,
+                intent.transport_mode,
+                safety_buffer_minutes=safety_buffer,
+            )
+            algorithm += "+amap-transit-refinement"
+
         planned_stops: list[PlannedStop] = []
         previous = 0
         confidences: list[float] = []
@@ -263,6 +365,22 @@ class PlanningService:
                 )
             )
             previous = node.matrix_index
+
+        selected_by_task = {node.task_index: node for node in evaluation.selected_nodes}
+        candidate_reviews = [
+            CandidateReview(
+                task_index=task_index,
+                task_description=intent.tasks[task_index].description,
+                considered_count=len(group),
+                selected_poi_id=(
+                    group[selected_by_task[task_index].candidate_rank].id
+                    if task_index in selected_by_task
+                    else None
+                ),
+                candidates=group,
+            )
+            for task_index, group in enumerate(candidates)
+        ]
 
         confidence = sum(confidences) / len(confidences) if confidences else 0
         # ETA observations are collected for post-trip analysis but are not
@@ -309,6 +427,7 @@ class PlanningService:
                 score=evaluation.score,
                 confidence=confidence,
                 candidate_count=len(flattened),
+                candidate_reviews=candidate_reviews,
                 uncertainty=uncertainty,
             )
 
@@ -331,6 +450,7 @@ class PlanningService:
             score=evaluation.score,
             confidence=confidence,
             candidate_count=len(flattened),
+            candidate_reviews=candidate_reviews,
             uncertainty=uncertainty,
         )
 

@@ -4,7 +4,7 @@
 
 ## 前置条件
 
-- Node.js ≥ 18(打包机器上)
+- Node.js ≥ 22.5（与 `package.json` 的 engines 保持一致）
 - [Android Studio](https://developer.android.com/studio)(含 SDK)
 - 你的服务器已部署本项目并可从手机访问(见下)
 
@@ -20,7 +20,7 @@ npm install @capacitor/core @capacitor/cli @capacitor/android
 
 # 2. 修改 capacitor.config.json 里的 server.url
 #    改成你部署的地址,例如 https://map.example.com
-#    (生产务必用 https,并删掉 "cleartext": true)
+#    (生产务必用 https，并将 "cleartext" / "allowMixedContent" 改为 false)
 
 # 3. 生成 Android 工程
 npx cap add android

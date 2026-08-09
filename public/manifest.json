@@ -1,7 +1,7 @@
 {
   "name": "随行地图 MapGo",
   "short_name": "随行地图",
-  "description": "多模式实用地图:吃货 / 厕所 / 逛街 / 跑步 / 骑行 / 计划最短路径",
+  "description": "AI 行程规划与随行地图：真实 POI、约束路线优化、计划版本与动态重规划",
   "start_url": "./index.html",
   "display": "standalone",
   "orientation": "portrait",

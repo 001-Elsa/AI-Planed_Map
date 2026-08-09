@@ -1,6 +1,6 @@
-# 版本演进清单(v1 → v5)
+# 版本演进清单（v1 → v6）
 
-> 本文档完整记录项目从零到求职级作品的每一步。面试时可以据此讲清"这个项目是怎么长出来的"——每个版本解决什么问题、做了哪些决策。
+> 本文档记录项目从纯前端地图到 AI 规划平台的历史。v1～v5 的 Node/SQLite、最近邻 + 2-opt 等描述是当时版本的真实实现，不代表当前 v6 正式后端；当前能力以 README、架构文档和代码为准。
 
 ---
 
@@ -102,7 +102,46 @@
 
 ---
 
-## 数据库最终形态(9 表)
+## v6 — AI-Planned：FastAPI、确定性规划与伴游 Agent
+
+**正式后端替换**
+
+- 删除旧 Node API，正式后端迁移为 Python 3.12、FastAPI、Pydantic、SQLAlchemy 2.x 异步会话和 Alembic；
+- Docker Compose / CI 使用 PostgreSQL 16 与 Redis 7；本地开发、Python 集成测试和 Playwright E2E 可使用 SQLite；
+- API、Worker、数据库模型和 Provider 保持同一代码库，采用模块化单体 + 独立 Worker 进程，而不是拆分微服务。
+
+**AI 规划边界**
+
+- LLM 只输出严格 Pydantic 意图，不能生成 POI、写 PlanVersion 或绕过约束验证；失败时降级到 RuleBased Parser，并记录不确定约束；
+- 支持持久化多轮澄清，回答会写回类型化请求，再重新召回 POI 与求解；
+- 每项任务并发召回多个 Provider 候选，联合选择候选地点和访问顺序；小搜索空间精确枚举，大搜索空间优先 OR-Tools，失败时回退 Beam Search；
+- 路线边正式记录 source、quality、traffic timestamp、confidence 与 fallback 标记；在线置信区间仍是启发式，不宣称已完成历史校准。
+
+**计划版本与动态重规划**
+
+- 新增 PlanningRun、PlanVersion、PlanPatch、DecisionAuditLog 与 IdempotencyRecord；正式计划使用不可变版本，Patch 通过 base_version 做乐观并发控制；
+- Trip Session 管理状态机、Consent、短期精确定位和偏航检测；
+- Agent Controller 执行有步数、Token、费用、状态、授权和工具白名单限制的 Observation → Decision → Policy → Tool 循环；
+- Worker 消费高风险事件，生成待确认 Patch；用户接受并通过当前 Patch 复验后才创建 Version N+1；
+- 支持延误切换交通方式、闭馆替换 POI、暴雨将室外站点替换为室内候选。
+
+**可靠性、安全与工程化**
+
+- Runtime Store 支持内存/Redis 计数、JSON 快照、Redis List 队列、ZSET 延迟重试、DLQ、`SET NX EX` 锁和事件发布；
+- Session Token 只存哈希；密码使用 scrypt；精确位置使用 Fernet 字段加密、Consent 和 TTL；
+- 提供 Request/Trace ID、JSON 日志、Prometheus/Grafana、Ruff/Mypy/Bandit/pip-audit、PostgreSQL+Redis CI、pytest/property/contract/integration/eval/chaos/load、Playwright E2E 与 Docker build。
+
+**v6 已知边界**
+
+- Redis List 没有 ACK/pending reclaim，Worker 硬崩溃可能丢失在途消息；
+- SSE 是最新状态快照，不是完整事件回放；
+- Patch 接受路径尚未复用首次规划的全部约束检查；
+- OR-Tools/Beam 搜索阶段使用固定近似代价，大规模问题不保证请求权重下的全局最优；
+- 同步求解仍在 API 进程内执行；真实推送通道、托管向量检索和完整 OpenTelemetry 尚未实现。
+
+---
+
+## v5 数据库形态（历史，9 表）
 
 | 表 | 用途 | 关键设计 |
 |---|---|---|
@@ -116,4 +155,4 @@
 | friends | 好友 | 双向唯一;pending/accepted |
 | settings | 服务端配置 | k-v(高德 Key/jscode) |
 
-全部外键 `ON DELETE CASCADE`,删用户一步清干净。
+这是 v5 Node/SQLite 阶段的数据模型。v6 ORM 还包含规划会话、幂等记录、版本/Patch、决策审计、Trip/Agent/Consent/Location/外部数据快照等表；v6 外键删除策略也不再全部是 CASCADE，例如 `planning_runs.user_id` 使用 `SET NULL` 保留规划执行证据。

@@ -38,6 +38,7 @@ export const S = {
   /* 计划 */
   planOverlays: [],
   planTravelMode: 'walk',
+  planTravelModeExplicit: false,
   lastPlan: null,         // {text, travelMode, depart, stay} 用于保存
   lastPlanCtx: null,      // {origin, stops, legs, missed} 用于调序/分享
 

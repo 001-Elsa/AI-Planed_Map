@@ -55,6 +55,8 @@ function run(cmd, args, env, cwd) {
     MOCK_WEATHER_PROVIDER: 'true',
     REDIS_URL: '',
     LLM_API_KEY: '',
+    LOCATION_ENCRYPTION_KEY: 'test-only-location-key-for-field-encryption',
+    ADMIN_INIT_TOKEN: 'e2e-admin-token',
   });
 
   await run(process.platform === 'win32' ? 'python' : 'python3', ['-m', 'alembic', 'upgrade', 'head'], env, ROOT);
@@ -122,16 +124,25 @@ function run(cmd, args, env, cwd) {
     check('复访凭 token 免登录', !(await page.locator('#auth-view').isVisible()));
 
     console.log('▶ 管理后台');
+    const adminRegistration = await fetch(BASE + '/api/register', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: 'e2eadmin', password: 'e2eadmin1', accountType: 'admin',
+        adminInitToken: 'e2e-admin-token',
+      }),
+    });
+    check('管理员令牌可创建管理员账号', adminRegistration.ok);
     const admin = await newPage();
     await admin.goto(BASE + '/admin.html', { waitUntil: 'domcontentloaded' });
     await admin.waitForTimeout(600);
     if (!(await admin.locator('#panel').isVisible())) {
-      await admin.fill('#u', 'e2euser');
-      await admin.fill('#p', 'e2epass1');
+      await admin.fill('#u', 'e2eadmin');
+      await admin.fill('#p', 'e2eadmin1');
+      await admin.fill('#at', 'e2e-admin-token');
       await admin.click('button:has-text("登录")');
       await admin.waitForTimeout(800);
     }
-    check('管理员(首个注册)进入后台', await admin.locator('#panel').isVisible());
+    check('管理员通过专用入口进入后台', await admin.locator('#panel').isVisible());
     check('总览统计渲染', /用户/.test(await admin.locator('#tiles').textContent()));
 
     await admin.fill('#ak', 'E2E_PLACEHOLDER_KEY');
@@ -140,6 +151,8 @@ function run(cmd, args, env, cwd) {
     await admin.waitForTimeout(500);
     const cfg = await fetch(BASE + '/api/config').then((r) => r.json());
     check('服务端 Key 代理配置生效', cfg.data.proxy === true && cfg.data.amapKey === 'E2E_PLACEHOLDER_KEY');
+    const capabilities = await fetch(BASE + '/api/ai/capabilities').then((r) => r.json());
+    check('后台保存 Key 后 AI 地图 Provider 即时启用', capabilities.data.map_provider === 'amap-v3' && capabilities.data.map_credential_mode === 'js_api_proxy');
 
     console.log('▶ 分享页');
     const login = await fetch(BASE + '/api/login', {

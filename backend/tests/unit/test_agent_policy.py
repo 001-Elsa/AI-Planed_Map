@@ -28,6 +28,20 @@ def test_state_machine_rejects_skipping_confirmation_states():
     assert captured.value.code == "TRIP_STATE_TRANSITION_DENIED"
 
 
+@pytest.mark.parametrize(
+    "state",
+    [
+        TripState.active_trip,
+        TripState.paused,
+        TripState.off_route,
+        TripState.at_risk,
+        TripState.replanning,
+    ],
+)
+def test_live_trip_states_can_be_completed(state):
+    validate_transition(state, TripState.completed)
+
+
 def test_critical_event_bypasses_notification_cooldown():
     decision = evaluate_trip_event(
         TripState.active_trip,

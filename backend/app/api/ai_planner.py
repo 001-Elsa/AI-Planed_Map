@@ -17,9 +17,11 @@ from backend.app.models import (
     PlanningRun,
     PlanPatch,
     PlanVersion,
+    TripEvent,
     TripSession,
 )
 from backend.app.schemas.ai_intent import (
+    MAX_PLANNING_TASKS,
     AIPlanRequest,
     ContinuePlanningConversationRequest,
     CreatePlanPatchRequest,
@@ -33,6 +35,91 @@ router = APIRouter(prefix="/ai", tags=["ai-planner"])
 
 def _aware(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def _execution_trace(result, parser, request: Request, latency_ms: int) -> dict:
+    estimated_edges = sum(1 for stop in result.stops if stop.travel.fallback_used)
+    verified_edges = len(result.stops) - estimated_edges
+    return {
+        "trace_id": request.state.trace_id,
+        "latency_ms": latency_ms,
+        "intent_parser": parser.name,
+        "parser_fallback_used": bool(getattr(parser, "fallback_used", False)),
+        "map_provider": request.app.state.map_provider.name,
+        "verified_route_edges": verified_edges,
+        "estimated_route_edges": estimated_edges,
+        "formal_plan_persisted": False,
+        "stages": [
+            {
+                "key": "intent",
+                "label": "理解需求",
+                "status": "complete",
+                "detail": f"识别 {len(result.intent.tasks)} 个任务",
+            },
+            {
+                "key": "poi",
+                "label": "核验地点",
+                "status": "complete" if result.status != "need_clarification" else "attention",
+                "detail": f"比较 {result.candidate_count} 个真实候选",
+            },
+            {
+                "key": "route",
+                "label": "计算路网",
+                "status": "complete" if result.stops else "pending",
+                "detail": f"{verified_edges} 段 Provider 路线，{estimated_edges} 段估算",
+            },
+            {
+                "key": "optimize",
+                "label": "约束求解",
+                "status": (
+                    "blocked"
+                    if result.status == "infeasible"
+                    else "complete"
+                    if result.status == "success"
+                    else "pending"
+                ),
+                "detail": result.algorithm or "等待补充信息",
+            },
+        ],
+    }
+
+
+@router.get("/capabilities")
+async def planning_capabilities(request: Request):
+    """Expose safe runtime capability metadata for the planning workspace."""
+    settings = get_settings()
+    parser = build_intent_parser(settings, request.app.state.http_client)
+    map_provider = request.app.state.map_provider
+    credential_mode = getattr(map_provider, "credential_mode", "mock")
+    return {
+        "ok": True,
+        "data": {
+            "status": "operational",
+            "intent_parser": parser.name,
+            "map_provider": map_provider.name,
+            "map_credential_mode": credential_mode,
+            "configuration_warning": None
+            if credential_mode != "mock"
+            else "尚未配置可用的高德凭据，AI 规划将明确使用估算数据",
+            "persistence": True,
+            "versioned_plans": True,
+            "dynamic_replanning": True,
+            "max_tasks": MAX_PLANNING_TASKS,
+            "max_candidates_per_task": 5,
+            "max_route_matrix_points": settings.max_route_matrix_points,
+            "daily_plan_limit": settings.ai_plans_per_day,
+            "transport_modes": ["walking", "cycling", "driving", "transit"],
+            "hard_constraints": [
+                "latest_return_time",
+                "max_walking_meters",
+                "max_total_duration_minutes",
+                "max_total_cost_yuan",
+                "required_task_order",
+                "avoid_areas",
+                "wheelchair_accessible",
+            ],
+        },
+    }
 
 
 async def _enforce_ai_budget(request: Request, user_id: int, text: str) -> None:
@@ -101,12 +188,19 @@ async def _execute_conversation_plan(
     settings = get_settings()
     await _enforce_ai_budget(request, user.id, body.text)
     parser = build_intent_parser(settings, request.app.state.http_client)
+    started = time.perf_counter()
     result = await PlanningService(parser, request.app.state.map_provider, settings).plan(body)
     if getattr(parser, "fallback_used", False):
         metrics.increment(
             "mapgo_llm_fallback_total", {"parser": getattr(parser, "last_parser", "unknown")}
         )
     data = result.model_dump(mode="json")
+    data["execution"] = _execution_trace(
+        result,
+        parser,
+        request,
+        round((time.perf_counter() - started) * 1000),
+    )
     input_tokens = int(getattr(parser, "input_tokens", 0))
     output_tokens = int(getattr(parser, "output_tokens", 0))
     await _record_ai_usage(request, user.id, input_tokens, output_tokens)
@@ -157,13 +251,23 @@ async def _execute_conversation_plan(
             planning_run_id=run.id,
             user_id=user.id,
             version=1,
-            snapshot_json=json.dumps(data, ensure_ascii=False),
+            snapshot_json="{}",
             change_reason="conversation_constraints_confirmed",
         )
         db.add(version)
         await db.flush()
         data["plan_version"] = 1
         data["plan_version_id"] = version.id
+        data["execution"]["formal_plan_persisted"] = True
+        data["execution"]["stages"].append(
+            {
+                "key": "persist",
+                "label": "保存正式计划",
+                "status": "complete",
+                "detail": "已写入可回滚版本 v1",
+            }
+        )
+        version.snapshot_json = json.dumps(data, ensure_ascii=False)
         run.result_json = json.dumps(data, ensure_ascii=False)
     await db.commit()
     return data
@@ -171,9 +275,75 @@ async def _execute_conversation_plan(
 
 @router.post("/conversations")
 async def start_planning_conversation(
-    body: AIPlanRequest, request: Request, user: CurrentUser, db: Db
+    body: AIPlanRequest,
+    request: Request,
+    user: CurrentUser,
+    db: Db,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ):
-    data = await _execute_conversation_plan(body, request, user, db)
+    record = None
+    if idempotency_key:
+        if len(idempotency_key) > 200:
+            raise AppError(400, "IDEMPOTENCY_KEY_INVALID", "Idempotency-Key 过长")
+        settings = get_settings()
+        parser = build_intent_parser(settings, request.app.state.http_client)
+        fingerprint = request_fingerprint(str(user.id), body, parser.name, settings.prompt_version)
+        owner_key = f"{user.id}:conversation"
+        now = datetime.now(timezone.utc)
+        record = await db.scalar(
+            select(IdempotencyRecord).where(
+                IdempotencyRecord.owner_key == owner_key,
+                IdempotencyRecord.idempotency_key == idempotency_key,
+            )
+        )
+        if record and _aware(record.expires_at) <= now:
+            await db.delete(record)
+            await db.commit()
+            record = None
+        if record:
+            if record.request_fingerprint != fingerprint:
+                raise AppError(409, "IDEMPOTENCY_KEY_REUSED", "同一个幂等键不能用于不同请求")
+            if record.status == "succeeded" and record.response_json:
+                return {
+                    "ok": True,
+                    "data": json.loads(record.response_json),
+                    "replayed": True,
+                }
+            if record.status == "failed":
+                raise AppError(
+                    409, "PREVIOUS_REQUEST_FAILED", "相同规划此前执行失败，请使用新的幂等键"
+                )
+            raise AppError(409, "REQUEST_IN_PROGRESS", "相同规划正在处理中")
+        record = IdempotencyRecord(
+            owner_key=owner_key,
+            idempotency_key=idempotency_key,
+            request_fingerprint=fingerprint,
+            status="processing",
+            expires_at=now + timedelta(seconds=settings.idempotency_ttl_seconds),
+        )
+        db.add(record)
+        try:
+            await db.commit()
+        except IntegrityError as exc:
+            await db.rollback()
+            raise AppError(409, "REQUEST_IN_PROGRESS", "相同规划正在处理中") from exc
+    try:
+        data = await _execute_conversation_plan(body, request, user, db)
+    except Exception as exc:
+        if record:
+            await db.rollback()
+            stored = await db.get(IdempotencyRecord, record.id)
+            if stored:
+                stored.status = "failed"
+                stored.error_code = exc.code if isinstance(exc, AppError) else "UNEXPECTED_ERROR"
+                await db.commit()
+        raise
+    if record:
+        stored = await db.get(IdempotencyRecord, record.id)
+        if stored:
+            stored.status = "succeeded"
+            stored.response_json = json.dumps(data, ensure_ascii=False)
+            await db.commit()
     return {"ok": True, "data": data}
 
 
@@ -319,6 +489,12 @@ async def create_ai_plan(
         )
     response_data = result.model_dump(mode="json")
     planning_seconds = time.perf_counter() - started
+    response_data["execution"] = _execution_trace(
+        result,
+        parser,
+        request,
+        round(planning_seconds * 1000),
+    )
     metrics.observe(
         "mapgo_planning_duration_seconds",
         planning_seconds,
@@ -362,13 +538,23 @@ async def create_ai_plan(
             planning_run_id=run.id,
             user_id=user.id,
             version=1,
-            snapshot_json=json.dumps(response_data, ensure_ascii=False),
+            snapshot_json="{}",
             change_reason="initial_plan",
         )
         db.add(version)
         await db.flush()
         response_data["plan_version"] = 1
         response_data["plan_version_id"] = version.id
+        response_data["execution"]["formal_plan_persisted"] = True
+        response_data["execution"]["stages"].append(
+            {
+                "key": "persist",
+                "label": "保存正式计划",
+                "status": "complete",
+                "detail": "已写入可回滚版本 v1",
+            }
+        )
+        version.snapshot_json = json.dumps(response_data, ensure_ascii=False)
         run.result_json = json.dumps(response_data, ensure_ascii=False)
     if record:
         record.status = "succeeded"
@@ -717,8 +903,31 @@ async def decide_plan_patch(
     if patch.status != "pending":
         raise AppError(409, "PLAN_PATCH_ALREADY_DECIDED", "该补丁已经处理")
     if not body.accept:
+        now = datetime.now(timezone.utc)
         patch.status = "rejected"
-        patch.decided_at = datetime.now(timezone.utc)
+        patch.decided_at = now
+        trips = (
+            await db.scalars(
+                select(TripSession).where(
+                    TripSession.planning_run_id == run_id,
+                    TripSession.user_id == user.id,
+                )
+            )
+        ).all()
+        for trip in trips:
+            db.add(
+                TripEvent(
+                    trip_session_id=trip.id,
+                    event_id=f"patch-{patch.id}-rejected",
+                    event_type="PlanPatchRejected",
+                    payload_json=json.dumps({"patch_id": patch.id}),
+                    occurred_at=now,
+                    status="processed",
+                    impact_level="none",
+                    decision_json=json.dumps({"accepted": False}),
+                    processed_at=now,
+                )
+            )
         db.add(
             DecisionAuditLog(
                 planning_run_id=run_id,
@@ -789,7 +998,8 @@ async def decide_plan_patch(
         change_reason=patch.reason,
     )
     patch.status = "accepted"
-    patch.decided_at = datetime.now(timezone.utc)
+    decided_at = datetime.now(timezone.utc)
+    patch.decided_at = decided_at
     db.add(new_version)
     trips = (
         await db.scalars(
@@ -803,6 +1013,19 @@ async def decide_plan_patch(
         trip.current_plan_version = current + 1
         if trip.state == "REPLANNING":
             trip.state = "ACTIVE_TRIP"
+        db.add(
+            TripEvent(
+                trip_session_id=trip.id,
+                event_id=f"patch-{patch.id}-accepted",
+                event_type="PlanPatchAccepted",
+                payload_json=json.dumps({"patch_id": patch.id, "plan_version": current + 1}),
+                occurred_at=decided_at,
+                status="processed",
+                impact_level="none",
+                decision_json=json.dumps({"accepted": True}),
+                processed_at=decided_at,
+            )
+        )
     db.add(
         DecisionAuditLog(
             planning_run_id=run_id,

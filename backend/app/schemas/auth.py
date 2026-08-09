@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -5,7 +7,13 @@ class RegisterRequest(BaseModel):
     username: str = Field(min_length=2, max_length=20, pattern=r"^[\w\u4e00-\u9fff]+$")
     password: str = Field(min_length=6, max_length=64)
     nickname: str | None = Field(default=None, max_length=20)
+    accountType: Literal["user", "admin"] = "user"
     adminInitToken: str | None = None
+
+    @field_validator("username", mode="before")
+    @classmethod
+    def normalize_username(cls, value: str) -> str:
+        return str(value).strip()
 
     @field_validator("nickname")
     @classmethod
@@ -14,5 +22,12 @@ class RegisterRequest(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    username: str
-    password: str
+    username: str = Field(min_length=2, max_length=20)
+    password: str = Field(min_length=1, max_length=64)
+    accountType: Literal["user", "admin"] = "user"
+    adminInitToken: str | None = None
+
+    @field_validator("username", mode="before")
+    @classmethod
+    def normalize_username(cls, value: str) -> str:
+        return str(value).strip()

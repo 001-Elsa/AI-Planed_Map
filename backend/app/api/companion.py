@@ -1,7 +1,6 @@
 import asyncio
 import json
 from datetime import datetime, timedelta, timezone
-from typing import Any
 
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
@@ -21,7 +20,6 @@ from backend.app.models import (
     ExternalDataSnapshot,
     LocationSnapshot,
     PlanningRun,
-    PlanPatch,
     PlanVersion,
     Session,
     TripEvent,
@@ -48,6 +46,7 @@ from backend.app.schemas.companion import (
 from backend.app.services.agent_policy import evaluate_tool_policy
 from backend.app.services.agent_state import validate_transition
 from backend.app.services.trip_events import evaluate_trip_event
+from backend.app.services.trip_stream import publish_trip_stream
 
 router = APIRouter(prefix="/companion", tags=["companion-agent"])
 
@@ -98,6 +97,13 @@ async def create_trip_session(body: CreateTripSessionRequest, user: CurrentUser,
     )
     if run is None:
         raise AppError(404, "PLAN_RUN_NOT_FOUND", "规划记录不存在")
+    if run.status != "success":
+        raise AppError(
+            409,
+            "PLAN_NOT_EXECUTABLE",
+            "只有满足硬约束的成功计划才能开始行程",
+            {"planning_status": run.status},
+        )
     version = await db.scalar(
         select(PlanVersion)
         .where(PlanVersion.planning_run_id == run.id)
@@ -105,6 +111,17 @@ async def create_trip_session(body: CreateTripSessionRequest, user: CurrentUser,
     )
     if version is None:
         raise AppError(409, "PLAN_NOT_READY", "需要先生成正式计划")
+    snapshot = json.loads(version.snapshot_json)
+    if snapshot.get("status") != "success" or snapshot.get("planning_state") != "PLAN_READY":
+        raise AppError(
+            409,
+            "PLAN_NOT_EXECUTABLE",
+            "正式版本未处于可执行状态",
+            {
+                "status": snapshot.get("status"),
+                "planning_state": snapshot.get("planning_state"),
+            },
+        )
     existing = await db.scalar(
         select(TripSession).where(
             TripSession.planning_run_id == run.id,
@@ -329,10 +346,10 @@ async def update_location(
                 "event_type": "UserOffRoute",
             },
         )
-        await request.app.state.runtime_store.set_json(
-            f"trip-stream:{trip.id}",
+        await publish_trip_stream(
+            request.app.state.runtime_store,
+            trip.id,
             {
-                "sequence": off_route_event.id,
                 "event_id": off_route_event.event_id,
                 "type": "UserOffRoute",
                 "state": trip.state,
@@ -340,11 +357,6 @@ async def update_location(
                 "decision": json.loads(off_route_event.decision_json),
                 "occurred_at": body.captured_at.isoformat(),
             },
-            86_400,
-        )
-        await request.app.state.runtime_store.publish(
-            f"trip:{trip.id}",
-            {"type": "UserOffRoute", "trip_id": trip.id, "event_id": off_route_event.id},
         )
     return {
         "ok": True,
@@ -417,26 +429,16 @@ async def ingest_event(
         "mapgo:trip-events",
         {"trip_id": trip.id, "event_id": event.id, "event_type": body.type.value},
     )
-    await request.app.state.runtime_store.set_json(
-        f"trip-stream:{trip.id}",
+    await publish_trip_stream(
+        request.app.state.runtime_store,
+        trip.id,
         {
-            "sequence": event.id,
             "event_id": body.event_id,
             "type": body.type.value,
             "state": trip.state,
             "impact_level": decision.impact_level,
             "decision": decision_data,
             "occurred_at": body.occurred_at.isoformat(),
-        },
-        86_400,
-    )
-    await request.app.state.runtime_store.publish(
-        f"trip:{trip.id}",
-        {
-            "sequence": event.id,
-            "event_id": body.event_id,
-            "type": body.type.value,
-            "state": trip.state,
         },
     )
     return {
@@ -452,7 +454,11 @@ async def ingest_event(
 
 @router.get("/trips/{trip_id}/stream")
 async def stream_trip_events(trip_id: int, request: Request):
-    """Short-lived authenticated SSE stream; clients reconnect with Last-Event-ID."""
+    """Short-lived authenticated SSE stream over the latest trip-state snapshot.
+
+    Last-Event-ID suppresses an already-seen snapshot after reconnect; this is
+    not a durable, gap-free event log.
+    """
     authorization = request.headers.get("authorization", "")
     raw_token = authorization[7:] if authorization.startswith("Bearer ") else ""
     if not raw_token:
@@ -570,7 +576,12 @@ async def trip_summary(trip_id: int, user: CurrentUser, db: Db):
             rejected_patches += 1
     planned_stops = snapshot.get("stops", [])
     planned_ids = [stop["poi"]["id"] for stop in planned_stops]
-    planned_walk_meters = float(snapshot.get("total_distance_meters") or 0)
+    transport_mode = (snapshot.get("intent") or {}).get("transport_mode")
+    planned_walk_meters = (
+        float(snapshot.get("total_distance_meters") or 0)
+        if transport_mode == "walking"
+        else 0.0
+    )
     planned_cost = 0.0
     for stop in planned_stops:
         cost = (stop.get("poi") or {}).get("estimated_cost_yuan")
@@ -604,9 +615,7 @@ async def trip_summary(trip_id: int, user: CurrentUser, db: Db):
     if trip.started_at and trip.ended_at:
         actual_seconds = (trip.ended_at - trip.started_at).total_seconds()
     context = json.loads(trip.context_json or "{}")
-    replan_count = int(context.get("replan_count") or 0) + sum(
-        1 for event in events if event.impact_level in {"high", "critical"}
-    )
+    replan_count = int(context.get("replan_count") or 0)
     mae = sum(eta_errors) / len(eta_errors) if eta_errors else None
     lessons = []
     if skipped_ids:
@@ -746,7 +755,10 @@ async def execute_agent_tool(
         elif body.tool == "get_current_location":
             location = await db.scalar(
                 select(LocationSnapshot)
-                .where(LocationSnapshot.trip_session_id == trip.id)
+                .where(
+                    LocationSnapshot.trip_session_id == trip.id,
+                    LocationSnapshot.expires_at > now,
+                )
                 .order_by(LocationSnapshot.captured_at.desc())
             )
             output = (
@@ -879,219 +891,6 @@ async def replan_remaining_trip(
         await request.app.state.runtime_store.release_lock(f"trip-mutate:{trip.id}", lock_token)
 
 
-async def _replan_remaining_trip_locked(
-    trip_id: int,
-    body: ReplanTripRequest,
-    request: Request,
-    user: CurrentUser,
-    db: Db,
-    trip: TripSession,
-    context: dict,
-    replan_count: int,
-):
-    version = await db.scalar(
-        select(PlanVersion).where(
-            PlanVersion.planning_run_id == trip.planning_run_id,
-            PlanVersion.version == trip.current_plan_version,
-        )
-    )
-    if version is None:
-        raise AppError(409, "PLAN_VERSION_MISSING", "当前正式计划版本不存在")
-    snapshot = json.loads(version.snapshot_json)
-    completed = set(body.completed_stop_ids)
-    remaining = [stop for stop in snapshot.get("stops", []) if stop["poi"]["id"] not in completed]
-    if not remaining:
-        raise AppError(409, "NO_REMAINING_STOPS", "没有需要重规划的剩余站点")
-    from backend.app.schemas.ai_intent import Coordinate, PlanningTask, TransportMode
-    from backend.app.services.route_optimizer import optimize_route
-
-    points = [
-        body.current_location,
-        *(Coordinate.model_validate(stop["poi"]["location"]) for stop in remaining),
-    ]
-    mode = TransportMode(snapshot["intent"]["transport_mode"])
-    modes_to_try = [mode]
-    for alt in (TransportMode.driving, TransportMode.transit, TransportMode.walking):
-        if alt not in modes_to_try:
-            modes_to_try.append(alt)
-    alternatives: list[dict[str, Any]] = []
-    primary = None
-    for candidate_mode in modes_to_try[:3]:
-        try:
-            matrix = await request.app.state.map_provider.route_matrix(points, candidate_mode)
-        except Exception:  # noqa: BLE001
-            # Intentionally skip transport modes whose matrix lookup fails.
-            continue  # nosec B112
-        tasks = [PlanningTask.model_validate(stop["task"]) for stop in remaining]
-        # Drop optional (required=False) stops as a differentiated option.
-        for drop_optional in (False, True):
-            active_remaining = remaining
-            active_tasks = tasks
-            if drop_optional:
-                keep = [
-                    (stop, task)
-                    for stop, task in zip(remaining, tasks, strict=False)
-                    if task.required
-                ]
-                if len(keep) == len(remaining) or not keep:
-                    continue
-                active_remaining = [item[0] for item in keep]
-                active_tasks = [item[1] for item in keep]
-                active_points = [
-                    body.current_location,
-                    *(
-                        Coordinate.model_validate(stop["poi"]["location"])
-                        for stop in active_remaining
-                    ),
-                ]
-                matrix = await request.app.state.map_provider.route_matrix(
-                    active_points, candidate_mode
-                )
-            evaluation, algorithm = optimize_route(
-                body.current_time, active_tasks, matrix.distances, matrix.durations
-            )
-            option = {
-                "label": (
-                    f"方案{'ABC'[len(alternatives)]}"
-                    if len(alternatives) < 3
-                    else f"方案{len(alternatives) + 1}"
-                ),
-                "transport_mode": candidate_mode.value,
-                "drop_optional": drop_optional,
-                "feasible": evaluation.feasible,
-                "total_travel_seconds": evaluation.total_travel_seconds,
-                "total_distance_meters": evaluation.total_distance,
-                "conflicts": evaluation.conflicts,
-                "algorithm": algorithm,
-                "stop_ids": [active_remaining[index]["poi"]["id"] for index in evaluation.order],
-            }
-            alternatives.append(option)
-            if (
-                primary is None
-                and evaluation.feasible
-                and candidate_mode == mode
-                and not drop_optional
-            ):
-                primary = (evaluation, algorithm, active_remaining, matrix)
-            if len(alternatives) >= 3:
-                break
-        if len(alternatives) >= 3:
-            break
-
-    if primary is None:
-        # Fall back to first feasible alternative's reorder on original mode.
-        matrix = await request.app.state.map_provider.route_matrix(points, mode)
-        tasks = [PlanningTask.model_validate(stop["task"]) for stop in remaining]
-        evaluation, algorithm = optimize_route(
-            body.current_time, tasks, matrix.distances, matrix.durations
-        )
-        reordered = [remaining[index] for index in evaluation.order]
-    else:
-        evaluation, algorithm, active_remaining, matrix = primary
-        reordered = [active_remaining[index] for index in evaluation.order]
-        remaining = active_remaining
-
-    original_ids = [stop["poi"]["id"] for stop in snapshot["stops"]]
-    operations = [
-        {
-            "operation": "remove_stop",
-            "stop_id": stop_id,
-            "from_position": None,
-            "to_position": None,
-        }
-        for stop_id in original_ids
-        if stop_id in completed
-    ]
-    target_ids = [stop["poi"]["id"] for stop in reordered]
-    working = [stop_id for stop_id in original_ids if stop_id not in completed]
-    for target_position, stop_id in enumerate(target_ids):
-        if stop_id not in working:
-            continue
-        source_position = working.index(stop_id)
-        if source_position != target_position:
-            operations.append(
-                {
-                    "operation": "move_stop",
-                    "stop_id": None,
-                    "from_position": source_position,
-                    "to_position": target_position,
-                }
-            )
-            working.insert(target_position, working.pop(source_position))
-    impact = {
-        "before": {
-            "total_travel_seconds": snapshot.get("total_travel_seconds"),
-            "plan_version": trip.current_plan_version,
-        },
-        "after": {
-            "total_travel_seconds": evaluation.total_travel_seconds,
-            "total_distance_meters": evaluation.total_distance,
-            "feasible": evaluation.feasible,
-            "conflicts": evaluation.conflicts,
-        },
-        "algorithm": algorithm,
-        "alternatives": alternatives,
-        "replan_context": {
-            "origin": body.current_location.model_dump(mode="json"),
-            "departure_time": body.current_time.isoformat(),
-        },
-    }
-    context["replan_count"] = replan_count + 1
-    trip.context_json = json.dumps(context, ensure_ascii=False)
-    if not evaluation.feasible:
-        trip.state = TripState.at_risk.value
-        await db.commit()
-        return {
-            "ok": True,
-            "data": {
-                "status": "no_feasible_reorder",
-                "patch_created": False,
-                "impact": impact,
-                "alternatives": alternatives,
-                "options": [
-                    {"action": "remove_optional_stop", "requires_confirmation": True},
-                    {"action": "change_transport_mode", "requires_confirmation": True},
-                    {"action": "keep_plan", "violates_hard_constraints": True},
-                ],
-            },
-        }
-    if not operations:
-        trip.state = TripState.active_trip.value
-        await db.commit()
-        return {
-            "ok": True,
-            "data": {
-                "status": "current_order_still_optimal",
-                "patch_created": False,
-                "impact": impact,
-                "alternatives": alternatives,
-            },
-        }
-    patch = PlanPatch(
-        planning_run_id=trip.planning_run_id,
-        user_id=user.id,
-        base_version=trip.current_plan_version,
-        operations_json=json.dumps(operations, ensure_ascii=False),
-        reason=body.reason,
-        impact_json=json.dumps(impact, ensure_ascii=False),
-        status="pending",
-    )
-    db.add(patch)
-    await db.flush()
-    trip.state = TripState.replanning.value
-    await db.commit()
-    return {
-        "ok": True,
-        "data": {
-            "status": "patch_pending_confirmation",
-            "patch_created": True,
-            "patch_id": patch.id,
-            "impact": impact,
-            "alternatives": alternatives,
-        },
-    }
-
-
 @router.post("/trips/{trip_id}/pretrip-check")
 async def pretrip_check(
     trip_id: int,
@@ -1135,6 +934,7 @@ async def pretrip_check(
 
 @router.get("/privacy/export")
 async def export_private_data(user: CurrentUser, db: Db):
+    now = datetime.now(timezone.utc)
     trips = (await db.scalars(select(TripSession).where(TripSession.user_id == user.id))).all()
     trip_ids = [item.id for item in trips]
     consents = (await db.scalars(select(UserConsent).where(UserConsent.user_id == user.id))).all()
@@ -1144,7 +944,10 @@ async def export_private_data(user: CurrentUser, db: Db):
     locations = (
         (
             await db.scalars(
-                select(LocationSnapshot).where(LocationSnapshot.trip_session_id.in_(trip_ids))
+                select(LocationSnapshot).where(
+                    LocationSnapshot.trip_session_id.in_(trip_ids),
+                    LocationSnapshot.expires_at > now,
+                )
             )
         ).all()
         if trip_ids
