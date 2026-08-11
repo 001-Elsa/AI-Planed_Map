@@ -16,6 +16,6 @@ asgi-lifespan==2.1.0
 pytest-cov==6.0.0
 hypothesis==6.122.3
 redis==5.2.1
-cryptography==49.0.0
+cryptography==50.0.0
 ortools==9.15.6755
 protobuf==6.33.5
