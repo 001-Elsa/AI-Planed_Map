@@ -20,6 +20,8 @@ let eventStreamController = null;
 let lastStreamEventId = 0;
 let draftSaveTimer = null;
 let plannerCapabilities = null;
+let completedStopIds = new Set();
+let skippedStopIds = new Set();
 const PLAN_DRAFT_KEY = 'mapgo_plan_draft';
 
 /* ---------------- 生命周期 ---------------- */
@@ -87,6 +89,8 @@ function switchActiveTrip(nextTripId, trackingEnabled = false) {
     stopLocationTracking();
     stopTripEventStream();
     lastStreamEventId = 0;
+    completedStopIds = new Set();
+    skippedStopIds = new Set();
   }
   activeTripId = nextTripId;
   locationConsentGranted = Boolean(trackingEnabled);
@@ -109,7 +113,16 @@ export function bindPlanUI() {
   $('btn-plan-restore').addEventListener('click', () => runPlan());
   $('btn-plan-fold').addEventListener('click', () => {
     const folded = $('plan-body').classList.toggle('hidden');
+    $('panel-plan').classList.toggle('plan-collapsed', folded);
     $('btn-plan-fold').textContent = folded ? '展开' : '收起';
+    $('btn-plan-fold').setAttribute('aria-label', folded ? '展开计划面板' : '收起计划面板');
+    $('btn-plan-fold').setAttribute('aria-expanded', String(!folded));
+  });
+  $('btn-timeline-fold').addEventListener('click', () => {
+    const folded = $('agent-timeline').classList.toggle('timeline-collapsed');
+    $('btn-timeline-fold').textContent = folded ? '打开控制台' : '收起';
+    $('btn-timeline-fold').setAttribute('aria-label', folded ? '打开实时行程控制台' : '收起实时行程控制台');
+    $('btn-timeline-fold').setAttribute('aria-expanded', String(!folded));
   });
   $('btn-trip-start').addEventListener('click', startTrip);
   $('btn-trip-pause').addEventListener('click', pauseTrip);
@@ -480,7 +493,8 @@ function renderStructuredTimeline(result) {
     '<div><b>' + (result.candidate_count || 0) + '</b><span>候选 POI</span></div>';
   $('structured-timeline').innerHTML = result.stops.map((stop, index) => {
     const sourceClass = stop.travel.fallback_used ? 'estimated' : 'verified';
-    return '<article class="timeline-stop"><span class="timeline-no">' + (index + 1) + '</span>' +
+    return '<article class="timeline-stop" data-stop-id="' + escapeHtml(stop.poi.id) +
+      '"><span class="timeline-no">' + (index + 1) + '</span>' +
       '<div><b>' + escapeHtml(stop.poi.name) + '</b><small>' +
       escapeHtml(new Date(stop.arrival_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })) +
       ' 到达 · 停留 ' + stop.task.service_duration_minutes + ' 分钟</small>' +
@@ -489,7 +503,8 @@ function renderStructuredTimeline(result) {
       '<span class="timeline-stop-actions"><button type="button" class="small-btn btn-stop-complete" ' +
       'data-stop-id="' + escapeHtml(stop.poi.id) + '" data-planned-arrival="' +
       escapeHtml(stop.arrival_time) + '">完成</button><button type="button" class="small-btn btn-stop-skip" ' +
-      'data-stop-id="' + escapeHtml(stop.poi.id) + '">跳过</button></span></div></article>';
+      'data-stop-id="' + escapeHtml(stop.poi.id) + '">跳过</button></span>' +
+      '<span class="timeline-stop-status hidden"></span></div></article>';
   }).join('');
   $('structured-timeline').querySelectorAll('.btn-stop-complete, .btn-stop-skip').forEach((button) => {
     button.addEventListener('click', () => reportStopOutcome(button));
@@ -502,6 +517,75 @@ function renderStructuredTimeline(result) {
         .map((item) => '<p>' + escapeHtml(item) + '</p>').join('');
   } else {
     risk.classList.add('hidden');
+  }
+}
+
+function setTripFeedback(message, tone = '') {
+  const feedback = $('trip-action-feedback');
+  feedback.textContent = message || '';
+  feedback.className = 'trip-action-feedback' + (tone ? ' ' + tone : '');
+}
+
+function findTimelineStop(stopId) {
+  return [...$('structured-timeline').querySelectorAll('.timeline-stop')]
+    .find((stop) => stop.dataset.stopId === stopId) || null;
+}
+
+function paintStopOutcome(stopId, outcome) {
+  const stop = findTimelineStop(stopId);
+  if (!stop) return;
+  const completed = outcome === 'completed';
+  const skipped = outcome === 'skipped';
+  stop.classList.toggle('done', completed);
+  stop.classList.toggle('skipped', skipped);
+  const status = stop.querySelector('.timeline-stop-status');
+  status.textContent = completed ? '✓ 已完成并同步' : skipped ? '↷ 已跳过并同步' : '';
+  status.classList.toggle('hidden', !outcome);
+  stop.querySelectorAll('.timeline-stop-actions button').forEach((item) => {
+    item.disabled = Boolean(outcome);
+  });
+  const completeButton = stop.querySelector('.btn-stop-complete');
+  const skipButton = stop.querySelector('.btn-stop-skip');
+  completeButton.textContent = completed ? '已完成' : '完成';
+  skipButton.textContent = skipped ? '已跳过' : '跳过';
+}
+
+function applyTripSummary(summary) {
+  completedStopIds = new Set();
+  skippedStopIds = new Set(summary.skipped_stop_ids || []);
+  (summary.stop_deviations || []).forEach((stop) => {
+    if (stop.completed) completedStopIds.add(stop.stop_id);
+    if (stop.skipped) skippedStopIds.add(stop.stop_id);
+    paintStopOutcome(stop.stop_id, stop.skipped ? 'skipped' : stop.completed ? 'completed' : '');
+  });
+  const plannedStops = Number(summary.planned_stops || 0);
+  const processedStops = new Set([...completedStopIds, ...skippedStopIds]).size;
+  const hasRemainingStops = processedStops < plannedStops;
+  const replanButton = $('btn-trip-replan');
+  replanButton.disabled = !hasRemainingStops;
+  replanButton.textContent = hasRemainingStops ? '评估并重规划' : '没有剩余站点';
+  setTripFeedback(
+    '后端已同步：完成 ' + completedStopIds.size + ' 站，跳过 ' + skippedStopIds.size +
+    ' 站，共 ' + plannedStops + ' 站',
+    'success',
+  );
+}
+
+async function hydrateTripRuntime() {
+  if (!activeTripId) return;
+  const expectedTripId = activeTripId;
+  try {
+    const [trip, summary] = await Promise.all([
+      API.getTrip(expectedTripId),
+      API.getTripSummary(expectedTripId),
+    ]);
+    if (activeTripId !== expectedTripId) return;
+    switchActiveTrip(trip.id, trip.tracking_enabled);
+    $('trip-state-badge').textContent = trip.state;
+    setTripControls(trip.state);
+    applyTripSummary(summary);
+  } catch (error) {
+    if (activeTripId === expectedTripId) setTripFeedback('行程状态同步失败：' + error.message, 'error');
   }
 }
 
@@ -519,6 +603,7 @@ async function startTrip() {
     }
     $('trip-state-badge').textContent = 'ACTIVE_TRIP';
     setTripControls('ACTIVE_TRIP');
+    await hydrateTripRuntime();
     startTripEventStream();
     toast('随行 Agent 已启动；未授权前不会读取精确位置');
   } catch (error) { toast(error.message); }
@@ -551,23 +636,44 @@ async function finishTrip(targetState) {
 }
 
 async function reportStopOutcome(button) {
-  if (!activeTripId) { toast('请先开始行程'); return; }
+  if (!activeTripId) { setTripFeedback('请先开始行程', 'error'); toast('请先开始行程'); return; }
   const skipped = button.classList.contains('btn-stop-skip');
   const now = new Date().toISOString();
+  const stopId = button.dataset.stopId;
+  const actionButtons = [...button.closest('.timeline-stop-actions').querySelectorAll('button')];
+  actionButtons.forEach((item) => { item.disabled = true; });
+  const originalText = button.textContent;
+  button.textContent = skipped ? '正在跳过…' : '正在完成…';
+  setTripFeedback((skipped ? '正在跳过：' : '正在完成：') +
+    (button.closest('.timeline-stop').querySelector('b').textContent || stopId));
   try {
     await API.sendTripEvent(activeTripId, {
-      event_id: ((skipped ? 'skip-' : 'complete-') + Date.now() + '-' + button.dataset.stopId).slice(0, 100),
+      event_id: ((skipped ? 'stop-skip-' : 'stop-complete-') + stopId).slice(0, 100),
       type: skipped ? 'PlanStopSkipped' : 'PlanStopCompleted',
       occurred_at: now,
       payload: {
-        stop_id: button.dataset.stopId,
+        stop_id: stopId,
         planned_arrival: button.dataset.plannedArrival || null,
         arrived_at: skipped ? null : now,
       },
     });
-    button.closest('.timeline-stop').classList.add(skipped ? 'skipped' : 'done');
-    button.closest('.timeline-stop-actions').querySelectorAll('button').forEach((item) => { item.disabled = true; });
-  } catch (error) { toast(error.message); }
+    if (skipped) {
+      skippedStopIds.add(stopId);
+      completedStopIds.delete(stopId);
+    } else {
+      completedStopIds.add(stopId);
+      skippedStopIds.delete(stopId);
+    }
+    paintStopOutcome(stopId, skipped ? 'skipped' : 'completed');
+    const summary = await API.getTripSummary(activeTripId);
+    applyTripSummary(summary);
+    toast(skipped ? '该站已跳过并保存' : '该站已完成并保存');
+  } catch (error) {
+    button.textContent = originalText;
+    actionButtons.forEach((item) => { item.disabled = false; });
+    setTripFeedback('操作失败：' + error.message, 'error');
+    toast(error.message);
+  }
 }
 
 async function startTripEventStream() {
@@ -646,20 +752,51 @@ function stopTripEventStream() {
 }
 
 async function requestDynamicReplan() {
-  if (!activeTripId) return;
+  if (!activeTripId) { setTripFeedback('请先开始行程', 'error'); return; }
+  const button = $('btn-trip-replan');
+  if (button.disabled) {
+    setTripFeedback('所有站点都已完成或跳过，没有需要重规划的剩余站点。', 'success');
+    return;
+  }
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = '正在评估…';
+  setTripFeedback('正在读取已完成站点并重新计算剩余行程…');
+  let keepDisabled = false;
   const current = S.myPos || (() => {
     const center = S.map.getCenter();
     return { lng: center.lng, lat: center.lat };
   })();
   try {
+    const summary = await API.getTripSummary(activeTripId);
+    applyTripSummary(summary);
+    if (button.disabled) {
+      keepDisabled = true;
+      setTripFeedback('所有站点都已完成或跳过，没有需要重规划的剩余站点。', 'success');
+      return;
+    }
+    button.disabled = true;
+    button.textContent = '正在评估…';
     const result = await API.replanTrip(activeTripId, {
       current_location: current,
       current_time: new Date().toISOString(),
-      completed_stop_ids: [],
+      completed_stop_ids: [...completedStopIds, ...skippedStopIds],
       reason: '用户请求基于当前位置和当前时间重新评估',
     });
     renderPatchProposal(result);
-  } catch (error) { toast(error.message); }
+    setTripFeedback(result.patch_created
+      ? '后端已生成新的剩余行程方案，请确认是否应用。'
+      : '后端评估完成：当前计划无需变更。', 'success');
+    toast(result.patch_created ? '重规划方案已生成' : '评估完成，当前计划仍可执行');
+  } catch (error) {
+    setTripFeedback('重规划失败：' + error.message, 'error');
+    toast(error.message);
+  } finally {
+    if (!keepDisabled) {
+      button.disabled = false;
+      button.textContent = originalText;
+    }
+  }
 }
 
 function renderPatchProposal(result) {
@@ -698,15 +835,53 @@ async function decidePatch(patchId, accept) {
 }
 
 async function toggleLocationConsent() {
-  if (!activeTripId) { toast('请先开始行程'); return; }
+  if (!activeTripId) { setTripFeedback('请先开始行程', 'error'); toast('请先开始行程'); return; }
   const next = !locationConsentGranted;
   if (next && !confirm('允许本次行程使用精确位置？位置仅短期保存，行程结束后停止跟踪。')) return;
+  const button = $('btn-location-consent');
+  button.disabled = true;
+  button.textContent = next ? '精确定位：授权中…' : '精确定位：关闭中…';
   try {
+    let initialPosition = null;
+    if (next) {
+      if (!navigator.geolocation) throw new Error('当前浏览器不支持精确定位');
+      setTripFeedback('正在请求浏览器定位权限…');
+      initialPosition = await new Promise((resolve, reject) => {
+        navigator.geolocation.getCurrentPosition(resolve, (error) => {
+          reject(new Error(error.code === 1 ? '浏览器拒绝了定位权限' : '暂时无法取得当前位置'));
+        }, { enableHighAccuracy: true, maximumAge: 15000, timeout: 10000 });
+      });
+    }
     await API.setTripConsent(activeTripId, 'precise_location', next);
     locationConsentGranted = next;
-    $('btn-location-consent').textContent = '精确定位：' + (next ? '已授权' : '未授权');
-    if (next) startLocationTracking(); else stopLocationTracking();
-  } catch (error) { toast(error.message); }
+    button.textContent = '精确定位：' + (next ? '已授权' : '未授权');
+    if (next) {
+      const position = initialPosition;
+      await API.updateTripLocation(activeTripId, {
+        event_id: 'location-initial-' + Date.now(),
+        location: { lng: position.coords.longitude, lat: position.coords.latitude },
+        accuracy_meters: position.coords.accuracy,
+        captured_at: new Date(position.timestamp).toISOString(),
+      });
+      startLocationTracking();
+      setTripFeedback('精确定位已授权，当前位置已同步到后端。', 'success');
+      toast('精确定位已开启');
+    } else {
+      stopLocationTracking();
+      setTripFeedback('精确定位已关闭，后端不再接收位置。', 'success');
+      toast('精确定位已关闭');
+    }
+  } catch (error) {
+    if (next && locationConsentGranted) {
+      try { await API.setTripConsent(activeTripId, 'precise_location', false); } catch (_) { /* 保持原错误 */ }
+      locationConsentGranted = false;
+    }
+    button.textContent = '精确定位：' + (locationConsentGranted ? '已授权' : '未授权');
+    setTripFeedback('定位操作失败：' + error.message, 'error');
+    toast(error.message);
+  } finally {
+    button.disabled = false;
+  }
 }
 
 function startLocationTracking() {
@@ -727,7 +902,14 @@ function startLocationTracking() {
         (error.status === 403 || error.status === 409)
       ) stopLocationTracking();
     }
-  }, () => {}, { enableHighAccuracy: true, maximumAge: 15000, timeout: 10000 });
+  }, async (error) => {
+    if (error.code !== 1 || activeTripId !== trackingTripId) return;
+    stopLocationTracking();
+    locationConsentGranted = false;
+    $('btn-location-consent').textContent = '精确定位：未授权';
+    setTripFeedback('浏览器已撤销定位权限，实时位置同步已停止。', 'error');
+    try { await API.setTripConsent(trackingTripId, 'precise_location', false); } catch (_) { /* 已停止本地跟踪 */ }
+  }, { enableHighAccuracy: true, maximumAge: 15000, timeout: 10000 });
 }
 
 function stopLocationTracking() {
@@ -1028,6 +1210,7 @@ export async function loadPlanOverview() {
             $('trip-state-badge').textContent = item.trip_state;
             setTripControls(item.trip_state);
           }
+          if (item.trip_id) await hydrateTripRuntime();
           toast('已继续正式计划 v' + item.plan_version);
         } catch (error) {
           toast('恢复计划失败：' + error.message);

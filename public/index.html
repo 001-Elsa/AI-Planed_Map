@@ -318,7 +318,11 @@
       <span class="eyebrow">MAPGO COMPANION</span>
       <strong>实时行程控制台</strong>
     </div>
-    <span id="trip-state-badge" class="trip-state">PLAN_READY</span>
+    <div class="timeline-head-actions">
+      <span id="trip-state-badge" class="trip-state">PLAN_READY</span>
+      <button id="btn-timeline-fold" type="button" class="small-btn timeline-fold-btn"
+        aria-label="收起实时行程控制台" aria-expanded="true">收起</button>
+    </div>
   </div>
   <div id="timeline-proof" class="timeline-proof"></div>
   <div class="constraint-board">
@@ -331,6 +335,7 @@
   </div>
   <div id="agent-risk-card" class="agent-risk-card hidden"></div>
   <div id="plan-patch-card" class="plan-patch-card hidden"></div>
+  <div id="trip-action-feedback" class="trip-action-feedback" aria-live="polite"></div>
   <div class="timeline-actions">
     <button id="btn-trip-start" class="primary-btn">确认并开始行程</button>
     <button id="btn-trip-pause" class="small-btn hidden">暂停</button>

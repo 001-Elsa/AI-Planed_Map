@@ -101,6 +101,43 @@ def test_auth_plan_and_ai_pipeline():
         )
         assert active.json()["data"]["state"] == "ACTIVE_TRIP"
 
+        first_stop_id = payload["stops"][0]["poi"]["id"]
+        second_stop_id = payload["stops"][1]["poi"]["id"]
+        for event_id, event_type, stop_id in (
+            ("stop-complete-first", "PlanStopCompleted", first_stop_id),
+            ("stop-skip-first", "PlanStopSkipped", first_stop_id),
+            ("stop-complete-second", "PlanStopCompleted", second_stop_id),
+        ):
+            outcome = client.post(
+                f"/api/companion/trips/{trip_id}/events",
+                headers=headers,
+                json={
+                    "event_id": event_id,
+                    "type": event_type,
+                    "occurred_at": "2026-07-29T14:00:00+08:00",
+                    "payload": {
+                        "stop_id": stop_id,
+                        "planned_arrival": "2026-07-29T14:00:00+08:00",
+                        "arrived_at": (
+                            "2026-07-29T14:02:00+08:00"
+                            if event_type == "PlanStopCompleted"
+                            else None
+                        ),
+                    },
+                },
+            )
+            assert outcome.status_code == 200, outcome.text
+        progress = client.get(f"/api/companion/trips/{trip_id}/summary", headers=headers)
+        assert progress.status_code == 200, progress.text
+        progress_data = progress.json()["data"]
+        assert progress_data["completed_stops"] == 1
+        assert progress_data["skipped_stop_ids"] == [first_stop_id]
+        first_progress = next(
+            item for item in progress_data["stop_deviations"] if item["stop_id"] == first_stop_id
+        )
+        assert first_progress["completed"] is False
+        assert first_progress["skipped"] is True
+
         location_body = {
             "event_id": "location-event-0001",
             "location": {"lng": 116.397, "lat": 39.908},

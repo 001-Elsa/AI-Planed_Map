@@ -543,12 +543,12 @@ async def trip_summary(trip_id: int, user: CurrentUser, db: Db):
         await db.scalars(
             select(TripEvent)
             .where(TripEvent.trip_session_id == trip.id)
-            .order_by(TripEvent.occurred_at)
+            .order_by(TripEvent.occurred_at, TripEvent.id)
         )
     ).all()
-    completed_ids = []
-    skipped_ids = []
+    stop_outcomes: dict[str, str] = {}
     arrived_at: dict[str, str] = {}
+    planned_arrival_at: dict[str, str] = {}
     accepted_patches = 0
     rejected_patches = 0
     eta_errors: list[float] = []
@@ -557,23 +557,34 @@ async def trip_summary(trip_id: int, user: CurrentUser, db: Db):
         if event.event_type == "PlanStopCompleted":
             stop_id = payload.get("stop_id")
             if stop_id:
-                completed_ids.append(stop_id)
+                stop_outcomes[stop_id] = "completed"
                 if payload.get("arrived_at"):
                     arrived_at[stop_id] = payload["arrived_at"]
-                if payload.get("planned_arrival") and payload.get("arrived_at"):
-                    try:
-                        planned_dt = datetime.fromisoformat(payload["planned_arrival"])
-                        actual_dt = datetime.fromisoformat(payload["arrived_at"])
-                        eta_errors.append(abs((actual_dt - planned_dt).total_seconds()))
-                    except ValueError:
-                        pass
+                if payload.get("planned_arrival"):
+                    planned_arrival_at[stop_id] = payload["planned_arrival"]
         elif event.event_type == "PlanStopSkipped":
-            if payload.get("stop_id"):
-                skipped_ids.append(payload["stop_id"])
+            stop_id = payload.get("stop_id")
+            if stop_id:
+                stop_outcomes[stop_id] = "skipped"
+                arrived_at.pop(stop_id, None)
+                planned_arrival_at.pop(stop_id, None)
         elif event.event_type == "PlanPatchAccepted":
             accepted_patches += 1
         elif event.event_type == "PlanPatchRejected":
             rejected_patches += 1
+    completed_ids = [
+        stop_id for stop_id, outcome in stop_outcomes.items() if outcome == "completed"
+    ]
+    skipped_ids = [stop_id for stop_id, outcome in stop_outcomes.items() if outcome == "skipped"]
+    for stop_id in completed_ids:
+        if stop_id not in planned_arrival_at or stop_id not in arrived_at:
+            continue
+        try:
+            planned_dt = datetime.fromisoformat(planned_arrival_at[stop_id])
+            actual_dt = datetime.fromisoformat(arrived_at[stop_id])
+            eta_errors.append(abs((actual_dt - planned_dt).total_seconds()))
+        except ValueError:
+            pass
     planned_stops = snapshot.get("stops", [])
     planned_ids = [stop["poi"]["id"] for stop in planned_stops]
     transport_mode = (snapshot.get("intent") or {}).get("transport_mode")
