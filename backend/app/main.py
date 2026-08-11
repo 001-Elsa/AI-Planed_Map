@@ -6,6 +6,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from typing import Any, cast
 
 import httpx
 from fastapi import FastAPI, Request
@@ -252,7 +253,7 @@ async def request_context(request: Request, call_next):
 # buffer remains the outermost application wrapper. Otherwise Starlette can turn
 # a streaming overflow into a generic JSON parse error before it reaches us.
 app.add_middleware(
-    RequestBodyLimitMiddleware,  # type: ignore[arg-type]
+    cast(Any, RequestBodyLimitMiddleware),
     max_bytes=settings.max_request_bytes,
 )
 
