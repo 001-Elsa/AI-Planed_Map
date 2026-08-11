@@ -73,3 +73,22 @@ def test_public_transit_words_select_mode_without_polluting_place_names():
         "陈家祠",
         "北京路步行街",
     ]
+
+
+def test_joined_optimization_clause_does_not_become_a_fake_place():
+    intent = asyncio.run(
+        RuleBasedIntentParser().parse(
+            "坐公共交通去广州塔，然后乘公交到陈家祠，再换乘去北京路步行街，"
+            "最后去广东省博物馆，尽量少走路并要求最短时间"
+        )
+    )
+
+    assert intent.transport_mode == TransportMode.transit
+    assert intent.preferences.minimize_walking
+    assert intent.preferences.optimization_goal == "shortest_time"
+    assert [task.location_name for task in intent.tasks] == [
+        "广州塔",
+        "陈家祠",
+        "北京路步行街",
+        "广东省博物馆",
+    ]

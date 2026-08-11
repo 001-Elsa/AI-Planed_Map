@@ -167,6 +167,18 @@ class RuleBasedIntentParser:
         for piece in pieces:
             if not piece or piece in ignored:
                 continue
+            # A trailing optimization clause is often joined to the last stop with
+            # “并/而且/同时”, for example “最后去博物馆，并要求最短时间”.  Keep
+            # those words in the preference model, but never send “并要求” to POI
+            # search as if it were another place.  The look-ahead avoids damaging
+            # legitimate POI names that happen to start with “并”.
+            piece = re.sub(
+                r"^(?:并且|并|且|而且|同时|另外|此外)(?=(?:要求|希望|需要|请|尽量|优先|最好|要))",
+                "",
+                piece,
+            ).strip()
+            if not piece or piece in ignored:
+                continue
             piece = re.sub(
                 r"^(?:\d{1,2}|[一二三四五六七八九十]+)[.、)）]\s*",
                 "",
@@ -208,7 +220,10 @@ class RuleBasedIntentParser:
                 piece,
             ).strip()
             location = self._location_from_action(location)
-            if location in {"要求", "希望", "需要", "请安排", "帮我安排"}:
+            if re.fullmatch(
+                r"(?:并且|并|且|而且|同时|另外|此外)?(?:要求|希望|需要|要|请安排|帮我安排)",
+                location,
+            ):
                 location = ""
             if location:
                 tasks.append(
