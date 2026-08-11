@@ -1,5 +1,6 @@
 import asyncio
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
@@ -65,6 +66,10 @@ def test_streaming_body_limit_and_amap_proxy_allowlist():
         assert denied.json()["code"] == "AMAP_PATH_DENIED"
 
 
+@pytest.mark.skipif(
+    engine.dialect.name != "sqlite",
+    reason="SQLite PRAGMA is only valid for the SQLite test database",
+)
 def test_sqlite_connections_enable_foreign_keys():
     async def check() -> int:
         async with engine.connect() as connection:

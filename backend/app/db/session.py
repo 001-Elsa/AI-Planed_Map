@@ -27,6 +27,7 @@ SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 
 if settings.database_url.startswith("sqlite"):
+
     @event.listens_for(engine.sync_engine, "connect")
     def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
         cursor = dbapi_connection.cursor()

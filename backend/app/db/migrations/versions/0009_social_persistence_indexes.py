@@ -28,7 +28,9 @@ def upgrade() -> None:
     )
     kept_by_pair: dict[str, int] = {}
     for row in rows:
-        pair_key = f"{min(row['user_id'], row['friend_id'])}:{max(row['user_id'], row['friend_id'])}"
+        pair_key = (
+            f"{min(row['user_id'], row['friend_id'])}:{max(row['user_id'], row['friend_id'])}"
+        )
         if pair_key in kept_by_pair:
             connection.execute(
                 sa.text("DELETE FROM friends WHERE id = :id"),

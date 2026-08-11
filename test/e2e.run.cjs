@@ -51,7 +51,9 @@ function run(cmd, args, env, cwd) {
     PORT: String(PORT),
     DATABASE_URL: 'sqlite+aiosqlite:///' + dbPath,
     ENVIRONMENT: 'test',
-    MOCK_MAP_PROVIDER: 'true',
+    // Start without credentials, but allow the admin Key flow to switch the
+    // runtime from the automatic mock fallback to the real AMap provider.
+    MOCK_MAP_PROVIDER: 'false',
     MOCK_WEATHER_PROVIDER: 'true',
     REDIS_URL: '',
     LLM_API_KEY: '',

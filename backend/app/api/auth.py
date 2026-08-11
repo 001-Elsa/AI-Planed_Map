@@ -138,8 +138,10 @@ async def login(
     if body.accountType == "admin":
         if not user.is_admin:
             raise AppError(403, "ADMIN_ACCOUNT_REQUIRED", "该账号不是管理员账号")
-        if not settings.admin_init_token or not body.adminInitToken or not secrets.compare_digest(
-            body.adminInitToken, settings.admin_init_token
+        if (
+            not settings.admin_init_token
+            or not body.adminInitToken
+            or not secrets.compare_digest(body.adminInitToken, settings.admin_init_token)
         ):
             raise AppError(403, "ADMIN_INIT_INVALID", "管理员初始化令牌不正确")
     elif user.is_admin:

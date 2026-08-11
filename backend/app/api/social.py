@@ -152,15 +152,15 @@ async def list_friends(user: CurrentUser, db: Db):
             )
         ).all()
     )
-    other_ids = {
-        row.friend_id if row.user_id == user.id else row.user_id for row in rows
-    }
-    people = {
-        person.id: person
-        for person in (
-            await db.scalars(select(User).where(User.id.in_(other_ids)))
-        ).all()
-    } if other_ids else {}
+    other_ids = {row.friend_id if row.user_id == user.id else row.user_id for row in rows}
+    people = (
+        {
+            person.id: person
+            for person in (await db.scalars(select(User).where(User.id.in_(other_ids)))).all()
+        }
+        if other_ids
+        else {}
+    )
     accepted, incoming, outgoing = [], [], []
     for row in rows:
         other_id = row.friend_id if row.user_id == user.id else row.user_id
@@ -269,22 +269,23 @@ async def leaderboard(
             )
         ).all()
     )
-    user_ids = list(dict.fromkeys([user.id] + [
-        row.friend_id if row.user_id == user.id else row.user_id for row in relations
-    ]))
+    user_ids = list(
+        dict.fromkeys(
+            [user.id]
+            + [row.friend_id if row.user_id == user.id else row.user_id for row in relations]
+        )
+    )
     now_local = datetime.now(SHANGHAI)
     period_start_date = now_local.date() - timedelta(days=days - 1)
-    period_start = datetime.combine(
-        period_start_date, datetime.min.time(), SHANGHAI
-    ).astimezone(timezone.utc)
+    period_start = datetime.combine(period_start_date, datetime.min.time(), SHANGHAI).astimezone(
+        timezone.utc
+    )
     period_end = datetime.combine(
         now_local.date() + timedelta(days=1), datetime.min.time(), SHANGHAI
     ).astimezone(timezone.utc)
     people = {
         person.id: person
-        for person in (
-            await db.scalars(select(User).where(User.id.in_(user_ids)))
-        ).all()
+        for person in (await db.scalars(select(User).where(User.id.in_(user_ids)))).all()
     }
     track_rows = (
         await db.execute(
@@ -301,8 +302,7 @@ async def leaderboard(
         )
     ).all()
     totals: dict[int, dict[str, Any]] = {
-        user_id: {"distance": 0.0, "duration": 0.0, "count": 0, "daily": {}}
-        for user_id in user_ids
+        user_id: {"distance": 0.0, "duration": 0.0, "count": 0, "daily": {}} for user_id in user_ids
     }
     for user_id, distance, duration, created_at in track_rows:
         total = totals[user_id]
@@ -327,8 +327,7 @@ async def leaderboard(
                 "duration": total["duration"],
                 "count": total["count"],
                 "daily": [
-                    {"date": day, **values}
-                    for day, values in sorted(total["daily"].items())
+                    {"date": day, **values} for day, values in sorted(total["daily"].items())
                 ],
             }
         )

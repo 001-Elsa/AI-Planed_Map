@@ -263,7 +263,9 @@ async def stats(user: CurrentUser, db: Db):
             )
         )
     ).all()
-    weekly_buckets = {start: {"distance": 0.0, "duration": 0.0, "count": 0} for start in week_starts}
+    weekly_buckets = {
+        start: {"distance": 0.0, "duration": 0.0, "count": 0} for start in week_starts
+    }
     daily_buckets: dict[date, dict[str, float | int]] = {}
     for distance, duration, created_at in activity_rows:
         day = local_date(created_at)
@@ -277,12 +279,13 @@ async def stats(user: CurrentUser, db: Db):
         bucket["duration"] += float(duration or 0)
         bucket["count"] += 1
 
-    weekly = [
-        {"week": start.isoformat(), **values} for start, values in weekly_buckets.items()
-    ]
+    weekly = [{"week": start.isoformat(), **values} for start, values in weekly_buckets.items()]
     last_30_days = [today - timedelta(days=offset) for offset in range(29, -1, -1)]
     daily = [
-        {"date": day.isoformat(), **daily_buckets.get(day, {"distance": 0, "duration": 0, "count": 0})}
+        {
+            "date": day.isoformat(),
+            **daily_buckets.get(day, {"distance": 0, "duration": 0, "count": 0}),
+        }
         for day in last_30_days
     ]
     activity_days = set(daily_buckets)
@@ -328,8 +331,7 @@ async def stats(user: CurrentUser, db: Db):
                 "tracks": sum(item["count"] for item in by_kind),
             },
             "favoritesByMode": [
-                {"mode": mode or "other", "count": int(total)}
-                for mode, total in favorite_mode_rows
+                {"mode": mode or "other", "count": int(total)} for mode, total in favorite_mode_rows
             ],
             "recentCheckins": [row_dict(row) for row in recent_checkins],
             "since": user.created_at.isoformat(sep=" "),

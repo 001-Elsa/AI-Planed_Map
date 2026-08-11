@@ -87,7 +87,9 @@ async def lifespan(application: FastAPI):
             "",
             "replace-with-secret-manager-value-in-production",
         }:
-            raise RuntimeError("a non-placeholder LOCATION_ENCRYPTION_KEY is required in production")
+            raise RuntimeError(
+                "a non-placeholder LOCATION_ENCRYPTION_KEY is required in production"
+            )
         if settings.admin_init_token in {"", "change_this_before_production"}:
             raise RuntimeError("a non-placeholder ADMIN_INIT_TOKEN is required in production")
     await check_database()
@@ -160,9 +162,7 @@ async def request_context(request: Request, call_next):
             if path in {"/api/login", "/api/register"}
             else settings.api_ip_requests_per_minute
         )
-        ip_count = await request.app.state.runtime_store.increment(
-            f"rate:api-ip:{ip_digest}", 60
-        )
+        ip_count = await request.app.state.runtime_store.increment(f"rate:api-ip:{ip_digest}", 60)
 
         authorization = request.headers.get("authorization", "")
         if path in {"/api/login", "/api/register"}:

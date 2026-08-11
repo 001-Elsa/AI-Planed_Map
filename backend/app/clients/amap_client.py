@@ -439,7 +439,9 @@ class AMapProvider(MockMapProvider):
             unique.setdefault(key, candidate)
         unique_candidates = list(unique.values())
         strong_named_matches = [
-            item for item in unique_candidates if _poi_name_match_bucket(search_keyword, item)[0] <= 1
+            item
+            for item in unique_candidates
+            if _poi_name_match_bucket(search_keyword, item)[0] <= 1
         ]
         if strong_named_matches and not type_code:
             unique_candidates = strong_named_matches

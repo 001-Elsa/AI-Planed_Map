@@ -70,9 +70,7 @@ class Settings(BaseSettings):
 
     @property
     def use_mock_map(self) -> bool:
-        has_real_credentials = bool(
-            self.amap_web_key or (self.amap_key and self.amap_jscode)
-        )
+        has_real_credentials = bool(self.amap_web_key or (self.amap_key and self.amap_jscode))
         return self.mock_map_provider or not has_real_credentials
 
 

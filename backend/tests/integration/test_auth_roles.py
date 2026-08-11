@@ -96,4 +96,3 @@ async def test_admin_auth_requires_role_selection_and_token(async_client):
         assert admin_login.status_code == 200, admin_login.text
     finally:
         settings.admin_init_token = original_token
-

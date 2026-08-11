@@ -29,21 +29,27 @@ def test_location_backfill_encrypts_plaintext_and_removes_incomplete_rows(monkey
 
         migration.upgrade()
 
-        rows = connection.execute(
-            sa.text(
-                "SELECT id, longitude, latitude, encrypted_payload "
-                "FROM location_snapshots ORDER BY id"
+        rows = (
+            connection.execute(
+                sa.text(
+                    "SELECT id, longitude, latitude, encrypted_payload "
+                    "FROM location_snapshots ORDER BY id"
+                )
             )
-        ).mappings().all()
+            .mappings()
+            .all()
+        )
         assert len(rows) == 1
         assert rows[0]["longitude"] is None
         assert rows[0]["latitude"] is None
         assert decrypt_location(rows[0]["encrypted_payload"]) == (116.397, 39.908)
 
         migration.downgrade()
-        restored = connection.execute(
-            sa.text(
-                "SELECT longitude, latitude FROM location_snapshots WHERE id = 1"
+        restored = (
+            connection.execute(
+                sa.text("SELECT longitude, latitude FROM location_snapshots WHERE id = 1")
             )
-        ).mappings().one()
+            .mappings()
+            .one()
+        )
         assert restored == {"longitude": 116.397, "latitude": 39.908}

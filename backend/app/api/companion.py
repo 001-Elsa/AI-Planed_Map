@@ -578,9 +578,7 @@ async def trip_summary(trip_id: int, user: CurrentUser, db: Db):
     planned_ids = [stop["poi"]["id"] for stop in planned_stops]
     transport_mode = (snapshot.get("intent") or {}).get("transport_mode")
     planned_walk_meters = (
-        float(snapshot.get("total_distance_meters") or 0)
-        if transport_mode == "walking"
-        else 0.0
+        float(snapshot.get("total_distance_meters") or 0) if transport_mode == "walking" else 0.0
     )
     planned_cost = 0.0
     for stop in planned_stops:
