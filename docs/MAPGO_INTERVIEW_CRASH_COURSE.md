@@ -297,7 +297,7 @@ sequenceDiagram
 
 ### 5.2 第二步：LLM 只抽取意图
 
-代码：`backend/app/services/intent_parser.py` 第 150～215 行。
+代码：`backend/app/services/intent_parser.py` 的 `OpenAICompatibleIntentParser`。
 
 关键点：
 
@@ -336,7 +336,7 @@ sequenceDiagram
 
 ### 5.3 第三步：LLM 故障降级
 
-代码：`backend/app/services/intent_parser.py` 第 218～260 行。
+代码：`backend/app/services/intent_parser.py` 的 `FallbackIntentParser` 与 `RuleBasedIntentParser`。
 
 `FallbackIntentParser` 捕获主 Parser 的任意故障，改用规则解析器，并写入：
 
@@ -356,10 +356,10 @@ safety_buffer_minutes = 10
 
 代码：
 
-- 问题选择：`backend/app/services/clarification.py` 第 23～179 行。
-- 答案应用：同文件第 182～250 行。
-- 会话 revision 检查：`backend/app/api/ai_planner.py` 第 180～238 行。
-- 答案进入真实意图：`backend/app/services/planning_service.py` 第 54～93 行。
+- 问题选择：`backend/app/services/clarification.py` 的 `select_clarification_questions()`。
+- 答案应用：同文件的 `apply_clarification_answer()`。
+- 会话 revision 检查：`backend/app/api/ai_planner.py` 的 `continue_planning_conversation()`。
+- 答案进入真实意图：同文件的 `_execute_conversation_plan()` 与 `PlanningService.plan()`。
 
 澄清问题最多返回 3 个，必填问题排在可选偏好之前。`base_revision` 用于阻止用户基于旧会话状态提交答案。
 
@@ -371,7 +371,7 @@ safety_buffer_minutes = 10
 
 ### 5.5 第五步：并发召回候选 POI
 
-代码：`backend/app/services/planning_service.py` 第 128～199 行。
+代码：`backend/app/services/planning_service.py` 的 `PlanningService._search_candidates()` 与 `PlanningService.plan()`。
 
 ```python
 search_results = await asyncio.gather(
@@ -389,7 +389,7 @@ search_results = await asyncio.gather(
 
 ### 5.6 第六步：构建正式 RouteMatrix
 
-代码：`backend/app/clients/amap_client.py` 第 228～278 行。
+代码：`backend/app/clients/amap_client.py` 各 `MapProvider.route_matrix()` 实现。
 
 每条 `RouteEdge` 都包含：
 
@@ -411,7 +411,7 @@ search_results = await asyncio.gather(
 
 ### 5.7 第七步：调用联合求解器
 
-代码：`backend/app/services/planning_service.py` 第 201～238 行。
+代码：`backend/app/services/planning_service.py` 的 `PlanningService.plan()`。
 
 系统把每个 POI 转成 `CandidateNode`，其中保留任务下标、候选排名、矩阵下标、评分、费用、营业、无障碍和行政区信息，然后交给 `optimize_joint_route()`。
 
@@ -419,8 +419,8 @@ search_results = await asyncio.gather(
 
 代码：
 
-- 结果生成：`backend/app/services/planning_service.py` 第 240～335 行。
-- Run 和 V1：`backend/app/api/ai_planner.py` 第 342～376 行。
+- 结果生成：`backend/app/services/planning_service.py` 的 `PlanningService.plan()`。
+- Run 和 V1：`backend/app/api/ai_planner.py` 的 `_execute_conversation_plan()` 与 `create_ai_plan()`。
 
 `PlanningRun` 保存输入、Parser、Prompt、Provider、Token、费用和 Trace；只要不处于澄清状态，系统就保存 Version 1，包括成功或不可行快照。
 
@@ -495,7 +495,7 @@ flowchart TD
 
 ### 6.4 Exact 精确枚举
 
-代码：`backend/app/services/route_optimizer.py` 第 444～450 行。
+代码：`backend/app/services/route_optimizer.py` 的 `optimize_joint_route()` 精确枚举分支。
 
 ```python
 for selection in product(*candidate_groups):
@@ -514,7 +514,7 @@ for selection in product(*candidate_groups):
 
 ### 6.5 Beam Search
 
-代码：`backend/app/services/route_optimizer.py` 第 273～302 行。
+代码：`backend/app/services/route_optimizer.py` 的 `_beam_joint()`。
 
 一个 Beam 状态保存：
 
@@ -535,7 +535,7 @@ for selection in product(*candidate_groups):
 
 ### 6.6 OR-Tools 建模
 
-代码：`backend/app/services/route_optimizer.py` 第 305～401 行。
+代码：`backend/app/services/route_optimizer.py` 的 `_ortools_joint()`。
 
 关键概念：
 
@@ -552,11 +552,11 @@ for selection in product(*candidate_groups):
 
 ##### 答案
 
-> 预约表示固定到达时刻。早到可以等待，因此把 cursor 推进到 appointment_time；晚到意味着错过预约，必须产生硬约束冲突。对应代码在 `evaluate_joint_order()` 第 89～98 行。
+> 预约表示固定到达时刻。早到可以等待，因此把 cursor 推进到 appointment_time；晚到意味着错过预约，必须产生硬约束冲突。对应代码在 `evaluate_joint_order()` 的预约时间分支。
 
 ### 6.7 硬约束验证清单
 
-代码：`backend/app/services/route_optimizer.py` 第 77～210 行。
+代码：`backend/app/services/route_optimizer.py` 的 `evaluate_joint_order()`。
 
 | 约束 | 代码行为 |
 |---|---|
@@ -584,7 +584,7 @@ for selection in product(*candidate_groups):
 
 ### 6.8 软目标评分
 
-代码：`backend/app/services/route_optimizer.py` 第 212～265 行。
+代码：`backend/app/services/route_optimizer.py` 的 `evaluate_joint_order()` 与 `_evaluation_key()`。
 
 ```text
 total = travel_time
@@ -648,10 +648,10 @@ stateDiagram-v2
 
 核心模型：
 
-- `PlanningRun`：`backend/app/models.py` 第 68～87 行。
-- `PlanVersion`：第 125～137 行。
-- `PlanPatch`：第 140～154 行。
-- `DecisionAuditLog`：第 157～170 行。
+- `PlanningRun`：`backend/app/models.py` 的同名 ORM 类。
+- `PlanVersion`：同文件的同名 ORM 类。
+- `PlanPatch`：同文件的同名 ORM 类。
+- `DecisionAuditLog`：同文件的同名 ORM 类。
 
 优点：
 
@@ -703,7 +703,7 @@ patch.base_version == 当前 max(version) 才能应用
 
 ### 7.5 Patch 当前可执行的操作
 
-代码：`backend/app/schemas/ai_intent.py` 第 256～269 行。
+代码：`backend/app/schemas/ai_intent.py` 的 `PlanPatchOperation`。
 
 ```text
 remove_stop
@@ -712,9 +712,9 @@ replace_stop
 change_transport_mode
 ```
 
-结构修改：`backend/app/api/ai_planner.py` 第 571～615 行。  
-重新计算：同文件第 618～695 行。  
-最终决策：同文件第 698～828 行。
+- 结构修改：`backend/app/api/ai_planner.py` 的 `_apply_structure()`。
+- 重新计算：同文件的 `_recalculate_snapshot()`。
+- 最终决策：同文件的 `decide_plan_patch()`。
 
 ### 7.6 Patch 验证的真实不足
 
@@ -811,7 +811,7 @@ sequenceDiagram
 {"action": "finish", "tool": null, "arguments": {}, "reason": "处理完成"}
 ```
 
-代码：`backend/app/services/agent_decider.py` 第 21～35 行。
+代码：`backend/app/services/agent_decider.py` 的 `AgentDecision`。
 
 ### 9.2 三层安全边界
 
@@ -827,7 +827,7 @@ sequenceDiagram
 
 ### 9.3 工具策略表
 
-代码：`backend/app/services/agent_policy.py` 第 13～65 行。
+代码：`backend/app/services/agent_policy.py` 的 `TOOL_POLICIES` 与 `evaluate_tool_policy()`。
 
 | 工具 | 关键限制 |
 |---|---|
@@ -843,7 +843,7 @@ sequenceDiagram
 
 ### 9.4 有界工具循环
 
-代码：`backend/app/services/agent_controller.py` 第 29～198 行。
+代码：`backend/app/services/agent_controller.py` 的 `AgentController.run_once()`。
 
 限制包括：
 
@@ -863,7 +863,7 @@ sequenceDiagram
 
 ### 9.5 RuleBasedAgentDecider 不是另一个系统
 
-代码：`backend/app/services/agent_decider.py` 第 57～115 行。
+代码：`backend/app/services/agent_decider.py` 的 `RuleBasedAgentDecider`。
 
 它仍走相同的 Controller、Policy、Tool 和审计边界，只是决策来自规则：
 
@@ -883,7 +883,7 @@ sequenceDiagram
 
 ### 9.6 动态重规划如何选择方案
 
-代码：`backend/app/services/replanning.py` 第 117～393 行。
+代码：`backend/app/services/replanning.py` 的 `create_pending_replan()`。
 
 步骤：
 
@@ -926,12 +926,14 @@ flowchart LR
 
 ### 10.1 RuntimeStore 抽象
 
-代码：`backend/app/infrastructure/runtime_store.py` 第 9～29 行。
+代码：`backend/app/infrastructure/runtime_store.py` 的 `RuntimeStore` Protocol 及两个实现类。
 
 同一套 Protocol 有两个实现：
 
 - `InMemoryRuntimeStore`：本地和测试方便，但进程重启丢数据，不能多实例共享。
 - `RedisRuntimeStore`：生产运行时能力，多实例共享。
+
+内存实现不是无限字典：JSON 状态限制条目数和序列化后的总字节数，超限时先清理过期值再淘汰旧值；计数器 key 数也有上限，达到上限后新 key 返回超限值，让调用方按“已超过预算”处理，而不是淘汰活跃限流记录后给攻击者重置预算。
 
 ### 问题：为什么不在业务代码中直接到处调用 Redis Client？
 
@@ -958,7 +960,7 @@ EXPIRE key ttl NX
 
 ### 10.3 延迟重试和 DLQ
 
-代码：`runtime_store.py` 第 167～199 行。
+代码：`runtime_store.py` 的 `enqueue_retry()` 与 Redis `promote_retries()`。
 
 - 重试延迟：`min(300, 2**attempt)` 秒。
 - 未到期任务存入 ZSET。
@@ -1009,7 +1011,7 @@ SET lock:name random_token NX EX 30
 
 ### 10.6 SSE 实现和边界
 
-代码：`backend/app/api/companion.py` 第 453～510 行。
+代码：`backend/app/api/companion.py` 的 `stream_trip_events()`。
 
 行为：
 
@@ -1039,7 +1041,7 @@ SET lock:name random_token NX EX 30
 
 ### 11.1 Provider 接口
 
-代码：`backend/app/clients/amap_client.py` 第 22～29 行。
+代码：`backend/app/clients/amap_client.py` 的 `MapProvider` Protocol。
 
 ```text
 search_poi(keyword, origin, city)
@@ -1060,7 +1062,7 @@ Haversine 根据两个经纬度计算地球表面大圆距离。它是直线近�
 
 ### 11.3 上游保护链
 
-代码：`amap_client.py` 第 104～188 行。
+代码：`amap_client.py` 的 `AMapProvider._get()`、熔断状态方法和并发信号量。
 
 ```text
 Semaphore(8)
@@ -1117,9 +1119,10 @@ flowchart TB
 
 ### 12.1 密码安全
 
-代码：`backend/app/core/security.py` 第 8～35 行。
+代码：`backend/app/core/security.py` 的 `_derive()`、`hash_password()` 与 `verify_password()`。
 
 - 随机生成 16 字节 salt。
+- 注册入口要求密码长度为 8～64 个字符；登录请求只做 1～64 个字符的传输层校验，实际凭据是否有效仍由 scrypt 验证。
 - 使用 scrypt：`n=16384, r=8, p=1, dklen=64`。
 - CPU/内存密集计算通过 `asyncio.to_thread` 避免阻塞事件循环。
 - 校验使用 `hmac.compare_digest`。
@@ -1134,11 +1137,13 @@ flowchart TB
 
 代码：
 
-- Token 生成与哈希：`security.py` 第 38～43 行。
-- Session 模型：`backend/app/models.py` 第 27～36 行。
+- Token 生成与哈希：`security.py` 的 `new_session_token()` 与 `token_hash()`。
+- Session 模型：`backend/app/models.py` 的 `Session` ORM 类。
 - 鉴权依赖：`backend/app/api/deps.py`。
 
 客户端拿到 64 位十六进制随机 Token；数据库只保存 SHA-256 后的 token id。
+
+公开分享 token 与登录 Session 分离：新分享使用 128 bit、32 位十六进制 capability token；数据库为兼容历史链接仍可读取旧 16 位 token，分享读取另有 180 天 TTL。
 
 ### 问题：Session 和 JWT 怎么选？
 
@@ -1148,16 +1153,16 @@ flowchart TB
 
 ### 继续追问：首个管理员如何安全初始化？
 
-> 不能只用“用户数为 0”就把首个注册者设为管理员，否则默认部署暴露后可能被抢占，而且并发首次注册可能产生竞态。当前 Compose 默认按 production 启动并强制提供 `ADMIN_INIT_TOKEN`；注册时先获取 RuntimeStore 锁，再在 PostgreSQL 使用事务级 advisory lock、SQLite 使用 `BEGIN IMMEDIATE`，把“检查首个用户并插入”串行化。更严格的生产方案可以完全移除公开注册初始化，改成独立运维命令。
+> 当前实现不按“首个注册者”自动授予管理员权限，因此不存在首用户竞争。普通用户注册不需要初始化令牌；只有显式选择 `accountType=admin` 的注册和登录才同时要求服务端已配置 `ADMIN_INIT_TOKEN`，并用常量时间比较校验客户端提交值。更严格的生产方案可以完全移除公开管理员注册，改成独立运维命令。
 
 ### 12.3 精确位置保护
 
 代码：
 
-- 加密：`backend/app/core/privacy.py` 第 11～40 行。
-- Consent：`backend/app/api/companion.py` 第 182～199 行。
-- 位置写入：同文件第 202～357 行。
-- 过期删除：`backend/app/worker.py` 第 36～44 行。
+- 加密：`backend/app/core/privacy.py` 的 `encrypt_location()`、`decrypt_location()` 与 `read_location()`。
+- Consent：`backend/app/api/companion.py` 的 `set_consent()`。
+- 位置写入：同文件的 `update_location()`。
+- 过期删除：`backend/app/worker.py` 的 `cleanup_expired_locations()`。
 
 规则：
 
@@ -1181,13 +1186,13 @@ flowchart TB
 
 代码：`backend/app/main.py` 的 `amap_security_proxy()`。
 
-前端请求 `/_AMapService/...`，服务端只允许明确列出的地点、路线、天气、地理编码接口，并且只接受 GET/POST；代理有独立 IP 固定窗口限流、全局请求体上限和上游响应体上限。服务端从环境或数据库读取 jscode，附加后只转发到固定高德域名，jscode 不返回浏览器。
+前端请求 `/_AMapService/...`，服务端只允许明确列出的地点、路线、天气、地理编码接口，并且只接受 GET/POST；代理有独立 IP 固定窗口限流、全局请求体上限和上游响应体上限。可缓存 GET 使用去除密钥参数后的稳定摘要作为 key，只有高德返回成功 JSON 且响应不超过独立的 `AMAP_PROXY_MAX_CACHE_BYTES` 才写缓存。服务端从环境或数据库读取 jscode，附加后只转发到固定高德域名，jscode 不返回浏览器。
 
 ### 问题：这个代理还要防什么？
 
 #### 答案
 
-> 当前已经固定上游域名、使用精确路径白名单、限制方法、请求/响应体和每 IP 速率，因此不能被当成通用转发代理。进一步生产化仍应增加项目级日额度、异常流量告警、域名来源策略和更严格的响应头过滤。
+> 当前已经固定上游域名、使用精确路径白名单、限制方法、请求/响应体、可缓存响应大小和每 IP 速率，因此不能被当成通用转发代理，也不能用大成功响应无限挤占缓存。进一步生产化仍应增加项目级日额度、异常流量告警、域名来源策略和更严格的响应头过滤。
 
 ---
 
@@ -1245,7 +1250,7 @@ flowchart TB
 
 代码：
 
-- Trace/Request ID 和结构化日志：`backend/app/main.py` 第 69～142 行。
+- Trace/Request ID、限流、安全响应头和结构化日志：`backend/app/main.py` 的 `_correlation_id()` 与 `request_context()`。
 - Prometheus Registry：`backend/app/core/observability.py`。
 - Grafana：`infrastructure/grafana/`。
 
@@ -1359,7 +1364,7 @@ python -m uvicorn backend.app.main:app --reload --port 3000
 
 #### 读什么
 
-- `backend/app/api/ai_planner.py` 第 38～377 行。
+- `backend/app/api/ai_planner.py` 的规划会话与 `_execute_conversation_plan()` 路径。
 - `backend/app/services/planning_service.py` 全文件。
 - `backend/app/services/clarification.py`。
 
@@ -1445,8 +1450,8 @@ python -m uvicorn backend.app.main:app --reload --port 3000
 
 #### 读什么
 
-- `backend/app/models.py` 第 68～170 行。
-- `backend/app/api/ai_planner.py` 第 514～828 行。
+- `backend/app/models.py` 的 `PlanningRun`、`PlanVersion`、`PlanPatch` 与 `DecisionAuditLog`。
+- `backend/app/api/ai_planner.py` 的版本、Patch 结构修改、重算与决策路径。
 - `docs/adr/0001-deterministic-planning-boundary.md`。
 
 #### 怎么做
@@ -1508,7 +1513,7 @@ python -m uvicorn backend.app.main:app --reload --port 3000
 - `backend/app/infrastructure/runtime_store.py`
 - `backend/app/worker.py`
 - `backend/app/clients/amap_client.py`
-- `backend/app/api/companion.py` 第 453～510 行。
+- `backend/app/api/companion.py` 的 `stream_trip_events()`。
 
 #### 怎么做
 
@@ -1800,7 +1805,7 @@ python -m uvicorn backend.app.main:app --reload --port 3000
 
 ### 17.2 特别注意 2-opt 兼容标签
 
-`backend/app/services/route_optimizer.py` 第 478 行保留了 `optimize_route()` 兼容入口。它把当前联合求解器的非精确算法标签映射成 `nearest-neighbor+2-opt`，但底层实际上仍调用 `optimize_joint_route()`。这是历史兼容返回值，不代表当前主实现真的执行 2-opt。
+`backend/app/services/route_optimizer.py` 保留了 `optimize_route()` 兼容入口。它把当前联合求解器的非精确算法标签映射成 `nearest-neighbor+2-opt`，但底层实际上仍调用 `optimize_joint_route()`。这是历史兼容返回值，不代表当前主实现真的执行 2-opt。
 
 ### 问题：如果面试官发现文档和代码不一致怎么办？
 

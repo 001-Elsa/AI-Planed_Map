@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[3]
 
 class Settings(BaseSettings):
     app_name: str = "MapGo AI Planner"
-    app_version: str = "6.0.0"
+    app_version: str = "7.0.0"
     environment: str = "development"
     database_url: str = f"sqlite+aiosqlite:///{(ROOT / 'data' / 'mapgo-python.db').as_posix()}"
     database_pool_size: int = 20
@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     amap_web_key: str = ""
     amap_key: str = ""
     amap_jscode: str = ""
+    disable_configured_map_credentials: bool = False
     llm_api_key: str = ""
     llm_base_url: str = "https://api.openai.com/v1"
     llm_model: str = "gpt-4.1-mini"
@@ -38,10 +39,13 @@ class Settings(BaseSettings):
     max_request_bytes: int = 1_000_000
     max_route_matrix_points: int = 25
     idempotency_ttl_seconds: int = 86_400
-    required_schema_revision: str = "0009"
+    required_schema_revision: str = "0013"
     precise_location_ttl_minutes: int = 120
     location_encryption_key: str = ""
     max_agent_tool_calls: int = 8
+    max_agent_tool_calls_per_run: int = 4
+    max_agent_tool_calls_per_task: int = 8
+    max_agent_tool_calls_per_trip: int = 40
     max_agent_steps: int = 4
     max_agent_input_tokens: int = 6_000
     max_agent_output_tokens: int = 800
@@ -50,6 +54,26 @@ class Settings(BaseSettings):
     daily_ai_token_quota: int = 100_000
     max_ai_request_cost_usd: float = 0.20
     feature_companion_agent: bool = True
+    multi_agent_enabled: bool = True
+    plan_critic_mode: str = "shadow"
+    max_agent_workflow_cost_usd: float = 0.08
+    max_agent_handoffs: int = 12
+    agent_stage_timeout_seconds: float = 12.0
+    agent_search_max_attempts: int = 2
+    agent_shared_state_ttl_seconds: int = 7_200
+    agent_shared_state_max_history: int = 100
+    agent_shared_state_max_bytes: int = 512_000
+    max_critic_input_tokens: int = 4_000
+    max_critic_output_tokens: int = 800
+    max_critic_retries: int = 1
+    critic_enforce_min_shadow_samples: int = 30
+    critic_enforce_max_fallback_rate: float = 0.02
+    critic_enforce_max_blocking_rate: float = 0.05
+    critic_enforce_max_budget_exceeded_rate: float = 0.01
+    critic_enforce_max_p95_latency_ms: int = 5_000
+    worker_recover_processing_limit: int = 100
+    worker_lock_ttl_seconds: int = 30
+    worker_lock_renew_interval_seconds: int = 10
     redis_url: str = ""
     api_requests_per_minute: int = 120
     api_ip_requests_per_minute: int = 3000
@@ -57,6 +81,7 @@ class Settings(BaseSettings):
     auth_ip_requests_per_minute: int = 600
     amap_proxy_requests_per_minute: int = 300
     amap_proxy_max_response_bytes: int = 2_000_000
+    amap_proxy_max_cache_bytes: int = 250_000
     ai_plans_per_day: int = 50
     mock_weather_provider: bool = True
     llm_input_cost_per_million_usd: float = 0.40
@@ -70,6 +95,8 @@ class Settings(BaseSettings):
 
     @property
     def use_mock_map(self) -> bool:
+        if self.disable_configured_map_credentials:
+            return True
         has_real_credentials = bool(self.amap_web_key or (self.amap_key and self.amap_jscode))
         return self.mock_map_provider or not has_real_credentials
 

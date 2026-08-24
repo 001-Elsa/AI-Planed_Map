@@ -20,9 +20,11 @@ python -m pytest -c backend/pytest.ini --cov --cov-report=term-missing
 
 ```bash
 python backend/tests/evaluation/evaluate_intent.py
+python backend/tests/evaluation/evaluate_agents.py
+python backend/tests/evaluation/evaluate_routes.py
 ```
 
-质量门禁失败会使进程以非零退出码结束。
+三个门禁分别覆盖意图字段、Agent 隔离/审阅和确定性路线评分；任一失败都会使进程以非零退出码结束。
 
 ## 混沌 / 故障注入
 

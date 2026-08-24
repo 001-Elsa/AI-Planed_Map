@@ -55,6 +55,12 @@ function run(cmd, args, env, cwd) {
     // runtime from the automatic mock fallback to the real AMap provider.
     MOCK_MAP_PROVIDER: 'false',
     MOCK_WEATHER_PROVIDER: 'true',
+    // Explicitly override developer .env credentials. The E2E flow must start
+    // in the no-Key state and configure its own test credential via admin.
+    AMAP_WEB_KEY: '',
+    AMAP_KEY: '',
+    AMAP_JSCODE: '',
+    DISABLE_CONFIGURED_MAP_CREDENTIALS: 'true',
     REDIS_URL: '',
     LLM_API_KEY: '',
     LOCATION_ENCRYPTION_KEY: 'test-only-location-key-for-field-encryption',
@@ -94,7 +100,15 @@ function run(cmd, args, env, cwd) {
   const browser = await chromium.launch();
   const errors = [];
   const newPage = async () => {
-    const page = await browser.newPage({ viewport: { width: 420, height: 820 } });
+    const context = await browser.newContext({
+      viewport: { width: 420, height: 820 },
+      serviceWorkers: 'block',
+    });
+    const page = await context.newPage();
+    await page.route('**/js/local-config.js', (route) => route.fulfill({
+      contentType: 'application/javascript',
+      body: "export const LOCAL_AMAP_KEY=''; export const LOCAL_AMAP_JSCODE='';",
+    }));
     page.on('pageerror', (e) => errors.push('pageerror: ' + e.message));
     page.on('console', (m) => {
       const t = m.text();
@@ -113,6 +127,13 @@ function run(cmd, args, env, cwd) {
 
     await page.click('#auth-tab-reg');
     await page.fill('#auth-username', 'e2euser');
+    await page.fill('#auth-password', 'seven77');
+    await page.fill('#auth-password2', 'seven77');
+    await page.click('#auth-submit');
+    check(
+      'registration rejects seven-character passwords',
+      (await page.locator('#auth-err').textContent()).includes('8'),
+    );
     await page.fill('#auth-password', 'e2epass1');
     await page.fill('#auth-password2', 'e2epass1');
     await page.click('#auth-submit');
@@ -182,7 +203,23 @@ function run(cmd, args, env, cwd) {
     check('分享页展示轨迹信息卡', card.includes('e2e晨跑') && card.includes('4.2'));
 
     console.log('▶ 游客与退出');
-    const g = await browser.newContext();
+    const g = await browser.newContext({ serviceWorkers: 'block' });
+    await g.route('**/js/local-config.js', (route) => route.fulfill({
+      contentType: 'application/javascript',
+      body: "export const LOCAL_AMAP_KEY=''; export const LOCAL_AMAP_JSCODE='';",
+    }));
+    await g.route('**/api/config', (route) => route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ok: true,
+        data: {
+          amapKey: null,
+          proxy: false,
+          registrationNeedsAdminToken: false,
+          adminAuthTokenRequired: true,
+        },
+      }),
+    }));
     const gp = await g.newPage();
     await gp.goto(BASE, { waitUntil: 'networkidle' });
     await gp.waitForTimeout(400);

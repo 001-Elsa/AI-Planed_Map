@@ -14,6 +14,8 @@ GATES = {
     "task_count_accuracy": 0.70,
     "transport_mode_accuracy": 0.80,
     "deadline_accuracy": 0.70,
+    "avoid_hiking_accuracy": 0.95,
+    "travel_style_accuracy": 0.90,
 }
 
 
@@ -22,6 +24,8 @@ async def main() -> None:
     cases = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
     parser = RuleBasedIntentParser()
     valid = task_correct = mode_correct = deadline_correct = 0
+    avoid_hiking_correct = travel_style_correct = 0
+    avoid_hiking_cases = travel_style_cases = 0
     for case in cases:
         try:
             intent = await parser.parse(case["text"])
@@ -35,6 +39,16 @@ async def main() -> None:
         deadline_correct += (
             expected_hour is None and not actual_hours or expected_hour in actual_hours
         )
+        if "expected_avoid_hiking" in case:
+            avoid_hiking_cases += 1
+            avoid_hiking_correct += (
+                intent.preferences.avoid_hiking is case["expected_avoid_hiking"]
+            )
+        if "expected_travel_style" in case:
+            travel_style_cases += 1
+            travel_style_correct += (
+                intent.preferences.travel_style == case["expected_travel_style"]
+            )
     total = len(cases)
     metrics = {
         "cases": total,
@@ -42,6 +56,16 @@ async def main() -> None:
         "task_count_accuracy": task_correct / total,
         "transport_mode_accuracy": mode_correct / total,
         "deadline_accuracy": deadline_correct / total,
+        "avoid_hiking_accuracy": (
+            avoid_hiking_correct / avoid_hiking_cases if avoid_hiking_cases else 1.0
+        ),
+        "travel_style_accuracy": (
+            travel_style_correct / travel_style_cases if travel_style_cases else 1.0
+        ),
+        "preference_eval_cases": {
+            "avoid_hiking": avoid_hiking_cases,
+            "travel_style": travel_style_cases,
+        },
         "parser": parser.name,
         "note": "RuleBased offline gates; live LLM eval is optional via LLM_API_KEY",
     }

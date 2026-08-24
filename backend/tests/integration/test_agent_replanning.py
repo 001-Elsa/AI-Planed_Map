@@ -245,6 +245,12 @@ async def test_worker_llm_tool_loop_creates_one_pending_patch_and_transport_swit
     assert any(
         item["operation"] == "change_transport_mode" for item in stream["plan_patch"]["operations"]
     )
+    shared_state = await store.get_json(f"agent-shared-state:v1:trip-{trip_id}-state")
+    assert shared_state["phase"] == "in_trip"
+    assert shared_state["route_plan"]["plan_version"] == 1
+    assert shared_state["execution_context"]["last_run_status"] == "succeeded"
+    assert shared_state["execution_context"]["last_trigger"] == "worker_event"
+    assert shared_state["revision"] == 1
 
     # Re-consuming the same durable event is idempotent: no second patch.
     await process_trip_event(
@@ -368,6 +374,42 @@ async def test_agent_rejects_illegal_tool_and_stops_at_step_limit(
     assert denied["status"] == "succeeded"
     assert denied_calls[0].status == "policy_denied"
     assert denied_calls[0].error_type == "tool_not_registered"
+
+    blocked, blocked_calls = await _exercise_controller(
+        trip_id,
+        ScriptedDecider(
+            [
+                AgentDecision(
+                    action="call_tool",
+                    tool="create_plan_patch",
+                    reason="registered but outside Companion Agent boundary",
+                ),
+                AgentDecision(action="finish", reason="rejected by role boundary"),
+            ]
+        ),
+        max_steps=2,
+    )
+    assert blocked["status"] == "succeeded"
+    assert blocked_calls[0].status == "policy_denied"
+    assert blocked_calls[0].error_type == "tool_not_allowed_for_agent"
+
+    planning_tool, planning_tool_calls = await _exercise_controller(
+        trip_id,
+        ScriptedDecider(
+            [
+                AgentDecision(
+                    action="call_tool",
+                    tool="search_poi",
+                    reason="planning-period tool must stay outside Companion",
+                ),
+                AgentDecision(action="finish", reason="role boundary held"),
+            ]
+        ),
+        max_steps=2,
+    )
+    assert planning_tool["status"] == "succeeded"
+    assert planning_tool_calls[0].status == "policy_denied"
+    assert planning_tool_calls[0].error_type == "tool_not_allowed_for_agent"
 
     limited, calls = await _exercise_controller(
         trip_id,

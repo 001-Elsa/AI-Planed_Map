@@ -16,6 +16,7 @@ from pydantic import Field, ValidationError, model_validator
 
 from backend.app.core.config import Settings
 from backend.app.schemas.ai_intent import StrictModel
+from backend.app.services.agents.companion_agent import COMPANION_AGENT_SPEC
 
 
 class AgentDecision(StrictModel):
@@ -51,6 +52,7 @@ class AgentDecider(Protocol):
         observation: dict[str, Any],
         tool_history: list[dict[str, Any]],
         tools: list[str],
+        tool_schemas: dict[str, Any] | None = None,
     ) -> DecisionResult: ...
 
 
@@ -66,9 +68,14 @@ class RuleBasedAgentDecider:
         observation: dict[str, Any],
         tool_history: list[dict[str, Any]],
         tools: list[str],
+        tool_schemas: dict[str, Any] | None = None,
     ) -> DecisionResult:
         used = [item.get("tool") for item in tool_history]
-        event_type = str(observation.get("event_type") or "")
+        current_observation = observation.get("current_observation")
+        event_observation = (
+            current_observation if isinstance(current_observation, dict) else observation
+        )
+        event_type = str(event_observation.get("event_type") or "")
         risk_event = event_type in {
             "UserOffRoute",
             "ScheduleDelayDetected",
@@ -93,7 +100,7 @@ class RuleBasedAgentDecider:
             )
         if (
             risk_event
-            and observation.get("has_precise_location")
+            and event_observation.get("has_precise_location")
             and "get_current_location" not in used
         ):
             return DecisionResult(
@@ -108,7 +115,7 @@ class RuleBasedAgentDecider:
                 AgentDecision(
                     action="call_tool",
                     tool="propose_replan",
-                    arguments={"reason": observation.get("reason") or event_type},
+                    arguments={"reason": event_observation.get("reason") or event_type},
                     reason="风险事件需要生成待确认重规划方案",
                 )
             )
@@ -130,6 +137,7 @@ class OpenAICompatibleAgentDecider:
         observation: dict[str, Any],
         tool_history: list[dict[str, Any]],
         tools: list[str],
+        tool_schemas: dict[str, Any] | None = None,
     ) -> DecisionResult:
         schema = AgentDecision.model_json_schema()
         # OpenAI-compatible strict JSON schema mode requires every declared
@@ -159,6 +167,7 @@ class OpenAICompatibleAgentDecider:
                             "trip_state": trip_state,
                             "observation": observation,
                             "tool_history": tool_history,
+                            "tool_argument_schemas": tool_schemas or {},
                         },
                         ensure_ascii=False,
                     ),
@@ -173,6 +182,10 @@ class OpenAICompatibleAgentDecider:
             f"{self.settings.llm_base_url.rstrip('/')}/chat/completions",
             json=payload,
             headers={"Authorization": f"Bearer {self.settings.llm_api_key}"},
+            timeout=min(
+                self.settings.external_timeout_seconds,
+                COMPANION_AGENT_SPEC.budget.timeout_seconds,
+            ),
         )
         response.raise_for_status()
         data = response.json()

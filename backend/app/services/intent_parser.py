@@ -137,7 +137,28 @@ class RuleBasedIntentParser:
             minimize_walking=any(word in text for word in ("少走路", "不想走路")),
             minimize_cost=any(word in text for word in ("便宜", "省钱", "费用低")),
             prefer_high_rating=any(word in text for word in ("评分高", "口碑好")),
+            travel_style=(
+                "relaxed"
+                if any(word in text for word in ("轻松", "悠闲", "休闲", "慢节奏", "不赶"))
+                else "intensive"
+                if any(word in text for word in ("紧凑", "特种兵", "多安排", "多打卡"))
+                else "balanced"
+            ),
+            avoid_hiking=any(
+                word in text
+                for word in (
+                    "不想爬山",
+                    "不要爬山",
+                    "不爬山",
+                    "避免爬山",
+                    "不想登山",
+                    "不要登山",
+                    "避免登山",
+                )
+            ),
         )
+        if preferences.travel_style == "relaxed":
+            preferences.minimize_walking = True
         departure = None
         departure_match = re.search(
             r"((?:明天|后天|今天)?.{0,5}(?:上午|下午|晚上)?"
@@ -162,6 +183,10 @@ class RuleBasedIntentParser:
             "最短时间",
             "用时最少",
             "尽快",
+            "不想爬山",
+            "不要爬山",
+            "希望轻松旅游",
+            "希望悠闲旅游",
         )
         tasks: list[PlanningTask] = []
         for piece in pieces:
@@ -190,7 +215,11 @@ class RuleBasedIntentParser:
                 piece,
             ).strip()
             piece = re.sub(r"^(?:去|到|是|前往|前去)\s*", "", piece).strip()
-            piece = re.sub(r"(尽量少走路|尽量省钱|路程最短)$", "", piece).strip()
+            piece = re.sub(
+                r"(尽量少走路|尽量省钱|路程最短|不想爬山|不要爬山|希望轻松旅游)$",
+                "",
+                piece,
+            ).strip()
             deadline = None
             deadline_match = re.search(
                 r"((?:今天|明天|后天)?.{0,4}(?:[一二三四五六七八九十]{1,2}|\d{1,2})(?:[:：点时]\d{0,2})?)前",
@@ -215,7 +244,8 @@ class RuleBasedIntentParser:
             location = re.sub(
                 r"(?:在)?(?:今天|明天|后天)?(?:上午|下午|晚上)?\d{1,2}(?:[:：点时]\d{0,2})?前|"
                 r"(?:停留|待|逛)\d{1,3}分钟|五点前|"
-                r"(?:尽量少走路|尽量省钱|路程最短|距离最短|最短时间|用时最少|尽快)",
+                r"(?:尽量少走路|尽量省钱|路程最短|距离最短|最短时间|用时最少|尽快|"
+                r"不想爬山|不要爬山|希望轻松旅游|希望悠闲旅游)",
                 "",
                 piece,
             ).strip()

@@ -20,6 +20,31 @@ SOFT_PREFERENCE_HINTS = (
 )
 
 
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"true", "1", "yes", "y", "accept", "accepted", "continue", "ok"}:
+            return True
+        if normalized in {"false", "0", "no", "n", "reject", "rejected", "stop"}:
+            return False
+    raise ValueError("expected boolean confirmation answer")
+
+
+def _ensure_hard_constraints(request_data: dict[str, Any]) -> dict[str, Any]:
+    constraints = request_data.get("constraints")
+    if not isinstance(constraints, dict):
+        constraints = {"hard": {}, "uncertain": []}
+        request_data["constraints"] = constraints
+    hard = constraints.setdefault("hard", {})
+    if not isinstance(hard, dict):
+        hard = {}
+        constraints["hard"] = hard
+    constraints.setdefault("uncertain", [])
+    return hard
+
+
 def select_clarification_questions(
     *,
     request: AIPlanRequest,
@@ -181,6 +206,28 @@ def select_clarification_questions(
 
 def apply_clarification_answer(request_data: dict[str, Any], field: str, value: Any) -> None:
     """Mutate a persisted conversation request_json with a structured answer."""
+    if field.startswith("human_confirmation."):
+        confirmation_key = field.split(".", 1)[1]
+        if confirmation_key not in {"walking_distance", "estimated_cost"}:
+            raise KeyError(field)
+        accepted = _coerce_bool(value)
+        confirmations = request_data.setdefault("human_confirmations", {})
+        confirmations[confirmation_key] = accepted
+        if accepted:
+            return
+        preferences = request_data.setdefault("preferences_answers", {})
+        hard = _ensure_hard_constraints(request_data)
+        if confirmation_key == "walking_distance":
+            preferences["minimize_walking"] = True
+            preferences["travel_style"] = "relaxed"
+            hard.setdefault("max_walking_meters", 6000)
+            request_data["text"] = f"{request_data.get('text', '')}；用户不接受长距离步行，请少走路"
+            return
+        if confirmation_key == "estimated_cost":
+            preferences["minimize_cost"] = True
+            hard.setdefault("max_total_cost_yuan", 800)
+            request_data["text"] = f"{request_data.get('text', '')}；用户不接受高费用，请省钱优先"
+            return
     if field in {"origin", "departure_time", "transport_mode"}:
         request_data[field] = value
         return
@@ -221,14 +268,7 @@ def apply_clarification_answer(request_data: dict[str, Any], field: str, value: 
         return
     if field.startswith("constraints.hard.party."):
         party_field = field.rsplit(".", 1)[-1]
-        constraints = request_data.get("constraints")
-        if not isinstance(constraints, dict):
-            constraints = {"hard": {}, "uncertain": []}
-            request_data["constraints"] = constraints
-        hard = constraints.setdefault("hard", {})
-        if not isinstance(hard, dict):
-            hard = {}
-            constraints["hard"] = hard
+        hard = _ensure_hard_constraints(request_data)
         party = hard.setdefault("party", {})
         if not isinstance(party, dict):
             party = {}
@@ -237,14 +277,7 @@ def apply_clarification_answer(request_data: dict[str, Any], field: str, value: 
         return
     if field.startswith("constraints.hard."):
         hard_field = field.partition("constraints.hard.")[2]
-        constraints = request_data.get("constraints")
-        if not isinstance(constraints, dict):
-            constraints = {"hard": {}, "uncertain": []}
-            request_data["constraints"] = constraints
-        hard = constraints.setdefault("hard", {})
-        if not isinstance(hard, dict):
-            hard = {}
-            constraints["hard"] = hard
+        hard = _ensure_hard_constraints(request_data)
         hard[hard_field] = value
         return
     raise KeyError(field)

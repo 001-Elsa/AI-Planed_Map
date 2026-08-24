@@ -15,9 +15,19 @@ def test_runtime_store_counter_json_queue_lock_and_retry():
         assert await store.get_json("trip:1") == {"state": "ACTIVE_TRIP"}
         await store.enqueue("events", {"event_id": 1})
         assert await store.dequeue("events", timeout_seconds=1) == {"event_id": 1}
+        await store.enqueue("reliable", {"event_id": "reserved"})
+        reserved = await store.reserve("reliable", timeout_seconds=1)
+        assert reserved and reserved.payload == {"event_id": "reserved"}
+        assert await store.recover_processing("reliable") == 1
+        reserved_again = await store.reserve("reliable", timeout_seconds=1)
+        assert reserved_again and reserved_again.payload == {"event_id": "reserved"}
+        assert await store.acknowledge("reliable", reserved_again.receipt) is True
+        assert await store.recover_processing("reliable") == 0
         token = await store.acquire_lock("agent-run:1", 30)
         assert token
         assert await store.acquire_lock("agent-run:1", 30) is None
+        assert await store.renew_lock("agent-run:1", token, 30) is True
+        assert await store.renew_lock("agent-run:1", "wrong-token", 30) is False
         assert await store.release_lock("agent-run:1", token) is True
         disposition = await store.enqueue_retry(
             "events", {"event_id": 2}, attempt=1, max_attempts=2, delay_seconds=0
@@ -40,6 +50,27 @@ def test_runtime_store_counter_json_queue_lock_and_retry():
         first_stream = await store.get_json("trip-stream:9")
         second_stream = await publish_trip_stream(store, 9, {"type": "TripStateChanged"})
         assert second_stream["sequence"] == first_stream["sequence"] + 1
+        await store.close()
+
+    asyncio.run(scenario())
+
+
+def test_in_memory_runtime_store_bounds_untrusted_cache_and_counter_keys():
+    async def scenario():
+        store = InMemoryRuntimeStore(max_values=2, max_value_bytes=50, max_counters=2)
+
+        await store.set_json("cache:1", {"value": "a" * 10}, 60)
+        await store.set_json("cache:2", {"value": "b" * 10}, 60)
+        await store.set_json("cache:3", {"value": "c" * 10}, 60)
+        assert await store.get_json("cache:1") is None
+        assert await store.get_json("cache:2") == {"value": "b" * 10}
+        assert await store.get_json("cache:3") == {"value": "c" * 10}
+
+        assert await store.increment("counter:1", 60) == 1
+        assert await store.increment("counter:2", 60) == 1
+        assert await store.increment("counter:3", 60) > 1
+        assert len(store._counters) == 2
+
         await store.close()
 
     asyncio.run(scenario())

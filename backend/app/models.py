@@ -243,14 +243,34 @@ class AgentSession(Base):
 
 class AgentMessage(Base):
     __tablename__ = "agent_messages"
+    __table_args__ = (
+        UniqueConstraint("message_id"),
+        UniqueConstraint("workflow_run_id", "idempotency_key"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    agent_session_id: Mapped[int] = mapped_column(
-        ForeignKey("agent_sessions.id", ondelete="CASCADE"), index=True
+    agent_session_id: Mapped[int | None] = mapped_column(
+        ForeignKey("agent_sessions.id", ondelete="CASCADE"), index=True, nullable=True
+    )
+    workflow_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("agent_workflow_runs.id", ondelete="CASCADE"), index=True, nullable=True
     )
     role: Mapped[str] = mapped_column(String(20))
     content: Mapped[str] = mapped_column(Text)
     structured_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    protocol_version: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    message_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    task_id: Mapped[str | None] = mapped_column(String(128), index=True, nullable=True)
+    sender: Mapped[str | None] = mapped_column(String(30), index=True, nullable=True)
+    receiver: Mapped[str | None] = mapped_column(String(30), index=True, nullable=True)
+    message_type: Mapped[str | None] = mapped_column(String(30), index=True, nullable=True)
+    artifact_type: Mapped[str | None] = mapped_column(String(80), index=True, nullable=True)
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), index=True, nullable=True)
+    correlation_id: Mapped[str | None] = mapped_column(String(36), index=True, nullable=True)
+    causation_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    attempt: Mapped[int] = mapped_column(Integer, default=1)
+    delivery_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -258,9 +278,18 @@ class AgentRun(Base):
     __tablename__ = "agent_runs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    agent_session_id: Mapped[int] = mapped_column(
-        ForeignKey("agent_sessions.id", ondelete="CASCADE"), index=True
+    agent_session_id: Mapped[int | None] = mapped_column(
+        ForeignKey("agent_sessions.id", ondelete="CASCADE"), index=True, nullable=True
     )
+    workflow_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("agent_workflow_runs.id", ondelete="CASCADE"), index=True, nullable=True
+    )
+    parent_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("agent_runs.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    agent_type: Mapped[str] = mapped_column(String(30), default="companion", index=True)
+    prompt_version: Mapped[str] = mapped_column(String(50), default="companion-v1")
+    budget_json: Mapped[str] = mapped_column(Text, default="{}")
     trigger_type: Mapped[str] = mapped_column(String(60))
     status: Mapped[str] = mapped_column(String(30))
     trace_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
@@ -268,6 +297,121 @@ class AgentRun(Base):
     output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     estimated_cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
     latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    fallback_used: Mapped[bool] = mapped_column(Boolean, default=False)
+    output_summary_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AgentWorkflowRun(Base):
+    __tablename__ = "agent_workflow_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    planning_conversation_id: Mapped[int | None] = mapped_column(
+        ForeignKey("planning_conversations.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    planning_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("planning_runs.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    trip_session_id: Mapped[int | None] = mapped_column(
+        ForeignKey("trip_sessions.id", ondelete="CASCADE"), index=True, nullable=True
+    )
+    trigger_type: Mapped[str] = mapped_column(String(60))
+    mode: Mapped[str] = mapped_column(String(20), default="shadow")
+    status: Mapped[str] = mapped_column(String(30), default="running", index=True)
+    trace_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    handoff_count: Mapped[int] = mapped_column(Integer, default=0)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    estimated_cost_usd: Mapped[float] = mapped_column(Float, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AgentWorkflowTask(Base):
+    __tablename__ = "agent_workflow_tasks"
+    __table_args__ = (
+        UniqueConstraint("workflow_run_id", "task_key"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    workflow_run_id: Mapped[int] = mapped_column(
+        ForeignKey("agent_workflow_runs.id", ondelete="CASCADE"), index=True
+    )
+    task_key: Mapped[str] = mapped_column(String(80), index=True)
+    role: Mapped[str] = mapped_column(String(30), index=True)
+    status: Mapped[str] = mapped_column(String(30), default="pending", index=True)
+    dependency_keys_json: Mapped[str] = mapped_column(Text, default="[]")
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    input_artifact_refs_json: Mapped[str] = mapped_column(Text, default="[]")
+    output_artifact_type: Mapped[str] = mapped_column(String(80))
+    budget_json: Mapped[str] = mapped_column(Text, default="{}")
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class AgentHandoff(Base):
+    __tablename__ = "agent_handoffs"
+    __table_args__ = (
+        UniqueConstraint("workflow_run_id", "message_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    workflow_run_id: Mapped[int] = mapped_column(
+        ForeignKey("agent_workflow_runs.id", ondelete="CASCADE"), index=True
+    )
+    message_id: Mapped[str] = mapped_column(String(36), index=True)
+    source_task_key: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+    target_task_key: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+    sender: Mapped[str] = mapped_column(String(30), index=True)
+    receiver: Mapped[str] = mapped_column(String(30), index=True)
+    artifact_type: Mapped[str] = mapped_column(String(80), index=True)
+    status: Mapped[str] = mapped_column(String(20), default="delivered", index=True)
+    content_hash: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AgentArtifact(Base):
+    __tablename__ = "agent_artifacts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    workflow_run_id: Mapped[int] = mapped_column(
+        ForeignKey("agent_workflow_runs.id", ondelete="CASCADE"), index=True
+    )
+    agent_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("agent_runs.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    artifact_type: Mapped[str] = mapped_column(String(60), index=True)
+    schema_version: Mapped[str] = mapped_column(String(20), default="1.0")
+    artifact_key: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    artifact_version: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(String(20), default="active", index=True)
+    plan_version: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    producer_agent: Mapped[str] = mapped_column(String(30), index=True)
+    payload_json: Mapped[str] = mapped_column(Text)
+    confidence: Mapped[float] = mapped_column(Float, default=1)
+    evidence_refs_json: Mapped[str] = mapped_column(Text, default="[]")
+    input_hash: Mapped[str] = mapped_column(String(128), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    invalidated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AgentSharedStateSnapshot(Base):
+    __tablename__ = "agent_shared_state_snapshots"
+    __table_args__ = (UniqueConstraint("workflow_run_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    workflow_run_id: Mapped[int] = mapped_column(
+        ForeignKey("agent_workflow_runs.id", ondelete="CASCADE"), index=True
+    )
+    task_id: Mapped[str] = mapped_column(String(128), index=True)
+    revision: Mapped[int] = mapped_column(Integer)
+    phase: Mapped[str] = mapped_column(String(30), index=True)
+    state_hash: Mapped[str] = mapped_column(String(64), index=True)
+    payload_json: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

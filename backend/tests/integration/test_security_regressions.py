@@ -1,9 +1,12 @@
 import asyncio
+import uuid
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
+from backend.app.core.config import get_settings
+from backend.app.core.observability import metrics
 from backend.app.db.session import engine
 from backend.app.main import app
 
@@ -64,6 +67,74 @@ def test_streaming_body_limit_and_amap_proxy_allowlist():
         denied = client.get("/_AMapService/v9/unapproved")
         assert denied.status_code == 403
         assert denied.json()["code"] == "AMAP_PATH_DENIED"
+
+
+def test_random_404_paths_do_not_create_unbounded_metric_labels():
+    marker = f"missing-{uuid.uuid4().hex}"
+    with TestClient(app) as client:
+        response = client.get(f"/{marker}")
+        assert response.status_code == 404
+    rendered = metrics.render()
+    assert marker not in rendered
+    assert 'path="__unmatched__"' in rendered
+
+
+def test_auth_rate_limit_cannot_be_bypassed_with_device_headers():
+    settings = get_settings()
+    original_identity_limit = settings.auth_device_requests_per_minute
+    original_ip_limit = settings.auth_ip_requests_per_minute
+    settings.auth_device_requests_per_minute = 1
+    settings.auth_ip_requests_per_minute = 100
+    try:
+        with TestClient(app) as client:
+            first = client.post(
+                "/api/login",
+                json={"username": "not-a-user", "password": "not-a-password"},
+                headers={"X-Device-Id": "device-one"},
+            )
+            second = client.post(
+                "/api/login",
+                json={"username": "not-a-user", "password": "not-a-password"},
+                headers={"X-Device-Id": "device-two"},
+            )
+        assert first.status_code == 401
+        assert second.status_code == 429
+        assert second.json()["code"] == "RATE_LIMITED"
+    finally:
+        settings.auth_device_requests_per_minute = original_identity_limit
+        settings.auth_ip_requests_per_minute = original_ip_limit
+
+
+def test_correlation_ids_are_sanitized_before_reflection():
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/health",
+            headers={"X-Request-ID": "unsafe id", "X-Trace-ID": "<unsafe>"},
+        )
+    assert response.status_code == 200
+    assert response.headers["X-Request-ID"].startswith("req_")
+    assert response.headers["X-Request-ID"] != "unsafe id"
+    assert response.headers["X-Trace-ID"] != "<unsafe>"
+    assert response.headers["Cache-Control"] == "no-store"
+
+
+def test_new_credentials_and_public_share_tokens_have_safe_minimum_strength():
+    username = f"strong{uuid.uuid4().hex[:8]}"
+    with TestClient(app) as client:
+        weak = client.post(
+            "/api/register",
+            json={"username": username, "password": "seven77"},
+        )
+        assert weak.status_code == 422
+
+        headers = _register(client, username)
+        shared = client.post(
+            "/api/shares",
+            headers=headers,
+            json={"type": "plan", "payload": {"name": "private route"}},
+        )
+        assert shared.status_code == 200
+        assert len(shared.json()["data"]["token"]) == 32
 
 
 @pytest.mark.skipif(

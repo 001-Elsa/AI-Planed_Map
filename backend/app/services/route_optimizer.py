@@ -226,8 +226,13 @@ def evaluate_joint_order(
                 if (position[left] - position[right]) * (prev_pos[left] - prev_pos[right]) < 0:
                     disagreements += 1
         change_component = disagreements * 120
-    distance_weight = weights.distance * (2 if preferences.minimize_distance else 1)
-    walking_weight = weights.walking_time * (2 if preferences.minimize_walking else 1)
+    relaxed_multiplier = 1.5 if preferences.travel_style == "relaxed" else 1
+    distance_weight = (
+        weights.distance * (2 if preferences.minimize_distance else 1) * relaxed_multiplier
+    )
+    walking_weight = (
+        weights.walking_time * (2 if preferences.minimize_walking else 1) * relaxed_multiplier
+    )
     rating_weight = weights.low_rating * (2 if preferences.prefer_high_rating else 1)
     soft_penalty_score = 180.0 * len(soft_penalties)
     breakdown = ScoreBreakdown(

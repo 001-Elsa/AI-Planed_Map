@@ -6,6 +6,7 @@ the API's version validator and requires an explicit user decision.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 from dataclasses import dataclass, field
@@ -223,8 +224,8 @@ async def create_pending_replan(
             ]
             matrix = await provider.route_matrix(points, candidate_mode)
             tasks = [PlanningTask.model_validate(item["stop"]["task"]) for item in active]
-            evaluation, algorithm = optimize_route(
-                current_time, tasks, matrix.distances, matrix.durations
+            evaluation, algorithm = await asyncio.to_thread(
+                optimize_route, current_time, tasks, matrix.distances, matrix.durations
             )
             option = {
                 "label": f"方案{chr(65 + len(options))}",

@@ -16,11 +16,12 @@
 ```bash
 python -m pytest -c backend/pytest.ini backend/tests/integration/test_agent_replanning.py
 python backend/tests/evaluation/evaluate_intent.py
+python backend/tests/evaluation/evaluate_routes.py
 ```
 
 第一条使用脚本化 `AgentDecision` 验证结构化工具循环、非法工具 Policy 拒绝、调用步数上限、Worker 锁竞争、重复事件幂等、自动 pending Patch、交通方式变更、天气替换室外 POI，以及确认/拒绝的 Version 行为；它不等价于真实在线 LLM 质量评测。
 
-第二条输出已提交离线评测集的实际指标并在低于门槛时失败；它不是虚构的“模型分数”。
+评测命令输出已提交意图/路线数据集的实际指标并在低于门槛时失败；路线分数使用固定 40/30/30 公式和 hard-fail 规则，不是虚构的“模型分数”。
 
 ## 真实压测（不要提交伪造数字）
 

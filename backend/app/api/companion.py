@@ -15,7 +15,9 @@ from backend.app.db.session import SessionLocal
 from backend.app.models import (
     AgentRun,
     AgentSession,
+    AgentSharedStateSnapshot,
     AgentToolCall,
+    AgentWorkflowRun,
     DecisionAuditLog,
     ExternalDataSnapshot,
     LocationSnapshot,
@@ -28,6 +30,7 @@ from backend.app.models import (
     UserConsent,
     UserPreference,
 )
+from backend.app.schemas.agent_artifacts import AgentType, minimize_agent_payload
 from backend.app.schemas.companion import (
     ConsentRequest,
     ConsentScope,
@@ -43,8 +46,25 @@ from backend.app.schemas.companion import (
     TripState,
     TripTransitionRequest,
 )
+from backend.app.services.agent_memory import (
+    SUPPORTED_LONG_TERM_KEYS,
+    MemoryPreferenceError,
+    normalize_long_term_preference,
+)
 from backend.app.services.agent_policy import evaluate_tool_policy
 from backend.app.services.agent_state import validate_transition
+from backend.app.services.agent_tool_contracts import (
+    stable_tool_error,
+    tool_result_error,
+    tool_result_success,
+    validate_tool_arguments,
+)
+from backend.app.services.agent_tool_registry import (
+    TOOL_REGISTRY,
+    CapabilityAuthorizationError,
+    InvocationMode,
+)
+from backend.app.services.agents.companion_agent import COMPANION_AGENT_SPEC
 from backend.app.services.trip_events import evaluate_trip_event
 from backend.app.services.trip_stream import publish_trip_stream
 
@@ -672,6 +692,15 @@ async def save_preference(body: ExplicitPreferenceRequest, user: CurrentUser, db
             "EXPLICIT_CONFIRMATION_REQUIRED",
             "长期偏好只能在用户明确确认后保存",
         )
+    try:
+        normalized_value = normalize_long_term_preference(body.key, body.value)
+    except MemoryPreferenceError as exc:
+        raise AppError(
+            422,
+            "LONG_TERM_MEMORY_INVALID",
+            "长期偏好字段或值不受支持",
+            {"key": body.key, "supported_keys": sorted(SUPPORTED_LONG_TERM_KEYS)},
+        ) from exc
     row = await db.scalar(
         select(UserPreference).where(
             UserPreference.user_id == user.id, UserPreference.key == body.key
@@ -679,19 +708,67 @@ async def save_preference(body: ExplicitPreferenceRequest, user: CurrentUser, db
     )
     now = datetime.now(timezone.utc)
     if row:
-        row.value_json = json.dumps(body.value, ensure_ascii=False)
+        row.value_json = json.dumps(normalized_value, ensure_ascii=False)
         row.confirmed_at = now
+        row.source = "explicit_user_confirmation"
     else:
         db.add(
             UserPreference(
                 user_id=user.id,
                 key=body.key,
-                value_json=json.dumps(body.value, ensure_ascii=False),
+                value_json=json.dumps(normalized_value, ensure_ascii=False),
                 confirmed_at=now,
             )
         )
     await db.commit()
-    return {"ok": True, "data": {"key": body.key, "saved": True}}
+    return {
+        "ok": True,
+        "data": {
+            "key": body.key,
+            "value": normalized_value,
+            "saved": True,
+            "source": "explicit_user_confirmation",
+        },
+    }
+
+
+@router.get("/preferences")
+async def list_preferences(user: CurrentUser, db: Db):
+    rows = (
+        await db.scalars(
+            select(UserPreference)
+            .where(UserPreference.user_id == user.id)
+            .order_by(UserPreference.key)
+        )
+    ).all()
+    return {
+        "ok": True,
+        "data": [
+            {
+                "key": row.key,
+                "value": json.loads(row.value_json),
+                "source": row.source,
+                "confirmed_at": row.confirmed_at,
+                "updated_at": row.updated_at,
+            }
+            for row in rows
+        ],
+    }
+
+
+@router.delete("/preferences/{key}")
+async def delete_preference(key: str, user: CurrentUser, db: Db):
+    row = await db.scalar(
+        select(UserPreference).where(
+            UserPreference.user_id == user.id,
+            UserPreference.key == key,
+        )
+    )
+    if row is None:
+        raise AppError(404, "LONG_TERM_MEMORY_NOT_FOUND", "长期偏好不存在")
+    await db.delete(row)
+    await db.commit()
+    return {"ok": True, "data": {"key": key, "deleted": True}}
 
 
 @router.post("/trips/{trip_id}/tools/execute")
@@ -706,6 +783,25 @@ async def execute_agent_tool(
     agent = await db.scalar(select(AgentSession).where(AgentSession.trip_session_id == trip.id))
     if agent is None:
         raise AppError(409, "AGENT_SESSION_MISSING", "Agent 会话不存在")
+    capability = TOOL_REGISTRY.get(body.tool)
+    try:
+        TOOL_REGISTRY.authorize(
+            agent_type=AgentType.companion,
+            capability=body.tool,
+            invocation_mode=InvocationMode.agent_callable,
+            requested_scopes=capability.data_scopes if capability is not None else frozenset(),
+        )
+    except CapabilityAuthorizationError as exc:
+        raise AppError(
+            403,
+            "AGENT_TOOL_NOT_ALLOWED_FOR_ROLE",
+            "Tool is not allowed for the Companion Agent role",
+            {
+                "agent_type": COMPANION_AGENT_SPEC.agent_type.value,
+                "tool": body.tool,
+                "reason": exc.reason,
+            },
+        ) from exc
     consent_rows = (
         await db.scalars(
             select(UserConsent).where(
@@ -736,16 +832,28 @@ async def execute_agent_tool(
         )
     if confirmation_required and not body.confirmed:
         raise AppError(409, "AGENT_TOOL_CONFIRMATION_REQUIRED", "该操作需要用户二次确认")
+    try:
+        arguments = validate_tool_arguments(body.tool, body.arguments)
+    except Exception as exc:
+        raise AppError(
+            422,
+            "AGENT_TOOL_ARGUMENTS_INVALID",
+            "Agent 工具参数不符合注册表结构",
+            {"tool": body.tool, "error_code": stable_tool_error(exc)},
+        ) from exc
     call_count = await db.scalar(
         select(func.count(AgentToolCall.id))
         .join(AgentRun, AgentRun.id == AgentToolCall.agent_run_id)
         .where(AgentRun.agent_session_id == agent.id)
     )
-    if (call_count or 0) >= get_settings().max_agent_tool_calls:
+    if (call_count or 0) >= get_settings().max_agent_tool_calls_per_trip:
         raise AppError(429, "AGENT_TOOL_BUDGET_EXCEEDED", "本次 Agent 工具调用次数已达上限")
 
     run = AgentRun(
         agent_session_id=agent.id,
+        agent_type=COMPANION_AGENT_SPEC.agent_type.value,
+        prompt_version=COMPANION_AGENT_SPEC.prompt_version,
+        budget_json=COMPANION_AGENT_SPEC.budget.model_dump_json(),
         trigger_type="user_or_controller",
         status="running",
         trace_id=request.state.trace_id,
@@ -782,31 +890,12 @@ async def execute_agent_tool(
                 if location
                 else {"location": None}
             )
-        elif body.tool == "search_poi":
-            from backend.app.schemas.ai_intent import Coordinate
-
-            keyword = str(body.arguments.get("keyword") or "").strip()
-            origin = Coordinate.model_validate(body.arguments.get("origin"))
-            found = await request.app.state.map_provider.search_poi(
-                keyword, origin, body.arguments.get("city")
-            )
-            output = {"candidates": [item.model_dump(mode="json") for item in found[:5]]}
         elif body.tool == "get_weather":
             from backend.app.schemas.ai_intent import Coordinate
 
-            weather_location = Coordinate.model_validate(body.arguments.get("location"))
+            weather_location = Coordinate.model_validate(arguments.get("location"))
             weather = await request.app.state.weather_provider.current(weather_location)
             output = weather.model_dump(mode="json")
-        elif body.tool == "generate_attraction_brief":
-            attraction_name = str(body.arguments.get("name") or "").strip()
-            brief = await request.app.state.knowledge_provider.attraction_brief(attraction_name)
-            if brief is None:
-                raise AppError(
-                    404,
-                    "ATTRACTION_KNOWLEDGE_NOT_FOUND",
-                    "知识库没有可追溯内容，Agent 不会编造讲解",
-                )
-            output = brief
         else:
             output = {
                 "action_proposal": body.tool,
@@ -814,30 +903,41 @@ async def execute_agent_tool(
                 "reason": "重要变更必须进入专用 Plan Patch 或授权流程",
             }
     except Exception as exc:
-        status, error_type = "failed", type(exc).__name__
+        status, error_type = "failed", stable_tool_error(exc)
+        output = tool_result_error(
+            error_type,
+            retryable=error_type == "UPSTREAM_TIMEOUT",
+        ).model_dump(mode="json")
         run.status = status
         db.add(
             AgentToolCall(
                 agent_run_id=run.id,
                 tool_name=body.tool,
-                input_json=json.dumps(body.arguments, ensure_ascii=False),
-                output_summary_json="{}",
+                input_json=json.dumps(minimize_agent_payload(arguments), ensure_ascii=False),
+                output_summary_json=json.dumps(
+                    minimize_agent_payload(output), ensure_ascii=False, default=str
+                ),
                 status=status,
                 error_type=error_type,
                 trace_id=request.state.trace_id,
             )
         )
         await db.commit()
-        raise
+        raise AppError(
+            502,
+            "AGENT_TOOL_UPSTREAM_ERROR",
+            "Agent 工具执行失败",
+            {"tool": body.tool, "error_code": error_type, "retryable": output["retryable"]},
+        ) from exc
+    output = tool_result_success(body.tool, output).model_dump(mode="json")
     run.status = status
     db.add(
         AgentToolCall(
             agent_run_id=run.id,
             tool_name=body.tool,
-            input_json=json.dumps(body.arguments, ensure_ascii=False),
-            output_summary_json=json.dumps(output, ensure_ascii=False, default=str),
-            upstream_provider=(
-                request.app.state.map_provider.name if body.tool == "search_poi" else None
+            input_json=json.dumps(minimize_agent_payload(arguments), ensure_ascii=False),
+            output_summary_json=json.dumps(
+                minimize_agent_payload(output), ensure_ascii=False, default=str
             ),
             status=status,
             error_type=error_type,
@@ -971,7 +1071,14 @@ async def export_private_data(user: CurrentUser, db: Db):
                 for item in consents
             ],
             "preferences": [
-                {"key": item.key, "value": json.loads(item.value_json)} for item in preferences
+                {
+                    "key": item.key,
+                    "value": json.loads(item.value_json),
+                    "source": item.source,
+                    "confirmed_at": item.confirmed_at,
+                    "updated_at": item.updated_at,
+                }
+                for item in preferences
             ],
             "locations": [
                 {
@@ -988,7 +1095,12 @@ async def export_private_data(user: CurrentUser, db: Db):
 
 
 @router.post("/privacy/purge")
-async def purge_private_data(body: PrivacyPurgeRequest, user: CurrentUser, db: Db):
+async def purge_private_data(
+    body: PrivacyPurgeRequest,
+    request: Request,
+    user: CurrentUser,
+    db: Db,
+):
     if body.confirmation != "DELETE_MY_LOCATION_AND_PREFERENCES":
         raise AppError(409, "PRIVACY_PURGE_CONFIRMATION_REQUIRED", "删除敏感数据需要明确确认")
     trip_ids = list(
@@ -1002,6 +1114,25 @@ async def purge_private_data(body: PrivacyPurgeRequest, user: CurrentUser, db: D
         locations_deleted = result.rowcount
     await db.execute(delete(UserPreference).where(UserPreference.user_id == user.id))
     await db.execute(delete(UserConsent).where(UserConsent.user_id == user.id))
+    task_ids = list(
+        (
+            await db.scalars(
+                select(AgentSharedStateSnapshot.task_id)
+                .join(
+                    AgentWorkflowRun,
+                    AgentWorkflowRun.id == AgentSharedStateSnapshot.workflow_run_id,
+                )
+                .where(AgentWorkflowRun.user_id == user.id)
+            )
+        ).all()
+    )
+    runtime_task_ids = set(task_ids) | {f"trip-{trip_id}-state" for trip_id in trip_ids}
+    runtime_states_deleted = 0
+    for task_id in runtime_task_ids:
+        if await request.app.state.runtime_store.delete_json(
+            f"agent-shared-state:v1:{task_id}"
+        ):
+            runtime_states_deleted += 1
     await db.commit()
     return {
         "ok": True,
@@ -1009,5 +1140,6 @@ async def purge_private_data(body: PrivacyPurgeRequest, user: CurrentUser, db: D
             "locations_deleted": locations_deleted,
             "preferences_deleted": True,
             "consents_revoked": True,
+            "runtime_shared_states_deleted": runtime_states_deleted,
         },
     }

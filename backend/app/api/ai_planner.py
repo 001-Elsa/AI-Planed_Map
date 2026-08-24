@@ -3,7 +3,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Header, Query, Request
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from backend.app.api.deps import CurrentUser, Db
@@ -11,6 +11,8 @@ from backend.app.core.config import get_settings
 from backend.app.core.exceptions import AppError
 from backend.app.core.observability import metrics
 from backend.app.models import (
+    AgentArtifact,
+    AgentWorkflowRun,
     DecisionAuditLog,
     IdempotencyRecord,
     PlanningConversation,
@@ -20,6 +22,7 @@ from backend.app.models import (
     TripEvent,
     TripSession,
 )
+from backend.app.schemas.agent_artifacts import AgentWorkflowTrace
 from backend.app.schemas.ai_intent import (
     MAX_PLANNING_TASKS,
     AIPlanRequest,
@@ -27,10 +30,61 @@ from backend.app.schemas.ai_intent import (
     CreatePlanPatchRequest,
     DecidePlanPatchRequest,
 )
+from backend.app.services.agent_memory import (
+    MemoryApplication,
+    apply_long_term_preferences,
+    load_confirmed_preferences,
+)
+from backend.app.services.agent_orchestrator import persist_agent_workflow
+from backend.app.services.agent_shared_state import AgentSharedStateManager
+from backend.app.services.agents.critic_agent import build_critic_agent
 from backend.app.services.intent_parser import build_intent_parser
+from backend.app.services.plan_patch_validator import (
+    apply_patch_structure,
+    recalculate_and_validate_snapshot,
+)
 from backend.app.services.planning_service import PlanningService, request_fingerprint
 
 router = APIRouter(prefix="/ai", tags=["ai-planner"])
+
+
+def _planning_service(request: Request, parser, settings):
+    return PlanningService(
+        parser,
+        request.app.state.map_provider,
+        settings,
+        critic_agent=build_critic_agent(settings, request.app.state.http_client),
+        shared_state=AgentSharedStateManager(request.app.state.runtime_store, settings),
+    )
+
+
+def _workflow_usage(result) -> tuple[int, int, float]:
+    raw = result.agent_workflow or {}
+    trace = AgentWorkflowTrace.model_validate(raw)
+    return (
+        sum(step.input_tokens for step in trace.steps),
+        sum(step.output_tokens for step in trace.steps),
+        trace.total_cost_usd,
+    )
+
+
+def _record_workflow_metrics(trace: AgentWorkflowTrace) -> None:
+    metrics.increment(
+        "mapgo_agent_workflows_total", {"mode": trace.mode.value, "status": trace.status}
+    )
+    metrics.observe(
+        "mapgo_agent_workflow_cost_usd", trace.total_cost_usd, {"mode": trace.mode.value}
+    )
+    for step in trace.steps:
+        metrics.increment(
+            "mapgo_agent_role_runs_total",
+            {"agent": step.agent_type.value, "status": step.status},
+        )
+        metrics.observe(
+            "mapgo_agent_role_latency_seconds",
+            step.latency_ms / 1000,
+            {"agent": step.agent_type.value},
+        )
 
 
 def _aware(value: datetime) -> datetime:
@@ -40,6 +94,56 @@ def _aware(value: datetime) -> datetime:
 def _execution_trace(result, parser, request: Request, latency_ms: int) -> dict:
     estimated_edges = sum(1 for stop in result.stops if stop.travel.fallback_used)
     verified_edges = len(result.stops) - estimated_edges
+    agent_trace = AgentWorkflowTrace.model_validate(result.agent_workflow or {})
+    stages = [
+        {
+            "key": "intent",
+            "label": "Intent Agent",
+            "status": "complete",
+            "detail": f"识别 {len(result.intent.tasks)} 个任务；无 POI 工具权限",
+        },
+        {
+            "key": "poi",
+            "label": "核验地点",
+            "status": "complete" if result.status != "need_clarification" else "attention",
+            "detail": f"比较 {result.candidate_count} 个真实候选",
+        },
+        {
+            "key": "route",
+            "label": "计算路网",
+            "status": "complete" if result.stops else "pending",
+            "detail": f"{verified_edges} 段 Provider 路线，{estimated_edges} 段估算",
+        },
+        {
+            "key": "optimize",
+            "label": "确定性约束求解",
+            "status": (
+                "blocked"
+                if result.status == "infeasible"
+                else "complete"
+                if result.status == "success"
+                else "pending"
+            ),
+            "detail": result.algorithm or "等待补充信息",
+        },
+    ]
+    critic_step = next(
+        (step for step in agent_trace.steps if step.agent_type.value == "critic"), None
+    )
+    stages.append(
+        {
+            "key": "critic",
+            "label": "Critic Agent",
+            "status": critic_step.status if critic_step else "pending",
+            "detail": (
+                result.critic_review.summary
+                if result.critic_review
+                else "方案证据审阅完成"
+                if critic_step
+                else "等待形成可审阅方案"
+            ),
+        }
+    )
     return {
         "trace_id": request.state.trace_id,
         "latency_ms": latency_ms,
@@ -49,38 +153,96 @@ def _execution_trace(result, parser, request: Request, latency_ms: int) -> dict:
         "verified_route_edges": verified_edges,
         "estimated_route_edges": estimated_edges,
         "formal_plan_persisted": False,
-        "stages": [
-            {
-                "key": "intent",
-                "label": "理解需求",
-                "status": "complete",
-                "detail": f"识别 {len(result.intent.tasks)} 个任务",
-            },
-            {
-                "key": "poi",
-                "label": "核验地点",
-                "status": "complete" if result.status != "need_clarification" else "attention",
-                "detail": f"比较 {result.candidate_count} 个真实候选",
-            },
-            {
-                "key": "route",
-                "label": "计算路网",
-                "status": "complete" if result.stops else "pending",
-                "detail": f"{verified_edges} 段 Provider 路线，{estimated_edges} 段估算",
-            },
-            {
-                "key": "optimize",
-                "label": "约束求解",
-                "status": (
-                    "blocked"
-                    if result.status == "infeasible"
-                    else "complete"
-                    if result.status == "success"
-                    else "pending"
-                ),
-                "detail": result.algorithm or "等待补充信息",
-            },
-        ],
+        "agent_roles": [step.agent_type.value for step in agent_trace.steps],
+        "agent_workflow_id": agent_trace.workflow_id,
+        "stages": stages,
+    }
+
+
+def _execution_trace_v2(result, parser, request: Request, latency_ms: int) -> dict:
+    estimated_edges = sum(1 for stop in result.stops if stop.travel.fallback_used)
+    verified_edges = len(result.stops) - estimated_edges
+    agent_trace = AgentWorkflowTrace.model_validate(result.agent_workflow or {})
+    role_status = {step.agent_type.value: step.status for step in agent_trace.steps}
+    critic_step = next(
+        (step for step in agent_trace.steps if step.agent_type.value == "critic"), None
+    )
+    human_questions = [
+        question for question in result.questions if getattr(question, "kind", None) == "confirmation"
+    ]
+    stages = [
+        {
+            "key": "supervisor",
+            "label": "Supervisor Agent",
+            "status": role_status.get("supervisor", "pending"),
+            "detail": "任务拆分、角色调度、状态管理和错误恢复",
+        },
+        {
+            "key": "intent",
+            "label": "Intent Agent",
+            "status": role_status.get("intent", "pending"),
+            "detail": f"识别 {len(result.intent.tasks)} 个任务；无 POI 生成权限",
+        },
+        {
+            "key": "search",
+            "label": "Search Stage",
+            "status": role_status.get("search", "attention" if result.questions else "pending"),
+            "detail": f"召回并校验 {result.candidate_count} 个真实候选地点",
+        },
+        {
+            "key": "planner",
+            "label": "Planner Stage",
+            "status": (
+                "blocked"
+                if result.status == "infeasible"
+                else role_status.get("planner", "pending")
+            ),
+            "detail": (
+                f"{result.algorithm or 'pending'}; {verified_edges} verified edges, "
+                f"{estimated_edges} estimated edges"
+            ),
+        },
+        {
+            "key": "critic",
+            "label": "Critic Agent",
+            "status": critic_step.status if critic_step else "pending",
+            "detail": (
+                result.critic_review.summary
+                if result.critic_review
+                else "方案证据审阅完成"
+                if critic_step
+                else "等待形成可审阅方案"
+            ),
+        },
+        {
+            "key": "human_confirmation",
+            "label": "Human-in-the-loop",
+            "status": "attention" if human_questions else "complete",
+            "detail": (
+                f"等待用户确认 {len(human_questions)} 个高影响决策"
+                if human_questions
+                else "未触发人工确认闸门"
+            ),
+        },
+        {
+            "key": "final",
+            "label": "Final Answer",
+            "status": result.status,
+            "detail": result.explanation or "等待补充信息",
+        },
+    ]
+    return {
+        "trace_id": request.state.trace_id,
+        "latency_ms": latency_ms,
+        "intent_parser": parser.name,
+        "parser_fallback_used": bool(getattr(parser, "fallback_used", False)),
+        "map_provider": request.app.state.map_provider.name,
+        "verified_route_edges": verified_edges,
+        "estimated_route_edges": estimated_edges,
+        "formal_plan_persisted": False,
+        "agent_roles": [step.agent_type.value for step in agent_trace.steps],
+        "agent_workflow_id": agent_trace.workflow_id,
+        "stages": stages,
     }
 
 
@@ -104,6 +266,73 @@ async def planning_capabilities(request: Request):
             "persistence": True,
             "versioned_plans": True,
             "dynamic_replanning": True,
+            "multi_agent": {
+                "enabled": settings.multi_agent_enabled,
+                "critic_mode": settings.plan_critic_mode,
+                "isolated_roles": [
+                    "supervisor",
+                    "intent",
+                    "search",
+                    "planner",
+                    "critic",
+                    "companion",
+                ],
+                "max_handoffs": settings.max_agent_handoffs,
+                "max_workflow_cost_usd": settings.max_agent_workflow_cost_usd,
+                "message_protocol": {
+                    "version": "1.0",
+                    "structured_content": True,
+                    "route_allowlist": True,
+                    "causal_tracing": True,
+                    "idempotent_delivery": True,
+                    "audit_payload_minimized": True,
+                },
+                "shared_state": {
+                    "version": "1.0",
+                    "runtime_backend": (
+                        "redis"
+                        if request.app.state.runtime_store.__class__.__name__
+                        == "RedisRuntimeStore"
+                        else "in_memory"
+                    ),
+                    "ttl_seconds": settings.agent_shared_state_ttl_seconds,
+                    "optimistic_concurrency": True,
+                    "role_scoped_views": True,
+                    "durable_minimized_snapshot": True,
+                    "delete_on_task_completion": True,
+                },
+                "memory": {
+                    "short_term": "runtime_store_delete_on_completion_with_ttl_fallback",
+                    "long_term": "postgresql_explicit_confirmation_only",
+                    "request_override_precedence": True,
+                    "per_request_opt_out": True,
+                    "agent_database_access": False,
+                },
+                "evaluation": {
+                    "intent_golden_cases": True,
+                    "route_golden_cases": True,
+                    "runtime_critic_scoring": True,
+                    "formula": "distance*0.40 + time*0.30 + preference*0.30",
+                    "hard_fail_zero_score": True,
+                    "default_quality_threshold": 75,
+                },
+                "human_in_the_loop": {
+                    "enabled": True,
+                    "protocol": "confirmation_question_over_clarification_continue",
+                    "gates": [
+                        "walking_distance",
+                        "estimated_cost",
+                    ],
+                    "reject_replans": True,
+                },
+                "critic_enforce_thresholds": {
+                    "min_shadow_samples": settings.critic_enforce_min_shadow_samples,
+                    "max_fallback_rate": settings.critic_enforce_max_fallback_rate,
+                    "max_blocking_rate": settings.critic_enforce_max_blocking_rate,
+                    "max_budget_exceeded_rate": settings.critic_enforce_max_budget_exceeded_rate,
+                    "max_p95_latency_ms": settings.critic_enforce_max_p95_latency_ms,
+                },
+            },
             "max_tasks": MAX_PLANNING_TASKS,
             "max_candidates_per_task": 5,
             "max_route_matrix_points": settings.max_route_matrix_points,
@@ -178,6 +407,24 @@ async def _record_ai_usage(request: Request, user_id: int, input_tokens: int, ou
         metrics.increment("mapgo_ai_token_quota_overshoot_total")
 
 
+async def _request_with_long_term_memory(
+    db: Db, user_id: int, body: AIPlanRequest
+) -> tuple[AIPlanRequest, MemoryApplication]:
+    values, ignored = await load_confirmed_preferences(db, user_id)
+    return apply_long_term_preferences(body, values, ignored_invalid_keys=ignored)
+
+
+def _memory_execution_stage(memory: MemoryApplication) -> dict[str, str]:
+    if not memory.enabled:
+        status, detail = "disabled", "本次请求已关闭长期记忆"
+    elif memory.applied_keys:
+        status = "complete"
+        detail = f"应用 {len(memory.applied_keys)} 项已确认长期软偏好；本次请求优先"
+    else:
+        status, detail = "complete", "未应用长期默认值；本次请求或文本意图优先"
+    return {"key": "memory", "label": "Memory", "status": status, "detail": detail}
+
+
 async def _execute_conversation_plan(
     body: AIPlanRequest,
     request: Request,
@@ -187,22 +434,42 @@ async def _execute_conversation_plan(
 ) -> dict:
     settings = get_settings()
     await _enforce_ai_budget(request, user.id, body.text)
+    if conversation is None:
+        body, memory = await _request_with_long_term_memory(db, user.id, body)
+    else:
+        previous = json.loads(conversation.result_json or "{}").get("memory") or {}
+        memory = MemoryApplication(
+            enabled=bool(previous.get("enabled", body.use_long_term_memory)),
+            source=str(previous.get("source") or "conversation_frozen"),
+            applied_keys=tuple(previous.get("applied_keys") or ()),
+            skipped_explicit_keys=tuple(previous.get("skipped_explicit_keys") or ()),
+            ignored_invalid_count=int(previous.get("ignored_invalid_count") or 0),
+        )
     parser = build_intent_parser(settings, request.app.state.http_client)
     started = time.perf_counter()
-    result = await PlanningService(parser, request.app.state.map_provider, settings).plan(body)
+    result = await _planning_service(request, parser, settings).plan(body)
     if getattr(parser, "fallback_used", False):
         metrics.increment(
             "mapgo_llm_fallback_total", {"parser": getattr(parser, "last_parser", "unknown")}
         )
     data = result.model_dump(mode="json")
-    data["execution"] = _execution_trace(
+    data["memory"] = memory.as_dict()
+    if set(memory.applied_keys) & {
+        "preferred_categories",
+        "preferred_environment",
+        "avoid_queues",
+    }:
+        data["warnings"].append(
+            "长期地点偏好仅用于候选召回；拥挤度、排队和环境特征仍需 Provider 事实验证。"
+        )
+    data["execution"] = _execution_trace_v2(
         result,
         parser,
         request,
         round((time.perf_counter() - started) * 1000),
     )
-    input_tokens = int(getattr(parser, "input_tokens", 0))
-    output_tokens = int(getattr(parser, "output_tokens", 0))
+    data["execution"]["stages"].insert(1, _memory_execution_stage(memory))
+    input_tokens, output_tokens, workflow_cost = _workflow_usage(result)
     await _record_ai_usage(request, user.id, input_tokens, output_tokens)
     if conversation is None:
         conversation = PlanningConversation(
@@ -238,11 +505,7 @@ async def _execute_conversation_plan(
             trace_id=request.state.trace_id,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            estimated_cost_usd=(
-                input_tokens * settings.llm_input_cost_per_million_usd
-                + output_tokens * settings.llm_output_cost_per_million_usd
-            )
-            / 1_000_000,
+            estimated_cost_usd=workflow_cost,
         )
         db.add(run)
         await db.flush()
@@ -267,6 +530,23 @@ async def _execute_conversation_plan(
                 "detail": "已写入可回滚版本 v1",
             }
         )
+        version.snapshot_json = json.dumps(data, ensure_ascii=False)
+        run.result_json = json.dumps(data, ensure_ascii=False)
+    trace = AgentWorkflowTrace.model_validate(data["agent_workflow"])
+    workflow = await persist_agent_workflow(
+        db,
+        user_id=user.id,
+        trace_id=request.state.trace_id,
+        trace=trace,
+        trigger_type="planning_conversation",
+        planning_conversation_id=conversation.id,
+        planning_run_id=data.get("planning_run_id"),
+    )
+    data["agent_workflow"]["workflow_id"] = workflow.id
+    data["execution"]["agent_workflow_id"] = workflow.id
+    _record_workflow_metrics(trace)
+    conversation.result_json = json.dumps(data, ensure_ascii=False)
+    if result.status != "need_clarification":
         version.snapshot_json = json.dumps(data, ensure_ascii=False)
         run.result_json = json.dumps(data, ensure_ascii=False)
     await db.commit()
@@ -472,9 +752,10 @@ async def create_ai_plan(
 
     if not budget_checked:
         await _enforce_ai_budget(request, user.id, body.text)
-    started = time.perf_counter()
-    service = PlanningService(parser, request.app.state.map_provider, settings)
     try:
+        body, memory = await _request_with_long_term_memory(db, user.id, body)
+        started = time.perf_counter()
+        service = _planning_service(request, parser, settings)
         result = await service.plan(body)
     except Exception as exc:
         if record:
@@ -488,13 +769,23 @@ async def create_ai_plan(
             {"parser": getattr(parser, "last_parser", "unknown")},
         )
     response_data = result.model_dump(mode="json")
+    response_data["memory"] = memory.as_dict()
+    if set(memory.applied_keys) & {
+        "preferred_categories",
+        "preferred_environment",
+        "avoid_queues",
+    }:
+        response_data["warnings"].append(
+            "长期地点偏好仅用于候选召回；拥挤度、排队和环境特征仍需 Provider 事实验证。"
+        )
     planning_seconds = time.perf_counter() - started
-    response_data["execution"] = _execution_trace(
+    response_data["execution"] = _execution_trace_v2(
         result,
         parser,
         request,
         round(planning_seconds * 1000),
     )
+    response_data["execution"]["stages"].insert(1, _memory_execution_stage(memory))
     metrics.observe(
         "mapgo_planning_duration_seconds",
         planning_seconds,
@@ -508,13 +799,9 @@ async def create_ai_plan(
         "mapgo_route_fallback_edges_total",
         value=sum(1 for stop in result.stops if stop.travel.fallback_used),
     )
-    input_tokens = int(getattr(parser, "input_tokens", 0))
-    output_tokens = int(getattr(parser, "output_tokens", 0))
+    input_tokens, output_tokens, workflow_cost = _workflow_usage(result)
     await _record_ai_usage(request, user.id, input_tokens, output_tokens)
-    estimated_cost = (
-        input_tokens * settings.llm_input_cost_per_million_usd
-        + output_tokens * settings.llm_output_cost_per_million_usd
-    ) / 1_000_000
+    estimated_cost = workflow_cost
     run = PlanningRun(
         user_id=user.id,
         input_text=body.text,
@@ -533,6 +820,18 @@ async def create_ai_plan(
     db.add(run)
     await db.flush()
     response_data["planning_run_id"] = run.id
+    trace = AgentWorkflowTrace.model_validate(response_data["agent_workflow"])
+    workflow = await persist_agent_workflow(
+        db,
+        user_id=user.id,
+        trace_id=request.state.trace_id,
+        trace=trace,
+        trigger_type="planning_request",
+        planning_run_id=run.id,
+    )
+    response_data["agent_workflow"]["workflow_id"] = workflow.id
+    response_data["execution"]["agent_workflow_id"] = workflow.id
+    _record_workflow_metrics(trace)
     if result.status != "need_clarification":
         version = PlanVersion(
             planning_run_id=run.id,
@@ -755,50 +1054,7 @@ async def create_plan_patch(
 
 
 def _apply_structure(snapshot: dict, operations: list[dict]) -> list[dict]:
-    stops = list(snapshot.get("stops") or [])
-    for operation in operations:
-        if operation["operation"] == "remove_stop":
-            stop_id = operation.get("stop_id")
-            position = next(
-                (i for i, stop in enumerate(stops) if stop["poi"]["id"] == stop_id),
-                None,
-            )
-            if position is None:
-                raise AppError(422, "PATCH_STOP_NOT_FOUND", f"找不到站点 {stop_id!r}")
-            stops.pop(position)
-        elif operation["operation"] == "move_stop":
-            source = operation.get("from_position")
-            target = operation.get("to_position")
-            if source is None or target is None or source >= len(stops) or target >= len(stops):
-                raise AppError(422, "PATCH_POSITION_INVALID", "移动站点的位置无效")
-            stops.insert(target, stops.pop(source))
-        elif operation["operation"] == "replace_stop":
-            stop_id = operation.get("stop_id")
-            replacement = operation.get("replacement_stop")
-            position = next(
-                (i for i, stop in enumerate(stops) if stop["poi"]["id"] == stop_id),
-                None,
-            )
-            if position is None:
-                raise AppError(422, "PATCH_STOP_NOT_FOUND", f"找不到站点 {stop_id!r}")
-            if (
-                not isinstance(replacement, dict)
-                or not replacement.get("poi")
-                or not replacement.get("task")
-            ):
-                raise AppError(422, "PATCH_REPLACEMENT_INVALID", "替换站点必须包含 POI 和任务")
-            stops[position] = replacement
-        elif operation["operation"] == "change_transport_mode":
-            mode = operation.get("transport_mode")
-            try:
-                from backend.app.schemas.ai_intent import TransportMode
-
-                snapshot.setdefault("intent", {})["transport_mode"] = TransportMode(mode).value
-            except (TypeError, ValueError) as exc:
-                raise AppError(422, "PATCH_TRANSPORT_MODE_INVALID", "交通方式无效") from exc
-    if not stops:
-        raise AppError(422, "PATCH_EMPTY_PLAN", "正式计划至少需要保留一个站点")
-    return stops
+    return apply_patch_structure(snapshot, operations)
 
 
 async def _recalculate_snapshot(
@@ -807,78 +1063,7 @@ async def _recalculate_snapshot(
     provider,
     replan_context: dict | None = None,
 ) -> tuple[dict, list[str]]:
-    context = replan_context or {}
-    origin = context.get("origin") or snapshot.get("origin")
-    departure_raw = context.get("departure_time") or snapshot.get("departure_time")
-    if not origin or not departure_raw:
-        raise AppError(409, "PATCH_CONTEXT_MISSING", "原计划缺少可重算的起点或出发时间")
-    from backend.app.schemas.ai_intent import Coordinate, TransportMode
-
-    coordinates = [
-        Coordinate.model_validate(origin),
-        *(Coordinate.model_validate(stop["poi"]["location"]) for stop in stops),
-    ]
-    mode = TransportMode(snapshot["intent"]["transport_mode"])
-    matrix = await provider.route_matrix(coordinates, mode)
-    cursor = datetime.fromisoformat(departure_raw)
-    total_distance = 0.0
-    total_seconds = 0.0
-    conflicts = []
-    for index, stop in enumerate(stops):
-        edge = matrix.edges[index][index + 1]
-        cursor += timedelta(seconds=edge.duration_seconds)
-        task = stop["task"]
-        earliest = (
-            datetime.fromisoformat(task["earliest_arrival"])
-            if task.get("earliest_arrival")
-            else None
-        )
-        if earliest and cursor < earliest:
-            cursor = earliest
-        arrival = cursor
-        deadline = datetime.fromisoformat(task["deadline"]) if task.get("deadline") else None
-        if deadline and arrival > deadline:
-            conflicts.append(
-                f"“{task['description']}”预计 {arrival:%H:%M} 到达，超过截止时间 {deadline:%H:%M}"
-            )
-        service_minutes = max(
-            task.get("service_duration_minutes") or 0,
-            task.get("min_service_duration_minutes") or 0,
-        )
-        cursor += timedelta(minutes=service_minutes)
-        stop["arrival_time"] = arrival.isoformat()
-        stop["departure_time"] = cursor.isoformat()
-        stop["travel"] = edge.model_dump(mode="json")
-        stop["constraint_satisfied"] = not bool(deadline and arrival > deadline)
-        total_distance += edge.distance_meters
-        total_seconds += edge.duration_seconds
-    hard = snapshot["intent"].get("constraints", {}).get("hard", {})
-    latest = (
-        datetime.fromisoformat(hard["latest_return_time"])
-        if hard.get("latest_return_time")
-        else None
-    )
-    if latest and cursor > latest:
-        conflicts.append(f"调整后预计 {cursor:%H:%M} 完成，超过最晚返回时间 {latest:%H:%M}")
-    max_walk = hard.get("max_walking_meters")
-    if mode == TransportMode.walking and max_walk is not None and total_distance > max_walk:
-        conflicts.append(f"调整后步行 {total_distance:.0f} 米，超过上限 {max_walk:.0f} 米")
-    max_cost = hard.get("max_total_cost_yuan")
-    total_cost = sum(
-        float((stop.get("poi") or {}).get("estimated_cost_yuan") or 0) for stop in stops
-    )
-    if max_cost is not None and total_cost > float(max_cost):
-        conflicts.append(f"调整后预估费用 {total_cost:.0f} 元，超过上限 {float(max_cost):.0f} 元")
-    snapshot["stops"] = stops
-    snapshot["total_distance_meters"] = total_distance
-    snapshot["total_travel_seconds"] = total_seconds
-    snapshot["estimated_cost_yuan"] = total_cost
-    snapshot["confidence"] = min(
-        (stop["travel"]["confidence"] for stop in stops),
-        default=0,
-    )
-    snapshot["algorithm"] = "validated-plan-patch"
-    return snapshot, conflicts
+    return await recalculate_and_validate_snapshot(snapshot, stops, provider, replan_context)
 
 
 @router.post("/plans/{run_id}/patches/{patch_id}/decision")
@@ -971,6 +1156,8 @@ async def decide_plan_patch(
         impact.get("replan_context"),
     )
     if conflicts:
+        patch.status = "blocked"
+        patch.decided_at = datetime.now(timezone.utc)
         db.add(
             DecisionAuditLog(
                 planning_run_id=run_id,
@@ -1026,6 +1213,17 @@ async def decide_plan_patch(
                 processed_at=decided_at,
             )
         )
+    await db.execute(
+        update(AgentArtifact)
+        .where(
+            AgentArtifact.workflow_run_id.in_(
+                select(AgentWorkflowRun.id).where(AgentWorkflowRun.planning_run_id == run_id)
+            ),
+            AgentArtifact.status == "active",
+            (AgentArtifact.plan_version.is_(None)) | (AgentArtifact.plan_version < current + 1),
+        )
+        .values(status="stale", invalidated_at=decided_at)
+    )
     db.add(
         DecisionAuditLog(
             planning_run_id=run_id,

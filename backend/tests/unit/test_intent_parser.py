@@ -92,3 +92,17 @@ def test_joined_optimization_clause_does_not_become_a_fake_place():
         "北京路步行街",
         "广东省博物馆",
     ]
+
+
+def test_relaxed_trip_and_hiking_avoidance_are_typed_preferences():
+    intent = asyncio.run(RuleBasedIntentParser().parse("不想爬山，希望轻松旅游。"))
+
+    assert intent.preferences.avoid_hiking is True
+    assert intent.preferences.travel_style == "relaxed"
+    assert intent.preferences.minimize_walking is True
+
+    intensive = asyncio.run(
+        RuleBasedIntentParser().parse("不要爬山，但希望行程紧凑，多打卡。")
+    )
+    assert intensive.preferences.avoid_hiking is True
+    assert intensive.preferences.travel_style == "intensive"

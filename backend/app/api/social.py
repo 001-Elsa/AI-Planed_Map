@@ -43,7 +43,9 @@ async def create_share(body: ShareCreate, user: CurrentUser, db: Db):
     encoded = json.dumps(body.payload, ensure_ascii=False)
     if len(encoded.encode()) > 500_000:
         raise AppError(413, "PAYLOAD_TOO_LARGE", "分享内容过大")
-    item = Share(token=secrets.token_hex(8), user_id=user.id, type=body.type, payload=encoded)
+    # Public links may expose precise routes, so use a full 128-bit capability
+    # token. Existing shorter tokens remain readable for backward compatibility.
+    item = Share(token=secrets.token_hex(16), user_id=user.id, type=body.type, payload=encoded)
     db.add(item)
     await db.commit()
     return {"ok": True, "data": {"token": item.token}}

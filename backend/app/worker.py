@@ -25,6 +25,7 @@ from backend.app.models import (
 from backend.app.schemas.companion import ConsentScope
 from backend.app.services.agent_controller import AgentController
 from backend.app.services.agent_decider import AgentDecider, build_agent_decider
+from backend.app.services.agent_shared_state import AgentSharedStateManager
 from backend.app.services.notifications import NotificationService, render_event_notification
 from backend.app.services.replanning import PendingReplanRequest, create_pending_replan
 from backend.app.services.trip_stream import publish_trip_stream
@@ -32,6 +33,24 @@ from backend.app.services.trip_stream import publish_trip_stream
 logger = logging.getLogger("mapgo.worker")
 TRIP_EVENTS_QUEUE = "mapgo:trip-events"
 NOTIFICATION_QUEUE = "mapgo:notifications"
+
+
+async def _maintain_lock_lease(
+    store,
+    lock_name: str,
+    token: str,
+    *,
+    ttl_seconds: int,
+    interval_seconds: int,
+) -> None:
+    while True:
+        await asyncio.sleep(max(1, interval_seconds))
+        renewed = await store.renew_lock(lock_name, token, ttl_seconds)
+        if not renewed:
+            metrics.increment("mapgo_worker_lock_renewal_failed_total")
+            logger.warning("worker_lock_renewal_failed lock=%s", lock_name)
+            return
+        metrics.increment("mapgo_worker_lock_renewals_total")
 
 
 async def cleanup_expired_locations() -> int:
@@ -82,12 +101,22 @@ async def process_trip_event(
     event_id = payload.get("event_id")
     event_type = str(payload.get("event_type") or "")
     attempt = int(payload.get("_attempt") or 0)
+    settings = get_settings()
     lock_name = f"agent-run:trip:{trip_id}"
-    token = await store.acquire_lock(lock_name, 30)
+    token = await store.acquire_lock(lock_name, settings.worker_lock_ttl_seconds)
     if token is None:
         await store.enqueue_retry(TRIP_EVENTS_QUEUE, payload, attempt=attempt + 1, max_attempts=8)
         metrics.increment("mapgo_worker_lock_contention_total", {"queue": "trip-events"})
         return
+    lease_task = asyncio.create_task(
+        _maintain_lock_lease(
+            store,
+            lock_name,
+            token,
+            ttl_seconds=settings.worker_lock_ttl_seconds,
+            interval_seconds=settings.worker_lock_renew_interval_seconds,
+        )
+    )
 
     try:
         async with SessionLocal() as db:
@@ -212,7 +241,11 @@ async def process_trip_event(
                         return replan_result
                     return {"status": "unsupported_in_worker", "tool": tool}
 
-                controller = AgentController(db, decider=decider)
+                controller = AgentController(
+                    db,
+                    decider=decider,
+                    shared_state=AgentSharedStateManager(store, get_settings()),
+                )
                 result = await controller.run_once(
                     trip=trip,
                     agent=agent,
@@ -227,14 +260,21 @@ async def process_trip_event(
                     consents=consents,
                     tool_executor=tool_executor,
                     trace_id=str(payload.get("trace_id") or ""),
+                    route_plan=json.loads(version.snapshot_json) if version is not None else None,
                 )
                 metrics.increment(
                     "mapgo_worker_agent_runs_total",
                     {"status": result.get("status") or "unknown"},
                 )
+                metrics.increment(
+                    "mapgo_agent_role_runs_total",
+                    {"agent": "companion", "status": result.get("status") or "unknown"},
+                )
                 if event is not None:
                     decision["agent_run"] = {
                         "run_id": result.get("run_id"),
+                        "workflow_id": result.get("workflow_id"),
+                        "agent_type": "companion",
                         "status": result.get("status"),
                     }
                     if replan_result is not None:
@@ -278,6 +318,11 @@ async def process_trip_event(
         metrics.increment("mapgo_worker_retries_total", {"disposition": disposition})
         raise
     finally:
+        lease_task.cancel()
+        try:
+            await lease_task
+        except asyncio.CancelledError:
+            pass
         await store.release_lock(lock_name, token)
 
 
@@ -317,6 +362,18 @@ async def run_worker() -> None:
     map_provider = build_map_provider(settings, client)
     weather_provider = build_weather_provider(client, settings.mock_weather_provider)
     decider = build_agent_decider(settings, client)
+    recovered_trip_events = await store.recover_processing(
+        TRIP_EVENTS_QUEUE, settings.worker_recover_processing_limit
+    )
+    recovered_notifications = await store.recover_processing(
+        NOTIFICATION_QUEUE, settings.worker_recover_processing_limit
+    )
+    if recovered_trip_events or recovered_notifications:
+        logger.warning(
+            "recovered_inflight trip_events=%s notifications=%s",
+            recovered_trip_events,
+            recovered_notifications,
+        )
     logger.info("MapGo worker started")
     try:
         while True:
@@ -324,22 +381,27 @@ async def run_worker() -> None:
                 await store.promote_retries(TRIP_EVENTS_QUEUE)
                 await store.promote_retries(NOTIFICATION_QUEUE)
 
-            item = await store.dequeue(TRIP_EVENTS_QUEUE, timeout_seconds=2)
-            if item:
+            reserved = await store.reserve(TRIP_EVENTS_QUEUE, timeout_seconds=2)
+            if reserved:
                 try:
                     await process_trip_event(
                         store,
-                        item,
+                        reserved.payload,
                         map_provider=map_provider,
                         weather_provider=weather_provider,
                         decider=decider,
                     )
                 except Exception:
                     logger.exception("trip event handler crashed")
+                finally:
+                    await store.acknowledge(TRIP_EVENTS_QUEUE, reserved.receipt)
 
-            note = await store.dequeue(NOTIFICATION_QUEUE, timeout_seconds=1)
-            if note:
-                await process_notification(store, note)
+            reserved_note = await store.reserve(NOTIFICATION_QUEUE, timeout_seconds=1)
+            if reserved_note:
+                try:
+                    await process_notification(store, reserved_note.payload)
+                finally:
+                    await store.acknowledge(NOTIFICATION_QUEUE, reserved_note.receipt)
 
             removed = await cleanup_expired_locations()
             if removed:

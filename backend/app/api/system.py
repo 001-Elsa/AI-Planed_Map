@@ -8,6 +8,7 @@ from backend.app.clients.amap_client import build_map_provider
 from backend.app.core.config import get_settings
 from backend.app.core.exceptions import AppError
 from backend.app.models import Checkin, Favorite, Plan, Setting, Share, Track, User
+from backend.app.services.agent_readiness import evaluate_critic_enforcement_readiness
 
 router = APIRouter(tags=["system"])
 BOOT_TIME = time.monotonic()
@@ -38,8 +39,10 @@ async def setting(db: Db, key: str) -> str:
 @router.get("/config")
 async def config(db: Db):
     settings = get_settings()
-    key = await setting(db, "amap_key") or settings.amap_key
-    jscode = await setting(db, "amap_jscode") or settings.amap_jscode
+    configured_key = "" if settings.disable_configured_map_credentials else settings.amap_key
+    configured_jscode = "" if settings.disable_configured_map_credentials else settings.amap_jscode
+    key = await setting(db, "amap_key") or configured_key
+    jscode = await setting(db, "amap_jscode") or configured_jscode
     return {
         "ok": True,
         "data": {
@@ -60,8 +63,10 @@ def require_admin(user) -> None:
 async def get_amap_key(user: CurrentUser, db: Db):
     require_admin(user)
     settings = get_settings()
-    key = await setting(db, "amap_key") or settings.amap_key
-    jscode = await setting(db, "amap_jscode") or settings.amap_jscode
+    configured_key = "" if settings.disable_configured_map_credentials else settings.amap_key
+    configured_jscode = "" if settings.disable_configured_map_credentials else settings.amap_jscode
+    key = await setting(db, "amap_key") or configured_key
+    jscode = await setting(db, "amap_jscode") or configured_jscode
     return {
         "ok": True,
         "data": {
@@ -78,7 +83,8 @@ async def set_amap_key(body: dict, request: Request, user: CurrentUser, db: Db):
     key = str(body.get("key") or "").strip()
     jscode = str(body.get("jscode") or "").strip()
     settings = get_settings()
-    previous_jscode = await setting(db, "amap_jscode") or settings.amap_jscode
+    configured_jscode = "" if settings.disable_configured_map_credentials else settings.amap_jscode
+    previous_jscode = await setting(db, "amap_jscode") or configured_jscode
     updates = [("amap_key", key)]
     if not key:
         updates.append(("amap_jscode", ""))
@@ -93,7 +99,11 @@ async def set_amap_key(body: dict, request: Request, user: CurrentUser, db: Db):
     await db.commit()
     effective_jscode = jscode or previous_jscode if key else ""
     runtime_settings = settings.model_copy(
-        update={"amap_key": key, "amap_jscode": effective_jscode}
+        update={
+            "amap_key": key,
+            "amap_jscode": effective_jscode,
+            "disable_configured_map_credentials": False,
+        }
     )
     request.app.state.map_provider = build_map_provider(
         runtime_settings, request.app.state.http_client
@@ -144,6 +154,15 @@ async def admin_overview(user: CurrentUser, db: Db):
                 "checkins": await count(Checkin),
             },
         },
+    }
+
+
+@router.get("/admin/agents/critic-readiness")
+async def critic_enforcement_readiness(user: CurrentUser, db: Db):
+    require_admin(user)
+    return {
+        "ok": True,
+        "data": await evaluate_critic_enforcement_readiness(db, get_settings()),
     }
 
 

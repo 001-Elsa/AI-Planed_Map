@@ -128,7 +128,7 @@ function bindAuthUI() {
     const password = $('auth-password').value;
     if (!username || !password) { authErr('请输入用户名和密码'); return; }
     if (authMode === 'reg') {
-      if (password.length < 6) { authErr('密码至少 6 位'); return; }
+      if (password.length < 8) { authErr('密码至少 8 位'); return; }
       if (password !== $('auth-password2').value) { authErr('两次密码不一致'); return; }
     }
     const adminInitToken = $('auth-admin-token').value.trim();
@@ -165,7 +165,7 @@ function bindAuthUI() {
       store.set('mapgo_guest', '0');
       toast((submitMode === 'login' ? '欢迎回来,' : '注册成功,') + r.user.nickname);
       hideAuth();
-      if (S.map) refreshUserUI(); else startApp();
+      if (S.map) refreshUserUI(); else await startApp();
     } catch (e) {
       const message = e.code === 'USERNAME_EXISTS'
         ? '该用户名已经注册，请切换到登录'

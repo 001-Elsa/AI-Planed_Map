@@ -10,14 +10,11 @@ class ToolPolicy:
     consent_scope: ConsentScope | None = None
 
 
+# This table is intentionally limited to model-selectable Companion tools.
+# Planning capabilities and confirmed server workflows belong to the Tool
+# Registry and their dedicated execution paths, never this LLM policy surface.
 TOOL_POLICIES = {
     "get_trip_state": ToolPolicy(frozenset(TripState)),
-    "search_poi": ToolPolicy(
-        frozenset({TripState.discovering, TripState.planning, TripState.replanning})
-    ),
-    "get_route_matrix": ToolPolicy(
-        frozenset({TripState.planning, TripState.active_trip, TripState.replanning})
-    ),
     "get_weather": ToolPolicy(
         frozenset(
             {
@@ -29,7 +26,6 @@ TOOL_POLICIES = {
             }
         )
     ),
-    "generate_attraction_brief": ToolPolicy(frozenset({TripState.active_trip})),
     "get_current_location": ToolPolicy(
         frozenset(
             {
@@ -45,22 +41,6 @@ TOOL_POLICIES = {
         frozenset(
             {TripState.active_trip, TripState.off_route, TripState.at_risk, TripState.replanning}
         )
-    ),
-    "create_plan_patch": ToolPolicy(
-        frozenset(
-            {TripState.active_trip, TripState.off_route, TripState.at_risk, TripState.replanning}
-        ),
-        confirmation_required=True,
-    ),
-    "share_trip_status": ToolPolicy(
-        frozenset({TripState.active_trip}),
-        confirmation_required=True,
-        consent_scope=ConsentScope.share_location,
-    ),
-    "save_explicit_preference": ToolPolicy(
-        frozenset({TripState.active_trip, TripState.completed}),
-        confirmation_required=True,
-        consent_scope=ConsentScope.save_preference,
     ),
 }
 

@@ -1,6 +1,69 @@
-# 版本演进清单（v1 → v6）
+# 版本演进清单（v1 → v7）
 
 > 本文档记录项目从纯前端地图到 AI 规划平台的历史。v1～v5 的 Node/SQLite、最近邻 + 2-opt 等描述是当时版本的真实实现，不代表当前 v6 正式后端；当前能力以 README、架构文档和代码为准。
+
+---
+
+## v7.6 — Agent 自动评测
+
+- `PlanningPreferences` 新增 `avoid_hiking` 与 `travel_style`，规则解析器覆盖轻松/紧凑旅行和登山规避表达；
+- 规划期对明确避开爬山的候选执行确定性过滤，`relaxed` 风格提高距离与步行惩罚；
+- 新增共用路线评分器：距离 40%、时间 30%、偏好 30%，默认 75 分通过；
+- deadline、重复/缺失 POI、时长/步行/费用硬限制和极端距离触发 hard fail，总分强制为 0；
+- Critic Review Report 写入分项、总分、公式和 hard-failure code；LLM Critic 不能覆盖服务器硬失败；
+- 意图集扩充偏好正负例，新增 6 条路线 golden cases、运行时指标和 CI `evaluate_routes.py` 门禁。
+
+## v7.5 — Agent Memory 系统
+
+- Shared State 从“仅 TTL 过期”升级为任务终止主动删除，Companion 状态在 Trip 完成后删除，TTL 只作为异常兜底；
+- PostgreSQL 长期偏好接入后续规划，仅允许显式确认的固定软偏好 Schema，不自动保存行为推断；
+- 建立“本次结构化值 > 本次文本意图 > 长期偏好 > Parser 默认值”的合并优先级，并支持 `use_long_term_memory=false`；
+- 新增长期偏好查询、单项撤销、隐私导出元数据与整库清除；多轮会话冻结首轮有效 Memory；
+- 地点类别、环境和少排队偏好只作为通用发现请求的有界召回提示，不替代 Provider 事实；
+- 新增 Memory 值校验、越权 key、当前请求覆盖、停用、撤销及短期状态清理测试与指标。
+
+## v7.4 — Agent Tool Registry 与能力隔离
+
+- 新增失败关闭的 `AgentToolRegistry`，统一声明能力 owner、调用模式、完整数据域和副作用；
+- `AgentSpec` 分离模型可选 `allowed_tools` 与服务器内部 `allowed_internal_capabilities`，地图和 OR-Tools 不进入 LLM Tool Schema；
+- Intent、Search、Planner 的真实解析/地图/求解入口以及 Companion Controller/HTTP Tool 入口接入授权检查；
+- Companion Tool 仍需继续通过 Trip State、Consent、确认和预算 Policy，高影响持久化/分享操作标记为 workflow-only 且无 Agent owner；
+- 新增跨角色、未知 Tool、调用模式混淆、Planner 越权数据域和 workflow-only 越权红队测试，并增加授权结果指标。
+
+## v7.3 — 版本化 Agent Shared State
+
+- 新增包含需求、候选、方案、评价、行中上下文和只追加历史的 `AgentSharedState`；
+- Redis 与内存 RuntimeStore 增加 revision CAS，防止并行 Agent 丢失更新；
+- AgentMessage 携带状态引用与 revision，陈旧或跨任务引用失败关闭；
+- 为 Supervisor、Intent、Search、Planner、Critic、Companion 建立字段级读写权限；
+- Search、Planner、Critic 改为从角色状态切片读取真实上游结果，Companion 可跨行中事件读取路线与上次执行摘要；
+- PostgreSQL 新增最小化 `AgentSharedStateSnapshot`，完整临时状态仍由 Redis TTL 管理；
+- 长期偏好继续只接受明确用户确认，正式计划和旅游历史继续由既有版本/事件表保存；
+- 新增 CAS 冲突、越权写入、角色视图、伪造状态引用和 Companion 跨事件状态测试。
+
+---
+
+## v7.2 — Supervisor 统一通信协议
+
+- 新增版本化 `AgentMessage` 信封和失败关闭的 `AgentMessageRouter`，统一规划链路与 Companion 行中链路；
+- 通过 task/correlation/causation ID、内容哈希和幂等键建立可追踪因果链；
+- 规划阶段真实输入经消息协议重新校验后消费，消息不再只是日志；
+- Agent 路由实施显式白名单，禁止 Critic 绕过 Supervisor 修改 Planner，也禁止 Companion 进入规划期角色；
+- `agent_messages` 扩展为规划与行中共用审计表，并保留旧 Companion 记录兼容；
+- 消息审计执行敏感字段最小化和超大正文摘要化，新增越权、幂等、因果关系与脱敏测试。
+
+---
+
+## v7 — 隔离的三 Agent 工作流
+
+- 固定为 Intent、Critic、Companion 三个 Agent；地图、求解器、Validator、权限和持久化继续保持确定性；
+- 三个角色拥有独立 Schema、Prompt 版本、工具白名单和预算，只通过编排器传递版本化 Artifact；
+- Critic 支持 off/shadow/enforce，最多触发一次仅调整软权重的重算，不能生成 POI、修改硬约束或写 PlanVersion；
+- 新增 AgentWorkflowRun / AgentRun / AgentArtifact 审计链、角色延迟/状态/成本指标和前端执行阶段；
+- Patch 接受复用联合求解器的完整约束评价，替换 POI 时保留原任务身份；
+- 初次规划、公共交通复评与动态重规划的 CPU 求解移入线程；
+- Worker 增加 processing 保留队列、显式 ack 和启动恢复，缩小硬崩溃丢失在途消息窗口；
+- 新增三 Agent 隔离单测及 `backend/tests/evaluation/evaluate_agents.py` 离线质量门禁。
 
 ---
 
@@ -127,9 +190,11 @@
 
 **可靠性、安全与工程化**
 
-- Runtime Store 支持内存/Redis 计数、JSON 快照、Redis List 队列、ZSET 延迟重试、DLQ、`SET NX EX` 锁和事件发布；
-- Session Token 只存哈希；密码使用 scrypt；精确位置使用 Fernet 字段加密、Consent 和 TTL；
-- 提供 Request/Trace ID、JSON 日志、Prometheus/Grafana、Ruff/Mypy/Bandit/pip-audit、PostgreSQL+Redis CI、pytest/property/contract/integration/eval/chaos/load、Playwright E2E 与 Docker build。
+- Runtime Store 支持内存/Redis 计数、JSON 快照、Redis List 队列、ZSET 延迟重试、DLQ、`SET NX EX` 锁和事件发布；内存实现限制缓存条目、总字节数和计数器数量，key 洪泛时限流失败关闭；
+- Session Token 只存哈希；注册密码至少 8 位并使用 scrypt；精确位置使用 Fernet 字段加密、Consent 和 TTL；新公开分享链接使用 128 bit（32 位 hex）随机 token，旧 16 位链接保持可读；
+- 登录/注册限流绑定来源 IP，不能通过轮换设备 Header 绕过；登录态请求再按 Session Token 限流，并保留 IP 总额度；
+- Request/Trace ID 会限制字符和长度；未匹配路由聚合为固定指标标签；API 默认 `no-store` 并限制浏览器能力；高德代理只缓存不超过独立上限的成功 JSON 响应；
+- 提供 JSON 日志、Prometheus/Grafana、Ruff/Mypy/Bandit/pip-audit、PostgreSQL+Redis CI、pytest/property/contract/integration/eval/chaos/load、Playwright E2E 与 Docker build。
 
 **v6 已知边界**
 

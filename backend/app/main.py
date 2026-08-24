@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -28,11 +29,20 @@ from backend.app.db.session import SessionLocal, check_database, engine
 from backend.app.infrastructure.runtime_store import build_runtime_store
 from backend.app.models import LocationSnapshot
 
+CORRELATION_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,100}$")
+
+
+def _correlation_id(value: str | None, fallback_prefix: str = "") -> str:
+    if value and CORRELATION_ID_PATTERN.fullmatch(value):
+        return value
+    generated = uuid.uuid4().hex
+    return f"{fallback_prefix}{generated[:16]}" if fallback_prefix else generated
+
 
 class RequestBodyLimitMiddleware:
     def __init__(self, application: ASGIApp, max_bytes: int) -> None:
         self.application = application
-        self.max_bytes = max_bytes
+        self.max_bytes = max_bytes  # 最大允许请求大小
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -40,7 +50,7 @@ class RequestBodyLimitMiddleware:
             return
         body = bytearray()
         disconnected = False
-        while True:
+        while True:  # 客户端来一块，我收一块
             message = await receive()
             if message["type"] == "http.disconnect":
                 disconnected = True
@@ -48,7 +58,7 @@ class RequestBodyLimitMiddleware:
             if message["type"] != "http.request":
                 continue
             body.extend(message.get("body", b""))
-            if len(body) > self.max_bytes:
+            if len(body) > self.max_bytes:  # 有没有超过最大允许请求大小
                 request_id = ""
                 for key, value in scope.get("headers", []):
                     if key.lower() == b"x-request-id":
@@ -64,6 +74,8 @@ class RequestBodyLimitMiddleware:
                         "details": {},
                     },
                 )
+                # 213行左右还有一次检查content_Length，因为客户端告诉服务器的长度可能>max或者不发 Content-Length或者SSE传输
+                # 所以不能只相信header，还要RequestBodyLimitMiddleware真正读取字节并计数（真正的保险）
                 await response(scope, receive, send)
                 return
             if not message.get("more_body", False):
@@ -83,7 +95,7 @@ class RequestBodyLimitMiddleware:
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    if settings.environment == "production":
+    if settings.environment == "production":  # api key的检查
         if settings.location_encryption_key in {
             "",
             "replace-with-secret-manager-value-in-production",
@@ -118,7 +130,7 @@ async def lifespan(application: FastAPI):
     application.state.knowledge_provider = CuratedKnowledgeProvider()
     application.state.runtime_store = await build_runtime_store(settings.redis_url)
     try:
-        yield
+        yield  # 把yield当成一条分界线：yield 上面是服务器启动时执行；yield 下面服务器关闭时执行
     finally:
         await client.aclose()
         await application.state.runtime_store.close()
@@ -140,10 +152,16 @@ app = FastAPI(
 )
 
 
-@app.middleware("http")
+@app.middleware("http")  # Middleware理解成所有 API 的公共检查站。
+# 项目给 FastAPI 注册了一个 request_context 中间件。每个 HTTP 请求都会经过它。
 async def request_context(request: Request, call_next):
-    request_id = request.headers.get("X-Request-ID") or f"req_{uuid.uuid4().hex[:16]}"
-    trace_id = request.headers.get("X-Trace-ID") or uuid.uuid4().hex
+    # request_id 和 trace_id 是为“定位一次请求”服务的
+    # request_id串起一个请求的完整流程
+    # trace_id是为了以后如果项目拆成多个服务，同一个 trace_id 可以跨服务跟踪整条调用链
+    # Correlation IDs are reflected in response headers and logs. Restrict them
+    # to a small visible-safe alphabet instead of trusting arbitrary input.
+    request_id = _correlation_id(request.headers.get("X-Request-ID"), "req_")
+    trace_id = _correlation_id(request.headers.get("X-Trace-ID"))
     request.state.request_id = request_id
     request.state.trace_id = trace_id
     started = time.perf_counter()
@@ -154,6 +172,13 @@ async def request_context(request: Request, call_next):
         client_ip = request.client.host if request.client else "unknown"
         ip_digest = hashlib.sha256(client_ip.encode()).hexdigest()[:24]
         path = request.url.path
+
+        # 因为公司、校园等环境可能存在 NAT，很多用户会共享公网 IP。
+        # 项目保留宽松的 IP 粗粒度防滥用，同时对已登录请求再按 session 做身份粒度限流。
+        # 项目做了两层限流：
+        # 一层是 IP 总额度，用来防止某个网络来源疯狂攻击。
+        # 另一层更细。登录和注册不能信任可伪造的设备 Header，因此仍按来源 IP；
+        # 已经登录的请求根据 Bearer Token 生成 session 身份，其他匿名请求按 IP。
 
         # Keep a generous per-IP ceiling as abuse protection, but do not make
         # all signed-in users behind the same office/school NAT share the much
@@ -167,12 +192,9 @@ async def request_context(request: Request, call_next):
 
         authorization = request.headers.get("authorization", "")
         if path in {"/api/login", "/api/register"}:
-            device = request.headers.get("x-device-id") or request.headers.get(
-                "x-device-name", "unknown"
-            )
-            device = device[:100]
-            device_digest = hashlib.sha256(f"{client_ip}|{device}".encode()).hexdigest()[:24]
-            identity = f"auth-device:{device_digest}"
+            # Device headers are attacker-controlled and must not create fresh
+            # login budgets. Otherwise changing X-Device-Id bypasses throttling.
+            identity = f"auth-source:{ip_digest}"
             identity_limit = settings.auth_device_requests_per_minute
         elif authorization.startswith("Bearer "):
             session_digest = hashlib.sha256(authorization[7:].encode()).hexdigest()[:24]
@@ -196,6 +218,10 @@ async def request_context(request: Request, call_next):
                 headers={"Retry-After": "60"},
             )
     try:
+        # Content-Length 是客户端在 Header 里声称“我的 body 有多大”
+        # 但是不能完全相信客户端的声称
+        # 所以这个项目又从 ASGI 底层真正读取收到的字节，并计算实际大小。
+        # Middleware 能够直接拦截 receive，统计到底收到了多少字节。这就是为什么它能比普通 Content-Length 检查更可靠。
         content_length = int(request.headers.get("content-length", "0") or 0)
     except ValueError:
         content_length = settings.max_request_bytes + 1
@@ -210,6 +236,7 @@ async def request_context(request: Request, call_next):
                 "details": {},
             },
         )
+    # 业务接口执行完后，这个 Middleware 会计算耗时，把 X-Request-ID 和 X-Trace-ID 返回给客户端，同时设置若干安全 Header。
     response = await call_next(request)
     elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
     response.headers["X-Request-ID"] = request_id
@@ -217,8 +244,12 @@ async def request_context(request: Request, call_next):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "SAMEORIGIN"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    logger.info(
+    response.headers["Permissions-Policy"] = "geolocation=(self), camera=(), microphone=()"
+    if request.url.path.startswith("/api/"):
+        response.headers.setdefault("Cache-Control", "no-store")
+    logger.info(  # Logging 是查具体事情。
         json.dumps(
+            # 然后它会输出结构化 JSON 日志，记录 method、path、status code、duration 等信息。
             {
                 "event": "http_request",
                 "request_id": request_id,
@@ -232,8 +263,10 @@ async def request_context(request: Request, call_next):
         )
     )
     route = request.scope.get("route")
-    route_path = getattr(route, "path", request.url.path)
-    metrics.increment(
+    # Never use the raw URL as a metric label. Random 404 paths would otherwise
+    # create unbounded label cardinality and permanently grow the registry.
+    route_path = getattr(route, "path", None) or "__unmatched__"
+    metrics.increment(  # Metrics 是看整体健康状态
         "mapgo_api_requests_total",
         {
             "method": request.method,
@@ -258,6 +291,9 @@ app.add_middleware(
 )
 
 
+# 异常处理这一大块，核心是“后端内部错误”和“API 对外错误格式”分离
+# 定义了4类异常处理，无论内部哪里出错，对前端都尽量返回统一的错误结构。
+# 1、AppError 用来表示项目主动定义的业务错误，比如“高德代理路径不允许”。
 @app.exception_handler(AppError)
 async def app_error(request: Request, exc: AppError):
     return JSONResponse(
@@ -272,6 +308,7 @@ async def app_error(request: Request, exc: AppError):
     )
 
 
+# 2、RequestValidationError 处理 FastAPI/Pydantic 参数校验错误。
 @app.exception_handler(RequestValidationError)
 async def validation_error(request: Request, exc: RequestValidationError):
     status_code = 400 if any(item.get("type") == "json_invalid" for item in exc.errors()) else 422
@@ -287,6 +324,7 @@ async def validation_error(request: Request, exc: RequestValidationError):
     )
 
 
+# 3、StarletteHTTPException 处理 404、405 这种 HTTP 层错误。
 @app.exception_handler(StarletteHTTPException)
 async def http_error(request: Request, exc: StarletteHTTPException):
     messages = {404: "接口或资源不存在", 405: "请求方法不允许"}
@@ -302,6 +340,7 @@ async def http_error(request: Request, exc: StarletteHTTPException):
     )
 
 
+# 4、Exception 负责接住真正没有预料到的异常。
 @app.exception_handler(Exception)
 async def unexpected_error(request: Request, exc: Exception):
     logger.exception("Unhandled error request_id=%s", request.state.request_id)
@@ -328,6 +367,7 @@ for api_router in (
     app.include_router(api_router, prefix="/api")
 
 
+# API Middleware 在请求完成后记录请求总数和请求耗时等指标，应用通过 /metrics 暴露 Prometheus 格式数据，再由 Prometheus 抓取，Grafana 做可视化。
 @app.get("/metrics", include_in_schema=False)
 async def prometheus_metrics():
     return Response(content=metrics.render(), media_type="text/plain; version=0.0.4")
@@ -355,6 +395,7 @@ AMAP_PROXY_ALLOWED_PATHS = {
 }
 
 
+# 高德 API 的服务端接入层
 @app.api_route("/_AMapService/{rest_path:path}", methods=["GET", "POST"])
 async def amap_security_proxy(rest_path: str, request: Request):
     normalized_path = rest_path.rstrip("/")
@@ -401,12 +442,14 @@ async def amap_security_proxy(rest_path: str, request: Request):
             for key, value in request.query_params.multi_items()
             if key not in {"key", "jscode", "csid"}
         )
-        digest = hashlib.sha256(
-            json.dumps(
-                {"path": normalized_path, "params": stable_params},
-                ensure_ascii=False,
-            ).encode("utf-8")
-        ).hexdigest()
+        digest = (
+            hashlib.sha256(  # 不是为了加密，而是把一组可能很长的查询条件稳定映射成固定长度的 key
+                json.dumps(
+                    {"path": normalized_path, "params": stable_params},
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            ).hexdigest()
+        )
         cache_key = f"amap:search:{digest}"
         cached = await request.app.state.runtime_store.get_json(cache_key)
         if cached:
@@ -415,11 +458,14 @@ async def amap_security_proxy(rest_path: str, request: Request):
                 status_code=int(cached["status_code"]),
                 media_type=cached.get("content_type"),
             )
-    # The proxy credential is never returned to the browser.
+    # The proxy credential is never returned to the browser
     from backend.app.db.session import SessionLocal
 
     async with SessionLocal() as db:
-        jscode = await system.setting(db, "amap_jscode") or settings.amap_jscode
+        configured_jscode = (
+            "" if settings.disable_configured_map_credentials else settings.amap_jscode
+        )
+        jscode = await system.setting(db, "amap_jscode") or configured_jscode
     if not jscode:
         raise AppError(503, "AMAP_NOT_CONFIGURED", "高德安全密钥尚未配置")
     params = dict(request.query_params)
@@ -454,7 +500,7 @@ async def amap_security_proxy(rest_path: str, request: Request):
                     "地图服务暂时不可用，请稍后重试",
                 ) from exc
             await asyncio.sleep(0.15 * (2**attempt))
-    if cache_key and status_code == 200:
+    if cache_key and status_code == 200 and len(content) <= settings.amap_proxy_max_cache_bytes:
         try:
             payload = json.loads(bytes(content))
             if str(payload.get("status")) == "1":

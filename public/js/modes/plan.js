@@ -199,7 +199,7 @@ function showPlanningExecutionPending() {
   const execution = $('planning-execution');
   execution.classList.remove('hidden');
   execution.innerHTML = '<div class="execution-head"><b>后端规划流水线</b><span>请求已提交，正在核验真实数据…</span></div>' +
-    '<div class="execution-stages">' + ['理解需求', '核验地点', '计算路网', '约束求解', '保存版本']
+    '<div class="execution-stages">' + ['Intent Agent', '核验地点', '计算路网', '确定性求解', 'Critic Agent', '保存版本']
       .map((label, index) => '<div class="execution-stage ' + (index === 0 ? 'attention' : '') + '">' +
         '<b>' + label + '</b><small>' + (index === 0 ? '处理中' : '等待上一步') + '</small></div>').join('') + '</div>';
 }
@@ -286,6 +286,11 @@ async function runAIPlan() {
 function clarificationControl(question, index) {
   const field = String(question.field || '');
   const name = 'q-' + index;
+  if (question.kind === 'confirmation' || field.startsWith('human_confirmation.')) {
+    return '<select name="' + name + '" data-field="' + escapeHtml(field) + '" data-value-type="boolean" required>' +
+      '<option value="">请选择</option><option value="true">接受，继续当前方案</option>' +
+      '<option value="false">不接受，重新规划</option></select>';
+  }
   if (Array.isArray(question.candidates) && question.candidates.length) {
     return '<select name="' + name + '" data-field="' + escapeHtml(field) + '" data-value-type="string" required>' +
       '<option value="">请选择地点</option>' + question.candidates.map((candidate) =>

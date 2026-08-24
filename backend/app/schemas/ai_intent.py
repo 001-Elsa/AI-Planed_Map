@@ -2,13 +2,18 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import Field, field_validator
+
+from backend.app.schemas.agent_artifacts import AgentWorkflowTrace, ReviewReport
+from backend.app.schemas.common import StrictModel
 
 MAX_PLANNING_TASKS = 24
-
-
-class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+HUMAN_CONFIRMATION_KEYS = frozenset(
+    {
+        "walking_distance",
+        "estimated_cost",
+    }
+)
 
 
 class TransportMode(str, Enum):
@@ -51,6 +56,7 @@ class ObjectiveWeights(StrictModel):
 
 class PlanningPreferences(StrictModel):
     optimization_goal: Literal["balanced", "shortest_time", "shortest_distance"] = "balanced"
+    travel_style: Literal["balanced", "relaxed", "intensive"] = "balanced"
     minimize_distance: bool = False
     minimize_walking: bool = False
     minimize_cost: bool = False
@@ -58,6 +64,14 @@ class PlanningPreferences(StrictModel):
     # Kept on the formal intent so a clarification answer is visible to both
     # candidate recall and the auditable final plan snapshot.
     dietary_restrictions: list[str] = Field(default_factory=list, max_length=20)
+    # Confirmed long-term discovery hints are soft recall preferences. They do
+    # not add mandatory stops or bypass Provider evidence.
+    preferred_categories: list[str] = Field(default_factory=list, max_length=10)
+    preferred_environment: list[Literal["quiet", "uncrowded", "indoor", "outdoor"]] = Field(
+        default_factory=list, max_length=4
+    )
+    avoid_queues: bool = False
+    avoid_hiking: bool = False
     weights: ObjectiveWeights = Field(default_factory=ObjectiveWeights)
 
 
@@ -142,6 +156,82 @@ class AIPlanRequest(StrictModel):
     task_location_overrides: dict[str, str] = Field(default_factory=dict)
     task_field_overrides: dict[str, dict[str, Any]] = Field(default_factory=dict)
     preferences_answers: dict[str, Any] = Field(default_factory=dict)
+    human_confirmations: dict[str, bool] = Field(default_factory=dict)
+    use_long_term_memory: bool = True
+
+    @field_validator("preferences_answers")
+    @classmethod
+    def validate_preference_answers(cls, values: dict[str, Any]) -> dict[str, Any]:
+        values = dict(values)
+        boolean_keys = {
+            "minimize_distance",
+            "minimize_walking",
+            "minimize_cost",
+            "prefer_high_rating",
+            "avoid_queues",
+            "avoid_hiking",
+        }
+        allowed = boolean_keys | {
+            "optimization_goal",
+            "dietary_restrictions",
+            "preferred_categories",
+            "preferred_environment",
+            "travel_style",
+        }
+        unknown = set(values) - allowed
+        if unknown:
+            raise ValueError(f"unsupported preference answers: {sorted(unknown)}")
+        for key in boolean_keys & set(values):
+            if not isinstance(values[key], bool):
+                raise ValueError(f"{key} must be boolean")
+        goal = values.get("optimization_goal")
+        if goal is not None and goal not in {"balanced", "shortest_time", "shortest_distance"}:
+            raise ValueError("unsupported optimization_goal")
+        travel_style = values.get("travel_style")
+        if travel_style is not None and travel_style not in {
+            "balanced",
+            "relaxed",
+            "intensive",
+        }:
+            raise ValueError("unsupported travel_style")
+        for key, limit in (("dietary_restrictions", 20), ("preferred_categories", 10)):
+            if key not in values:
+                continue
+            if isinstance(values[key], str):
+                values[key] = [values[key]]
+            items = values[key]
+            if (
+                not isinstance(items, list)
+                or len(items) > limit
+                or any(not isinstance(item, str) or not item.strip() or len(item) > 50 for item in items)
+            ):
+                raise ValueError(f"invalid {key}")
+        environments = values.get("preferred_environment")
+        if isinstance(environments, str):
+            environments = [environments]
+            values["preferred_environment"] = environments
+        if environments is not None and (
+            not isinstance(environments, list)
+            or len(environments) > 4
+            or any(
+                item not in {"quiet", "uncrowded", "indoor", "outdoor"}
+                for item in environments
+            )
+        ):
+            raise ValueError("invalid preferred_environment")
+        return values
+
+    @field_validator("human_confirmations")
+    @classmethod
+    def validate_human_confirmations(cls, values: dict[str, bool]) -> dict[str, bool]:
+        values = dict(values)
+        unknown = set(values) - HUMAN_CONFIRMATION_KEYS
+        if unknown:
+            raise ValueError(f"unsupported human confirmations: {sorted(unknown)}")
+        for key, value in values.items():
+            if not isinstance(value, bool):
+                raise ValueError(f"{key} must be boolean")
+        return values
 
 
 class PoiCandidate(StrictModel):
@@ -209,6 +299,7 @@ class ClarificationQuestion(StrictModel):
     field: str
     reason: str
     question: str
+    kind: Literal["clarification", "confirmation"] = "clarification"
     required: bool = True
     candidates: list[PoiCandidate] = Field(default_factory=list)
 
@@ -263,6 +354,8 @@ class AIPlanResult(StrictModel):
     candidate_count: int = 0
     candidate_reviews: list[CandidateReview] = Field(default_factory=list)
     uncertainty: UncertaintySummary | None = None
+    critic_review: ReviewReport | None = None
+    agent_workflow: AgentWorkflowTrace | None = None
 
 
 class PlanPatchOperation(StrictModel):

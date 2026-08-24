@@ -75,7 +75,10 @@ jobs:
       - name: Chaos / fault injection smoke
         run: python backend/tests/chaos/run_chaos.py
       - name: AI offline evaluation
-        run: python backend/tests/evaluation/evaluate_intent.py
+        run: |
+          python backend/tests/evaluation/evaluate_intent.py
+          python backend/tests/evaluation/evaluate_agents.py
+          python backend/tests/evaluation/evaluate_routes.py
       - uses: actions/upload-artifact@v4
         with:
           name: coverage

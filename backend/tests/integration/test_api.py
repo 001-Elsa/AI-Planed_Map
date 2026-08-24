@@ -1,6 +1,11 @@
-from fastapi.testclient import TestClient  # noqa: E402
+import asyncio
 
+from fastapi.testclient import TestClient  # noqa: E402
+from sqlalchemy import select
+
+from backend.app.db.session import SessionLocal
 from backend.app.main import app  # noqa: E402
+from backend.app.models import AgentArtifact, AgentHandoff, AgentWorkflowTask
 
 
 def test_auth_plan_and_ai_pipeline():
@@ -9,6 +14,16 @@ def test_auth_plan_and_ai_pipeline():
         assert capabilities.status_code == 200
         assert capabilities.json()["data"]["persistence"] is True
         assert capabilities.json()["data"]["max_tasks"] == 24
+        shared_capability = capabilities.json()["data"]["multi_agent"]["shared_state"]
+        evaluation_capability = capabilities.json()["data"]["multi_agent"]["evaluation"]
+        hitl_capability = capabilities.json()["data"]["multi_agent"]["human_in_the_loop"]
+        assert evaluation_capability["runtime_critic_scoring"] is True
+        assert evaluation_capability["hard_fail_zero_score"] is True
+        assert hitl_capability["enabled"] is True
+        assert hitl_capability["reject_replans"] is True
+        assert shared_capability["version"] == "1.0"
+        assert shared_capability["optimistic_concurrency"] is True
+        assert shared_capability["role_scoped_views"] is True
 
         registered = client.post(
             "/api/register",
@@ -40,6 +55,48 @@ def test_auth_plan_and_ai_pipeline():
         assert payload["execution"]["formal_plan_persisted"] is True
         assert payload["execution"]["map_provider"]
         assert payload["execution"]["stages"][-1]["key"] == "persist"
+        assert payload["agent_workflow"]["workflow_id"] > 0
+        assert [step["agent_type"] for step in payload["agent_workflow"]["steps"]] == [
+            "supervisor",
+            "intent",
+            "supervisor",
+            "search",
+            "planner",
+            "critic",
+            "supervisor",
+        ]
+        assert [
+            (message["sender"], message["receiver"])
+            for message in payload["agent_workflow"]["messages"]
+        ] == [
+            ("user", "supervisor"),
+            ("supervisor", "intent"),
+            ("intent", "supervisor"),
+            ("supervisor", "search"),
+            ("search", "planner"),
+            ("planner", "critic"),
+            ("critic", "supervisor"),
+            ("supervisor", "final_answer"),
+        ]
+        assert payload["agent_workflow"]["messages"][0]["content_summary"]["text"] == (
+            "[REDACTED_TEXT]"
+        )
+        shared_state = payload["agent_workflow"]["shared_state"]
+        assert shared_state["task_id"] == payload["agent_workflow"]["task_id"]
+        assert shared_state["phase"] == "finalized"
+        assert shared_state["revision"] >= 5
+        assert shared_state["candidate_count"] >= 3
+        assert shared_state["stop_count"] == 3
+        assert len(shared_state["state_hash"]) == 64
+        graph_counts = asyncio.run(_agent_graph_counts(payload["agent_workflow"]["workflow_id"]))
+        assert graph_counts["tasks"] == len(payload["agent_workflow"]["steps"])
+        assert graph_counts["handoffs"] == len(payload["agent_workflow"]["messages"])
+        assert graph_counts["active_artifacts"] == len(payload["agent_workflow"]["steps"])
+        assert payload["critic_review"]["verdict"] in {
+            "approved",
+            "approved_with_warnings",
+            "retry_with_soft_adjustments",
+        }
 
         replay = client.post(
             "/api/ai/plans",
@@ -71,8 +128,30 @@ def test_auth_plan_and_ai_pipeline():
             headers=headers,
             json={"accept": True},
         )
+        assert accepted.status_code == 409, accepted.text
+        assert accepted.json()["code"] == "PATCH_INFEASIBLE"
+        assert "任务先后顺序" in accepted.json()["details"]["conflicts"][0]
+
+        valid_patch = client.post(
+            f"/api/ai/plans/{payload['planning_run_id']}/patches",
+            headers=headers,
+            json={
+                "base_version": 1,
+                "operations": [{"operation": "change_transport_mode", "transport_mode": "driving"}],
+                "reason": "用户确认改为驾车",
+                "impact": {"source": "integration_test"},
+            },
+        )
+        valid_patch_id = valid_patch.json()["data"]["patch_id"]
+        accepted = client.post(
+            f"/api/ai/plans/{payload['planning_run_id']}/patches/{valid_patch_id}/decision",
+            headers=headers,
+            json={"accept": True},
+        )
         assert accepted.status_code == 200, accepted.text
         assert accepted.json()["data"]["plan_version"] == 2
+        stale_counts = asyncio.run(_agent_graph_counts(payload["agent_workflow"]["workflow_id"]))
+        assert stale_counts["stale_artifacts"] == graph_counts["active_artifacts"]
 
         versions = client.get(
             f"/api/ai/plans/{payload['planning_run_id']}/versions",
@@ -210,6 +289,17 @@ def test_auth_plan_and_ai_pipeline():
         assert tool.status_code == 200, tool.text
         assert tool.json()["data"]["audited"] is True
 
+        disallowed_tool = client.post(
+            f"/api/companion/trips/{trip_id}/tools/execute",
+            headers=headers,
+            json={
+                "tool": "search_poi",
+                "arguments": {"keyword": "museum", "origin": {"lng": 116.397, "lat": 39.908}},
+            },
+        )
+        assert disallowed_tool.status_code == 403
+        assert disallowed_tool.json()["code"] == "AGENT_TOOL_NOT_ALLOWED_FOR_ROLE"
+
         weather = client.post(
             f"/api/companion/trips/{trip_id}/pretrip-check",
             headers=headers,
@@ -224,6 +314,98 @@ def test_auth_plan_and_ai_pipeline():
             json={"key": "daily_walking_limit", "value": 6000, "confirmed": False},
         )
         assert implicit_preference.status_code == 409
+
+
+async def _agent_graph_counts(workflow_id: int) -> dict[str, int]:
+    async with SessionLocal() as db:
+        tasks = (
+            await db.scalars(
+                select(AgentWorkflowTask).where(AgentWorkflowTask.workflow_run_id == workflow_id)
+            )
+        ).all()
+        handoffs = (
+            await db.scalars(
+                select(AgentHandoff).where(AgentHandoff.workflow_run_id == workflow_id)
+            )
+        ).all()
+        artifacts = (
+            await db.scalars(
+                select(AgentArtifact).where(AgentArtifact.workflow_run_id == workflow_id)
+            )
+        ).all()
+        return {
+            "tasks": len(tasks),
+            "handoffs": len(handoffs),
+            "active_artifacts": sum(1 for item in artifacts if item.status == "active"),
+            "stale_artifacts": sum(1 for item in artifacts if item.status == "stale"),
+        }
+
+
+def test_confirmed_long_term_memory_is_applied_listed_and_revocable():
+    with TestClient(app) as client:
+        registered = client.post(
+            "/api/register",
+            json={"username": "memoryuser", "password": "secret12", "nickname": "记忆用户"},
+        )
+        token = registered.json()["data"]["token"]
+        headers = {"Authorization": f"Bearer {token}"}
+
+        invalid = client.post(
+            "/api/companion/preferences",
+            headers=headers,
+            json={"key": "home_address", "value": "private", "confirmed": True},
+        )
+        assert invalid.status_code == 422
+        assert invalid.json()["code"] == "LONG_TERM_MEMORY_INVALID"
+
+        saved = client.post(
+            "/api/companion/preferences",
+            headers=headers,
+            json={"key": "minimize_walking", "value": True, "confirmed": True},
+        )
+        assert saved.status_code == 200, saved.text
+        assert saved.json()["data"]["source"] == "explicit_user_confirmation"
+
+        planned = client.post(
+            "/api/ai/plans",
+            headers=headers,
+            json={
+                "text": "从酒店去博物馆",
+                "origin": {"lng": 120.62, "lat": 31.32},
+            },
+        )
+        assert planned.status_code == 200, planned.text
+        plan = planned.json()["data"]
+        assert plan["intent"]["preferences"]["minimize_walking"] is True
+        assert plan["memory"]["applied_keys"] == ["minimize_walking"]
+        assert plan["memory"]["values_included"] is False
+
+        overridden = client.post(
+            "/api/ai/plans",
+            headers=headers,
+            json={
+                "text": "从酒店去公园",
+                "origin": {"lng": 120.62, "lat": 31.32},
+                "preferences_answers": {"minimize_walking": False},
+            },
+        )
+        assert overridden.status_code == 200, overridden.text
+        override_data = overridden.json()["data"]
+        assert override_data["intent"]["preferences"]["minimize_walking"] is False
+        assert override_data["memory"]["applied_keys"] == []
+        assert override_data["memory"]["skipped_explicit_keys"] == ["minimize_walking"]
+
+        listed = client.get("/api/companion/preferences", headers=headers)
+        assert listed.status_code == 200
+        assert [(item["key"], item["value"]) for item in listed.json()["data"]] == [
+            ("minimize_walking", True)
+        ]
+
+        deleted = client.delete(
+            "/api/companion/preferences/minimize_walking", headers=headers
+        )
+        assert deleted.status_code == 200
+        assert client.get("/api/companion/preferences", headers=headers).json()["data"] == []
 
 
 def test_multi_turn_planning_conversation_is_versioned():
