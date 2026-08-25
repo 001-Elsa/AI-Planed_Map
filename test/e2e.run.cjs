@@ -4,7 +4,7 @@
  *   npm run test:e2e
  *
  * 策略: spawn 真实 FastAPI (uvicorn + 临时 SQLite), 无头浏览器走关键用户路径。
- * 不依赖真实高德 Key —— 只验证到"Key 配置弹窗"为止的全部应用逻辑。
+ * 不依赖真实高德 Key —— 验证登录后进入主界面，不再弹出本机 Key 配置窗。
  * =================================================================== */
 'use strict';
 
@@ -138,7 +138,8 @@ function run(cmd, args, env, cwd) {
     await page.fill('#auth-password2', 'e2epass1');
     await page.click('#auth-submit');
     await page.waitForTimeout(1500);
-    check('注册后进入应用(Key 弹窗出现)', await page.locator('#setup-mask').isVisible());
+    check('注册后进入应用(无 Key 配置弹窗)', !(await page.locator('#setup-mask').isVisible()));
+    check('地图 Key 设置入口已隐藏', await page.locator('#btn-settings').count() === 0);
     check('用户按钮显示昵称首字', (await page.locator('#btn-user').textContent()).trim() === 'e');
     check('模式标签渲染', (await page.locator('#tabbar .tab').count()) >= 14);
 
@@ -225,7 +226,7 @@ function run(cmd, args, env, cwd) {
     await gp.waitForTimeout(400);
     await gp.click('#auth-guest');
     await gp.waitForTimeout(800);
-    check('游客模式可进入(见 Key 弹窗)', await gp.locator('#setup-mask').isVisible());
+    check('游客模式可进入(无 Key 弹窗)', !(await gp.locator('#setup-mask').isVisible()) && (await gp.locator('#tabbar .tab').count()) >= 14);
     await g.close();
 
     check('全程无未捕获 JS 错误', errors.length === 0, errors.slice(0, 3).join(' | '));

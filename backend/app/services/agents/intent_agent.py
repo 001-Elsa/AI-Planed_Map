@@ -10,6 +10,7 @@ import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from backend.app.core.observability import metrics
 from backend.app.schemas.agent_artifacts import AgentBudget, AgentSpec, AgentType, ArtifactEnvelope
 from backend.app.schemas.ai_intent import (
     AIPlanRequest,
@@ -143,6 +144,31 @@ class IntentAgent:
         )
         input_tokens = int(getattr(self.parser, "input_tokens", 0) or 0)
         output_tokens = int(getattr(self.parser, "output_tokens", 0) or 0)
+        route = getattr(self.parser, "last_route", None)
+        route_reason = (
+            "model_route:"
+            f"{route.tier.value}:score={route.complexity_score}:"
+            f"{','.join(route.reason_codes)}"
+            if route is not None
+            else None
+        )
+        fallback_reason = getattr(self.parser, "fallback_reason", None)
+        estimated_cost = 0.0
+        if route is not None:
+            estimated_cost = (
+                input_tokens * route.estimated_input_cost_per_million_usd
+                + output_tokens * route.estimated_output_cost_per_million_usd
+            ) / 1_000_000
+            metrics.observe(
+                "mapgo_model_router_actual_cost_usd",
+                estimated_cost,
+                {"agent": "intent", "tier": route.tier.value},
+            )
+            metrics.observe(
+                "mapgo_model_router_latency_ms",
+                int((time.perf_counter() - started) * 1000),
+                {"agent": "intent", "tier": route.tier.value},
+            )
         return AgentExecution(
             spec=self.spec,
             output=(intent, required_questions),
@@ -150,6 +176,11 @@ class IntentAgent:
             latency_ms=int((time.perf_counter() - started) * 1000),
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            estimated_cost_usd=estimated_cost,
             fallback_used=bool(getattr(self.parser, "fallback_used", False)),
-            reason=getattr(self.parser, "fallback_reason", None),
+            reason=(
+                f"{route_reason};fallback={fallback_reason}"
+                if route_reason and fallback_reason
+                else fallback_reason or route_reason
+            ),
         )

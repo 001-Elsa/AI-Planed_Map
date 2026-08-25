@@ -3,12 +3,12 @@
 
 import { S } from '../state.js';
 import { $, escapeHtml, toast } from '../ui/dom.js';
-import { API } from '../services/api.js?v=33';
+import { API } from '../services/api.js?v=36';
 import { fmtDist, fmtDur, haversine } from '../services/format.js';
-import { searchNearestPOI } from '../services/amap.js?v=33';
-import { requireLogin } from '../ui/auth.js?v=33';
-import { MODES } from './registry.js?v=33';
-import { trackPath } from './route.js?v=33';
+import { searchNearestPOI } from '../services/amap.js?v=36';
+import { requireLogin } from '../ui/auth.js?v=36';
+import { MODES } from './registry.js?v=36';
+import { trackPath } from './route.js?v=36';
 
 let leaderboardRefreshTimer = null;
 

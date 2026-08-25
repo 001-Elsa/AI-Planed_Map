@@ -3,13 +3,13 @@
 
 import { S } from '../state.js';
 import { $, escapeHtml, toast, speak } from '../ui/dom.js';
-import { API } from '../services/api.js?v=33';
+import { API } from '../services/api.js?v=36';
 import { store } from '../services/store.js';
 import { fmtDist, fmtDur, fmtMMSS, haversine, toXY, downloadGPX, copyText } from '../services/format.js';
-import { routeLeg, getCity, getLiveWeather, searchTransitPlans } from '../services/amap.js?v=33';
-import { requireLogin } from '../ui/auth.js?v=33';
-import { MODES } from './registry.js?v=33';
-import { drawAssistPois } from './poi.js?v=33';
+import { routeLeg, getCity, getLiveWeather, searchTransitPlans } from '../services/amap.js?v=36';
+import { requireLogin } from '../ui/auth.js?v=36';
+import { MODES } from './registry.js?v=36';
+import { drawAssistPois } from './poi.js?v=36';
 
 /* ---------------- 生命周期 ---------------- */
 export function activate(cfg) {

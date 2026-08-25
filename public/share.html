@@ -26,9 +26,6 @@ body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
   padding: 8px 16px; font-size: 14px; font-weight: 600;
 }
 .btn { border: none; background: #4a7cf7; color: #fff; font-weight: 600; padding: 8px 14px; border-radius: 10px; font-size: 13.5px; cursor: pointer; margin-top: 6px; }
-.keybox { position: fixed; inset: 0; z-index: 50; background: #1f2430; color: #eee; display: flex; align-items: center; justify-content: center; padding: 24px; }
-.keybox .inner { max-width: 380px; width: 100%; background: #fff; color: #222; border-radius: 16px; padding: 22px; }
-.keybox input { width: 100%; padding: 10px 12px; border: 1px solid #ccd; border-radius: 10px; font-size: 14px; margin: 6px 0 12px; }
 .runner { font-size: 24px; text-shadow: 0 2px 4px rgba(0,0,0,.4); }
 .num-marker { width: 28px; height: 28px; border-radius: 50%; background: #4a7cf7; color: #fff; font-weight: 700; font-size: 13px; display: flex; align-items: center; justify-content: center; border: 2.5px solid #fff; box-shadow: 0 3px 8px rgba(0,0,0,.35); }
 .num-marker.start { background: #16a34a; }
@@ -38,15 +35,6 @@ body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
 <div id="map"></div>
 <div class="brand">🗺️ 随行地图 · 分享</div>
 <div class="card" id="card"><span class="muted">加载中…</span></div>
-<div class="keybox" id="keybox" style="display:none">
-  <div class="inner">
-    <h2 style="font-size:17px;margin-bottom:8px">需要高德 Key 才能显示地图</h2>
-    <p class="muted">该服务器未托管地图 Key。请输入你自己的高德 Web端(JS API)Key 与安全密钥(仅存本机)。</p>
-    <input id="k1" placeholder="Key">
-    <input id="k2" placeholder="安全密钥 jscode">
-    <button class="btn" onclick="saveKey()">加载地图</button>
-  </div>
-</div>
 
 <script>
 'use strict';
@@ -89,17 +77,8 @@ async function boot() {
     let k = null, j = null;
     try { k = localStorage.getItem('amap_key'); j = localStorage.getItem('amap_jscode'); } catch (e) {}
     if (k && j) { window._AMapSecurityConfig = { securityJsCode: j }; loadScript(k); }
-    else $('keybox').style.display = 'flex';
+    else mapLoadFailed('服务器未托管地图服务,内容信息见上');
   }
-}
-
-function saveKey() {
-  const k = $('k1').value.trim(), j = $('k2').value.trim();
-  if (!k || !j) return;
-  try { localStorage.setItem('amap_key', k); localStorage.setItem('amap_jscode', j); } catch (e) {}
-  window._AMapSecurityConfig = { securityJsCode: j };
-  $('keybox').style.display = 'none';
-  loadScript(k);
 }
 
 function mapLoadFailed(msg) {

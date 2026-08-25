@@ -21,6 +21,12 @@ from backend.app.schemas.agent_artifacts import (
     minimize_agent_payload,
 )
 from backend.app.schemas.ai_intent import AIPlanRequest, AIPlanResult, PlanningIntent, PoiCandidate
+from backend.app.schemas.dynamic_replanning import (
+    DynamicPatchReview,
+    PlanPatchArtifact,
+    ReplanDirective,
+    TripEventArtifact,
+)
 
 MAX_AGENT_MESSAGE_BYTES = 256 * 1024
 MAX_AGENT_AUDIT_BYTES = 8 * 1024
@@ -147,6 +153,42 @@ ROUTES = (
         AgentMessageType.result,
         frozenset({"companion_action_report"}),
     ),
+    AgentRoute(
+        AgentEndpoint.companion,
+        AgentEndpoint.supervisor,
+        AgentMessageType.artifact,
+        frozenset({"trip_event_artifact"}),
+    ),
+    AgentRoute(
+        AgentEndpoint.supervisor,
+        AgentEndpoint.replanner,
+        AgentMessageType.command,
+        frozenset({"trip_event_artifact"}),
+    ),
+    AgentRoute(
+        AgentEndpoint.replanner,
+        AgentEndpoint.planner,
+        AgentMessageType.artifact,
+        frozenset({"replan_directive"}),
+    ),
+    AgentRoute(
+        AgentEndpoint.planner,
+        AgentEndpoint.critic,
+        AgentMessageType.artifact,
+        frozenset({"plan_patch_candidate"}),
+    ),
+    AgentRoute(
+        AgentEndpoint.critic,
+        AgentEndpoint.supervisor,
+        AgentMessageType.result,
+        frozenset({"dynamic_patch_review"}),
+    ),
+    AgentRoute(
+        AgentEndpoint.supervisor,
+        AgentEndpoint.final_answer,
+        AgentMessageType.result,
+        frozenset({"plan_patch_proposal"}),
+    ),
 )
 
 
@@ -159,7 +201,11 @@ def _sha256(value: object) -> str:
 
 
 class AgentMessageRouter:
-    """In-process delivery boundary with route authorization and deduplication."""
+    """Protocol boundary with route authorization and a local delivery adapter.
+
+    Durable delivery and cross-process deduplication live in Agent transports;
+    ``deliver`` is retained for synchronous development workflows.
+    """
 
     def __init__(self) -> None:
         self._delivered: dict[str, AgentMessage] = {}
@@ -211,6 +257,20 @@ class AgentMessageRouter:
         )
 
     def deliver(self, message: AgentMessage) -> tuple[AgentMessage, str]:
+        self.validate(message)
+        existing = self._delivered.get(message.idempotency_key)
+        if existing is not None:
+            return existing, "duplicate"
+        self._delivered[message.idempotency_key] = message
+        return message, "delivered"
+
+    def validate(self, message: AgentMessage) -> None:
+        """Validate an envelope without recording process-local delivery state.
+
+        Durable transports use this boundary before publishing and again after
+        claiming a message. ``deliver`` remains the synchronous development
+        adapter and adds its historical in-process deduplication behavior.
+        """
         self._authorize(message)
         self._validate_payload(message)
         serialized = _canonical_json(message.content).encode("utf-8")
@@ -235,11 +295,6 @@ class AgentMessageRouter:
             raise AgentProtocolError("agent message idempotency key mismatch")
         if message.expires_at is not None and message.expires_at <= datetime.now(timezone.utc):
             raise AgentProtocolError("agent message has expired")
-        existing = self._delivered.get(message.idempotency_key)
-        if existing is not None:
-            return existing, "duplicate"
-        self._delivered[message.idempotency_key] = message
-        return message, "delivered"
 
     @staticmethod
     def audit(message: AgentMessage, delivery_status: str = "delivered") -> AgentMessageAudit:
@@ -313,11 +368,17 @@ class AgentMessageRouter:
                     raise ValueError("question count must be non-negative")
                 return
             if has_metadata and message.artifact_type == "search_artifact":
-                if set(payload) != {"summary"} or not isinstance(payload["summary"], dict):
+                if set(payload) != {"artifact_hash", "summary"} or not isinstance(
+                    payload["summary"], dict
+                ):
                     raise ValueError("state-backed search message requires a summary")
                 return
             if has_metadata and message.artifact_type == "safety_report":
-                if set(payload) != {"summary"} or not isinstance(payload["summary"], dict):
+                if set(payload) != {
+                    "artifact_hash",
+                    "search_artifact_hash",
+                    "summary",
+                } or not isinstance(payload["summary"], dict):
                     raise ValueError("state-backed safety message requires a summary")
                 return
             if has_metadata and message.artifact_type == "plan_candidate":
@@ -329,6 +390,8 @@ class AgentMessageRouter:
                     "stop_count",
                     "conflict_count",
                     "warning_count",
+                    "tool_error_codes",
+                    "plan_hash",
                 }
                 if set(payload) != allowed:
                     raise ValueError("state-backed plan message contains unexpected fields")
@@ -366,6 +429,16 @@ class AgentMessageRouter:
                     raise ValueError("retry directive may contain only intent and soft adjustments")
                 PlanningIntent.model_validate(payload["intent"])
                 CriticSoftAdjustments.model_validate(payload["soft_adjustments"])
+            elif message.artifact_type == "trip_event_artifact":
+                TripEventArtifact.model_validate(payload)
+            elif message.artifact_type == "replan_directive":
+                ReplanDirective.model_validate(payload)
+            elif message.artifact_type == "plan_patch_candidate":
+                PlanPatchArtifact.model_validate(payload)
+            elif message.artifact_type == "dynamic_patch_review":
+                DynamicPatchReview.model_validate(payload)
+            elif message.artifact_type == "plan_patch_proposal":
+                PlanPatchArtifact.model_validate(payload)
         except (KeyError, TypeError, ValidationError, ValueError) as exc:
             raise AgentProtocolError(
                 f"invalid {message.artifact_type} payload: {type(exc).__name__}"

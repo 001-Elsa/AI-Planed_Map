@@ -28,6 +28,7 @@ from backend.app.core.observability import metrics
 from backend.app.db.session import SessionLocal, check_database, engine
 from backend.app.infrastructure.runtime_store import build_runtime_store
 from backend.app.models import LocationSnapshot
+from backend.app.services.agent_transport import build_agent_message_bus
 
 CORRELATION_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,100}$")
 
@@ -129,6 +130,14 @@ async def lifespan(application: FastAPI):
     )
     application.state.knowledge_provider = CuratedKnowledgeProvider()
     application.state.runtime_store = await build_runtime_store(settings.redis_url)
+    application.state.agent_message_bus = build_agent_message_bus(
+        mode=settings.agent_message_transport,
+        runtime_store=application.state.runtime_store,
+        stream_prefix=settings.agent_stream_prefix,
+        group_prefix=settings.agent_consumer_group_prefix,
+        idempotency_ttl_seconds=settings.idempotency_ttl_seconds,
+        max_stream_length=settings.agent_stream_max_length,
+    )
     try:
         yield  # 把yield当成一条分界线：yield 上面是服务器启动时执行；yield 下面服务器关闭时执行
     finally:

@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import NoReturn
+from typing import Any, NoReturn
 
 from backend.app.core.observability import metrics
 from backend.app.schemas.agent_artifacts import AgentType
@@ -47,6 +47,7 @@ class AgentCapability:
     invocation_mode: InvocationMode
     data_scopes: frozenset[DataScope]
     side_effect: str = "read_only"
+    argument_schema_ref: str | None = None
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,7 @@ class CapabilityGrant:
     agent_type: AgentType
     invocation_mode: InvocationMode
     requested_scopes: frozenset[DataScope]
+    argument_schema: dict[str, Any] | None = None
 
 
 class CapabilityAuthorizationError(PermissionError):
@@ -71,54 +73,63 @@ CAPABILITIES = (
         frozenset({AgentType.intent}),
         InvocationMode.internal_stage,
         frozenset({DataScope.planning_request}),
+        argument_schema_ref="ParseRequirementArgs",
     ),
     AgentCapability(
         "search_poi",
         frozenset({AgentType.search}),
         InvocationMode.internal_stage,
         frozenset({DataScope.map_search}),
+        argument_schema_ref="SearchPoiArgs",
     ),
     AgentCapability(
         "check_travel_safety",
         frozenset({AgentType.safety}),
         InvocationMode.internal_stage,
         frozenset({DataScope.safety_review}),
+        argument_schema_ref="SafetyCheckArgs",
     ),
     AgentCapability(
         "get_route_matrix",
         frozenset({AgentType.planner}),
         InvocationMode.internal_stage,
         frozenset({DataScope.route_matrix}),
+        argument_schema_ref="RouteMatrixArgs",
     ),
     AgentCapability(
         "optimize_route",
         frozenset({AgentType.planner}),
         InvocationMode.internal_stage,
         frozenset({DataScope.route_optimization}),
+        argument_schema_ref="OptimizeRouteArgs",
     ),
     AgentCapability(
         "verify_transit_edges",
         frozenset({AgentType.planner}),
         InvocationMode.internal_stage,
         frozenset({DataScope.transit_routes}),
+        argument_schema_ref="RouteMatrixArgs",
     ),
     AgentCapability(
         "get_trip_state",
         frozenset({AgentType.companion}),
         InvocationMode.agent_callable,
         frozenset({DataScope.trip_state}),
+        argument_schema_ref="TripStateQueryArgs",
     ),
     AgentCapability(
         "get_current_location",
         frozenset({AgentType.companion}),
         InvocationMode.agent_callable,
         frozenset({DataScope.precise_location}),
+        argument_schema_ref="CurrentLocationQueryArgs",
     ),
     AgentCapability(
         "get_weather",
         frozenset({AgentType.companion}),
         InvocationMode.agent_callable,
         frozenset({DataScope.weather}),
+        argument_schema_ref="WeatherQueryArgs",
     ),
     AgentCapability(
         "propose_replan",
@@ -126,6 +137,7 @@ CAPABILITIES = (
         InvocationMode.agent_callable,
         frozenset({DataScope.trip_state, DataScope.replan_proposal}),
         side_effect="proposal_only",
+        argument_schema_ref="ReplanProposalArgs",
     ),
     # These operations exist in the business policy table but intentionally
     # have no Agent owner.  Only dedicated, server-controlled workflows may
@@ -190,6 +202,18 @@ class AgentToolRegistry:
     def get(self, name: str) -> AgentCapability | None:
         return self._capabilities.get(name)
 
+    def argument_schema(self, name: str) -> dict[str, Any] | None:
+        from backend.app.services.agent_tool_contracts import tool_argument_schema
+
+        return tool_argument_schema(name)
+
+    def argument_schemas_for(self, agent_type: AgentType, mode: InvocationMode) -> dict[str, Any]:
+        return {
+            name: schema
+            for name in self.names_for(agent_type, mode)
+            if (schema := self.argument_schema(name)) is not None
+        }
+
     def authorize(
         self,
         *,
@@ -245,6 +269,7 @@ class AgentToolRegistry:
             agent_type=agent_type,
             invocation_mode=invocation_mode,
             requested_scopes=requested_scopes,
+            argument_schema=self.argument_schema(capability),
         )
 
     @staticmethod

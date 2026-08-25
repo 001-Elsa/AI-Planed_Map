@@ -4,13 +4,12 @@
 import { S, DEFAULT_CENTER } from '../state.js';
 import { $, escapeHtml, toast } from '../ui/dom.js';
 import { store } from '../services/store.js';
-import { API } from '../services/api.js?v=33';
-import { searchPlaceSuggestions } from '../services/amap.js?v=33';
-import { showSetup, setupErr } from '../ui/auth.js?v=33';
-import * as poi from './poi.js?v=33';
-import * as route from './route.js?v=33';
-import * as plan from './plan.js?v=33';
-import * as social from './social.js?v=33';
+import { API } from '../services/api.js?v=36';
+import { searchPlaceSuggestions, convertGpsToAmap, reverseGeocode } from '../services/amap.js?v=36';
+import * as poi from './poi.js?v=36';
+import * as route from './route.js?v=36';
+import * as plan from './plan.js?v=36';
+import * as social from './social.js?v=36';
 
 const LAST_POS_KEY = 'mapgo_last_pos';
 const LOCATION_SEARCH_CACHE_KEY = 'mapgo_location_search_cache_v1';
@@ -20,6 +19,7 @@ let locationSearchTimer = null;
 let locationSearchSeq = 0;
 let activeLocationIndex = -1;
 let locationInputComposing = false;
+let locatingCurrentPosition = false;
 
 function loadLocationSearchCache() {
   try {
@@ -199,7 +199,7 @@ export const MODES = {
 
 /* ---------------- 地图初始化 ---------------- */
 export function initMap() {
-  if (!window.AMap) { showSetup(true, false); setupErr('高德 API 未就绪,请检查 Key。'); return; }
+  if (!window.AMap) { toast('地图服务未就绪,请稍后刷新', 4000); return; }
 
   const cachedPos = getCachedPosition();
   S.map = new AMap.Map('map', {
@@ -218,12 +218,9 @@ export function initMap() {
   window.addEventListener('error', (ev) => {
     const m = String(ev && ev.message || '');
     if (m.indexOf('INVALID_USER_SCODE') !== -1 || m.indexOf('USERKEY') !== -1) {
-      showSetup(true, true);
-      setupErr('Key 或安全密钥校验失败,请核对后重新保存。');
+      toast('地图凭据校验失败,请联系管理员检查服务端配置', 4200);
     }
   });
-
-  if (!cachedPos) toast('请先在上方输入你的位置，比如小区/地标/地址', 5200);
 
   S.map.on('moveend', () => {
     const cfg = MODES[S.currentMode];
@@ -237,6 +234,7 @@ export function initMap() {
   bindMainUI();
   switchMode('plan');
   setTimeout(social.checkNudge, 4000);
+  void locateCurrentPosition(false);
 }
 
 function setMyPosition(pos, moveMap, name) {
@@ -245,6 +243,8 @@ function setMyPosition(pos, moveMap, name) {
   store.set(LAST_POS_KEY, JSON.stringify({ lng: S.myPos.lng, lat: S.myPos.lat, name: S.myPosName, t: Date.now() }));
   drawMyMarker();
   if (moveMap) S.map.setZoomAndCenter(15, [S.myPos.lng, S.myPos.lat]);
+  const btn = $('btn-locate');
+  if (btn) btn.classList.add('located');
 }
 
 function addressPart(value) {
@@ -383,6 +383,72 @@ function drawMyMarker() {
   S.map.add(S.myMarker);
 }
 
+
+function applyLocatedPosition() {
+  const input = $('my-location-input');
+  if (input && S.myPosName) input.value = S.myPosName;
+  const btn = $('btn-locate');
+  if (btn && S.myPos) btn.classList.add('located');
+  if (MODES[S.currentMode] && MODES[S.currentMode].poi) {
+    clearTimeout(S.searchTimer);
+    S.searchTimer = setTimeout(() => poi.searchPOIsInView(), 120);
+  }
+}
+
+function explainLocateError(error) {
+  if (!navigator.geolocation) return '当前浏览器不支持定位，请在上方搜索位置';
+  if (error && error.code === 1) return '浏览器拒绝了定位权限，请在上方搜索位置';
+  if (error && error.code === 3) return '定位超时，请在上方搜索位置';
+  return '暂时无法定位，请在上方搜索位置';
+}
+
+function setLocateBusy(busy) {
+  const btn = $('btn-locate');
+  if (!btn) return;
+  btn.classList.toggle('locating', busy);
+  if (busy) btn.classList.remove('located');
+  btn.disabled = Boolean(busy);
+  btn.setAttribute('aria-busy', busy ? 'true' : 'false');
+}
+
+export function locateCurrentPosition(manual) {
+  if (!S.map || locatingCurrentPosition) return Promise.resolve(false);
+  if (!navigator.geolocation) {
+    if (manual || !S.myPos) toast(explainLocateError({ code: 0 }), 4200);
+    if (manual) $('my-location-input').focus();
+    return Promise.resolve(false);
+  }
+  locatingCurrentPosition = true;
+  setLocateBusy(true);
+  toast(manual ? '正在定位…' : '正在定位到你的位置…', 1800);
+  return new Promise((resolve) => {
+    navigator.geolocation.getCurrentPosition(resolve, (error) => resolve({ error }), {
+      enableHighAccuracy: true,
+      maximumAge: 15000,
+      timeout: 10000,
+    });
+  }).then(async (result) => {
+    if (!result || result.error || !result.coords) {
+      if (manual || !S.myPos) toast(explainLocateError(result && result.error), 4200);
+      if (manual) $('my-location-input').focus();
+      return false;
+    }
+    const pos = await convertGpsToAmap(result.coords.longitude, result.coords.latitude);
+    let name = '';
+    try { name = await reverseGeocode(pos.lng, pos.lat); } catch (e) { /* 地址可缺 */ }
+    setMyPosition(pos, true, name || '当前位置');
+    applyLocatedPosition();
+    toast('已定位到当前位置' + (name ? '：' + name : ''), 3200);
+    return true;
+  }).catch(() => {
+    if (manual || !S.myPos) toast('暂时无法定位，请在上方搜索位置', 4200);
+    return false;
+  }).finally(() => {
+    locatingCurrentPosition = false;
+    setLocateBusy(false);
+  });
+}
+
 /* ---------------- 全局 UI 绑定 ---------------- */
 function bindMainUI() {
   document.querySelectorAll('#tabbar .tab').forEach((btn) => {
@@ -439,10 +505,9 @@ function bindMainUI() {
     if (!$('my-location-search').contains(e.target)) hideLocationSuggestions();
   });
   $('btn-locate').addEventListener('click', () => {
-    locationInput.focus();
-    locationInput.select();
-    toast('请输入你的位置，比如小区/地标/地址');
+    void locateCurrentPosition(true);
   });
+  if (S.myPos) $('btn-locate').classList.add('located');
   if (S.myPosName) locationInput.value = S.myPosName;
   $('chk-hide-others').addEventListener('change', applyMapDressing);
 

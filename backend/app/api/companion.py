@@ -46,6 +46,7 @@ from backend.app.schemas.companion import (
     TripState,
     TripTransitionRequest,
 )
+from backend.app.schemas.dynamic_replanning import TripEventArtifact
 from backend.app.services.agent_memory import (
     SUPPORTED_LONG_TERM_KEYS,
     MemoryPreferenceError,
@@ -157,6 +158,9 @@ async def create_trip_session(body: CreateTripSessionRequest, user: CurrentUser,
         state=TripState.plan_ready.value,
         current_plan_version=version.version,
         reminder_cooldown_minutes=body.reminder_cooldown_minutes,
+        context_json=json.dumps(
+            {"auto_apply_low_risk_patches": body.auto_apply_low_risk_patches}
+        ),
     )
     db.add(trip)
     await db.flush()
@@ -981,18 +985,24 @@ async def replan_remaining_trip(
     if lock_token is None:
         raise AppError(409, "TRIP_LOCKED", "行程正在被其他实例修改，请稍后重试")
     try:
-        from backend.app.services.replanning import PendingReplanRequest, create_pending_replan
+        from backend.app.services.dynamic_replanning import DynamicReplanningOrchestrator
 
-        data = await create_pending_replan(
-            db=db,
+        data = await DynamicReplanningOrchestrator(
+            db, request.app.state.map_provider
+        ).run(
             trip=trip,
-            provider=request.app.state.map_provider,
-            request=PendingReplanRequest(
-                current_location=body.current_location,
-                current_time=body.current_time,
-                completed_stop_ids=body.completed_stop_ids,
+            event=TripEventArtifact(
+                trip_id=trip.id,
+                event_type="ManualReplanRequested",
+                occurred_at=body.current_time,
+                impact_level="medium",
                 reason=body.reason,
+                base_plan_version=trip.current_plan_version,
             ),
+            current_location=body.current_location,
+            completed_stop_ids=body.completed_stop_ids,
+            event_payload={},
+            weather=None,
             trace_id=request.state.trace_id,
         )
         return {"ok": True, "data": data}

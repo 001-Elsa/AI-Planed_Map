@@ -71,7 +71,7 @@ body {
 
 /* ============ 顶部条 ============ */
 #topbar {
-  position: fixed; top: 0; left: 0; right: 0; z-index: 20;
+  position: fixed; top: 0; left: 0; right: 0; z-index: 36;
   display: flex; align-items: center; justify-content: space-between;
   padding: calc(env(safe-area-inset-top, 0px) + 10px) 14px 10px;
   pointer-events: none;
@@ -95,13 +95,13 @@ body.plan-mode #mode-title {
   flex: 1;
   max-width: 680px;
   min-width: 320px;
-  height: 52px;
+  height: 54px;
   margin: 0 16px;
   display: flex;
   align-items: center;
   position: relative;
   border: 1px solid rgba(74,124,247,.28);
-  border-radius: 8px;
+  border-radius: 10px;
   background: rgba(255,255,255,.96);
   box-shadow: 0 6px 20px rgba(31,36,48,.2);
 }
@@ -109,11 +109,53 @@ body.plan-mode #mode-title {
   border-color: #4a7cf7;
   box-shadow: 0 8px 24px rgba(31,36,48,.24), 0 0 0 3px rgba(74,124,247,.16);
 }
-.location-search-icon {
-  flex: 0 0 44px;
-  text-align: center;
-  color: #667085;
-  font-size: 20px;
+.location-locate-btn {
+  flex: 0 0 auto;
+  height: 44px;
+  margin: 0 8px 0 5px;
+  padding: 0 12px 0 8px;
+  border: none;
+  border-radius: 22px;
+  background: #1f2430;
+  color: #fff;
+  box-shadow: 0 3px 12px rgba(31,36,48,.45), 0 0 0 4px rgba(74,124,247,.32);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+.location-locate-btn svg {
+  width: 22px;
+  height: 22px;
+  flex: 0 0 22px;
+  display: block;
+}
+.location-locate-btn span {
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: .02em;
+}
+.location-locate-btn:hover {
+  background: #2a3348;
+  box-shadow: 0 4px 14px rgba(31,36,48,.5), 0 0 0 5px rgba(74,124,247,.4);
+}
+.location-locate-btn:active { transform: scale(.94); }
+.location-locate-btn.located {
+  background: #2563eb;
+  box-shadow: 0 2px 10px rgba(37,99,235,.4), 0 0 0 3px rgba(37,99,235,.2);
+}
+.location-locate-btn.locating {
+  background: #1d4ed8;
+  pointer-events: none;
+}
+.location-locate-btn.locating svg {
+  animation: locate-spin 1s linear infinite;
+}
+@keyframes locate-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
 }
 .location-search input {
   flex: 1;
@@ -772,7 +814,17 @@ body.dark .panel, body.dark .dialog { background: #232936; color: #dde2ee; }
 body.dark .location-search { background: rgba(31,36,48,.95); }
 body.dark .location-search input { color: #dde2ee; }
 body.dark .location-search input::placeholder { color: #8b93a7; }
-body.dark .location-search-icon { color: #8b93a7; }
+body.dark .location-locate-btn {
+  background: #eef2ff;
+  color: #1f2430;
+  box-shadow: 0 2px 8px rgba(0,0,0,.35), 0 0 0 3px rgba(148,163,255,.28);
+}
+body.dark .location-locate-btn:hover { background: #fff; }
+body.dark .location-locate-btn.located,
+body.dark .location-locate-btn.locating {
+  background: #60a5fa;
+  color: #0f172a;
+}
 body.dark .location-suggestions { background: #232936; border-color: #3a4356; }
 body.dark .location-suggestion { color: #eef1f7; border-color: #303848; }
 body.dark .location-suggestion:hover,
@@ -843,9 +895,9 @@ body.dark .emoji-pick button.active { background: #253252; border-color: #4a7cf7
     min-width: 0;
     max-width: none;
     margin: 0;
-    height: 50px;
+    height: 54px;
   }
-  .location-search-icon { flex-basis: 40px; }
+  .location-locate-btn { height: 42px; padding: 0 10px 0 7px; }
   #btn-my-location-search { flex-basis: 68px; }
   .location-suggestions { max-height: min(52vh, 420px); }
   #toast { top: calc(env(safe-area-inset-top, 0px) + 110px); }

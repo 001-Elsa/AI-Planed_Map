@@ -1,0 +1,44 @@
+{
+  "benchmark": "mapgo-agent-replay-v1",
+  "profile": "offline_deterministic",
+  "dataset_hash": "b6ac33236f0ace74fecedb244014cbd74dfeb79e614d99e658556c1adbad6d56",
+  "case_count": 100,
+  "single_agent": {
+    "task_completion_rate": 0.85,
+    "hard_constraint_satisfaction_rate": 1.0,
+    "executable_plan_constraint_satisfaction_rate": 1.0,
+    "tool_selection_accuracy": 0.92,
+    "illegal_tool_execution_rate": 0.0,
+    "agent_handoff_success_rate": 1.0,
+    "recovery_success_rate": 0.8444,
+    "replanning_success_rate": 1.0,
+    "critic_bad_plan_recall": 0.0,
+    "average_agent_count": 1.0,
+    "average_llm_calls": 0.0,
+    "average_token_cost_usd": 0.0,
+    "latency_p50_ms": 20.9,
+    "latency_p95_ms": 336.26
+  },
+  "multi_agent": {
+    "task_completion_rate": 1.0,
+    "hard_constraint_satisfaction_rate": 1.0,
+    "executable_plan_constraint_satisfaction_rate": 1.0,
+    "tool_selection_accuracy": 1.0,
+    "illegal_tool_execution_rate": 0.0,
+    "agent_handoff_success_rate": 1.0,
+    "recovery_success_rate": 1.0,
+    "replanning_success_rate": 1.0,
+    "critic_bad_plan_recall": 1.0,
+    "average_agent_count": 4.55,
+    "average_llm_calls": 0.0,
+    "average_token_cost_usd": 0.0,
+    "latency_p50_ms": 64.47,
+    "latency_p95_ms": 390.69
+  },
+  "notes": {
+    "generated_at": "2026-08-24",
+    "llm_metrics": "zero in offline profile; no model endpoint is called",
+    "latency": "local deterministic execution; not production network latency",
+    "reproduce": "python backend/tests/evaluation/replay_agent_benchmark.py"
+  }
+}

@@ -4,17 +4,17 @@
 
 import { S } from '../state.js';
 import { $, escapeHtml, toast } from '../ui/dom.js';
-import { API } from '../services/api.js?v=33';
+import { API } from '../services/api.js?v=36';
 import { fmtDist, fmtDur, haversine } from '../services/format.js';
 import {
   explainAmapError,
   searchNearbyPlaces,
   searchPlaceByKeyword,
   flattenRoutePath,
-} from '../services/amap.js?v=33';
+} from '../services/amap.js?v=36';
 import { geometricMedian } from '../services/algo.js';
-import { requireLogin } from '../ui/auth.js?v=33';
-import { MODES } from './registry.js?v=33';
+import { requireLogin } from '../ui/auth.js?v=36';
+import { MODES } from './registry.js?v=36';
 
 let poiSearchSeq = 0;
 

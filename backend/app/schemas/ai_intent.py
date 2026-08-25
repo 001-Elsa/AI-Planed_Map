@@ -2,7 +2,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from backend.app.schemas.agent_artifacts import AgentWorkflowTrace, ReviewReport
 from backend.app.schemas.common import StrictModel
@@ -359,12 +359,37 @@ class AIPlanResult(StrictModel):
 
 
 class PlanPatchOperation(StrictModel):
-    operation: Literal["remove_stop", "move_stop", "replace_stop", "change_transport_mode"]
+    operation: Literal[
+        "remove_stop",
+        "move_stop",
+        "replace_stop",
+        "change_transport_mode",
+        "change_departure_time",
+    ]
     stop_id: str | None = None
     from_position: int | None = Field(default=None, ge=0)
     to_position: int | None = Field(default=None, ge=0)
     replacement_stop: dict[str, Any] | None = None
     transport_mode: TransportMode | None = None
+    departure_time: datetime | None = None
+
+    @model_validator(mode="after")
+    def validate_operation_arguments(self) -> "PlanPatchOperation":
+        if self.operation in {"remove_stop", "replace_stop"} and not self.stop_id:
+            raise ValueError(f"{self.operation} requires stop_id")
+        if self.operation == "move_stop" and (
+            self.from_position is None or self.to_position is None
+        ):
+            raise ValueError("move_stop requires from_position and to_position")
+        if self.operation == "replace_stop" and not self.replacement_stop:
+            raise ValueError("replace_stop requires replacement_stop")
+        if self.operation == "change_transport_mode" and self.transport_mode is None:
+            raise ValueError("change_transport_mode requires transport_mode")
+        if self.operation == "change_departure_time" and (
+            self.departure_time is None or self.departure_time.tzinfo is None
+        ):
+            raise ValueError("change_departure_time requires a timezone-aware departure_time")
+        return self
 
 
 class CreatePlanPatchRequest(StrictModel):

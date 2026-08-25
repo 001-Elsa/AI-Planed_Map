@@ -23,11 +23,12 @@ from backend.app.models import (
     UserConsent,
 )
 from backend.app.schemas.companion import ConsentScope
+from backend.app.schemas.dynamic_replanning import TripEventArtifact
 from backend.app.services.agent_controller import AgentController
 from backend.app.services.agent_decider import AgentDecider, build_agent_decider
 from backend.app.services.agent_shared_state import AgentSharedStateManager
+from backend.app.services.dynamic_replanning import DynamicReplanningOrchestrator
 from backend.app.services.notifications import NotificationService, render_event_notification
-from backend.app.services.replanning import PendingReplanRequest, create_pending_replan
 from backend.app.services.trip_stream import publish_trip_stream
 
 logger = logging.getLogger("mapgo.worker")
@@ -219,23 +220,32 @@ async def process_trip_event(
                                 "status": "replan_unavailable",
                                 "reason": "missing_provider_or_location",
                             }
-                        replan_result = await create_pending_replan(
-                            db=db,
+                        trip_context = json.loads(trip.context_json or "{}")
+                        replan_result = await DynamicReplanningOrchestrator(
+                            db, map_provider
+                        ).run(
                             trip=trip,
-                            provider=map_provider,
-                            request=PendingReplanRequest(
-                                current_location=current_location,
-                                current_time=(
+                            event=TripEventArtifact(
+                                trip_id=trip.id,
+                                event_id=event.id if event else None,
+                                event_type=event_type,
+                                occurred_at=(
                                     event.occurred_at if event else datetime.now(timezone.utc)
                                 ),
+                                impact_level=impact,
                                 reason=str(
                                     arguments.get("reason") or decision.get("reason") or event_type
                                 ),
-                                source_event_id=event.id if event else None,
-                                event_type=event_type,
-                                event_payload=event_payload,
-                                weather=weather_observation,
+                                payload_summary=event_payload,
+                                base_plan_version=trip.current_plan_version,
                             ),
+                            current_location=current_location,
+                            completed_stop_ids=[
+                                str(item)
+                                for item in trip_context.get("completed_stop_ids", [])
+                            ],
+                            event_payload=event_payload,
+                            weather=weather_observation,
                             trace_id=str(payload.get("trace_id") or ""),
                         )
                         return replan_result

@@ -63,6 +63,17 @@ def apply_patch_structure(
                 ).value
             except (TypeError, ValueError) as exc:
                 raise AppError(422, "PATCH_TRANSPORT_MODE_INVALID", "交通方式无效") from exc
+        elif operation["operation"] == "change_departure_time":
+            raw = operation.get("departure_time")
+            try:
+                departure = datetime.fromisoformat(raw) if isinstance(raw, str) else raw
+            except ValueError as exc:
+                raise AppError(
+                    422, "PATCH_DEPARTURE_TIME_INVALID", "补丁出发时间无效"
+                ) from exc
+            if departure is None or departure.tzinfo is None:
+                raise AppError(422, "PATCH_DEPARTURE_TIME_INVALID", "补丁出发时间必须含时区")
+            snapshot["departure_time"] = departure.isoformat()
     if not stops:
         raise AppError(422, "PATCH_EMPTY_PLAN", "正式计划至少需要保留一个站点")
     return stops
@@ -171,4 +182,5 @@ async def recalculate_and_validate_snapshot(
         default=0,
     )
     snapshot["algorithm"] = "shared-joint-validator-plan-patch"
+    snapshot["departure_time"] = departure.isoformat()
     return snapshot, conflicts

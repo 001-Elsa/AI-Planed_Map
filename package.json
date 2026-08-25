@@ -9,7 +9,7 @@
     "test": "python -m pytest -c backend/pytest.ini",
     "test:e2e": "node test/e2e.run.cjs",
     "test:agents": "python backend/tests/evaluation/evaluate_agents.py",
-    "test:evaluation": "python backend/tests/evaluation/evaluate_intent.py && python backend/tests/evaluation/evaluate_agents.py && python backend/tests/evaluation/evaluate_routes.py && python backend/tests/evaluation/evaluate_multi_agent.py"
+    "test:evaluation": "python backend/tests/evaluation/evaluate_intent.py && python backend/tests/evaluation/evaluate_agents.py && python backend/tests/evaluation/evaluate_routes.py && python backend/tests/evaluation/evaluate_multi_agent.py && python backend/tests/evaluation/evaluate_model_router.py && python backend/tests/evaluation/replay_agent_benchmark.py"
   },
   "engines": {
     "node": ">=22.5"

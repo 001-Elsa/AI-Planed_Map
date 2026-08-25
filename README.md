@@ -33,12 +33,13 @@ MapGo 的定位不是“让模型生成一条看起来合理的路线”。系�
 - Agent 通信协议 v1：所有规划交接和 Companion 工具循环使用统一结构化消息信封，包含 sender/receiver、task/correlation/causation ID、消息与 Artifact 类型、内容哈希和幂等键；Router 对允许路由执行失败关闭校验，审计内容先最小化再持久化；
 - Shared State v1：Redis/内存 RuntimeStore 保存带 revision 和 TTL 的当前任务状态，统一包含用户需求、POI 候选、路线方案、Critic 评价和执行历史；Agent 只能读取角色切片、写入本角色字段，更新使用 CAS 防止并发覆盖；PostgreSQL 只保存最小化状态快照、明确确认的长期偏好和正式任务/行程历史；
 - Agent Tool Registry：角色授权、调用模式与数据域统一失败关闭校验；Intent/Search/Planner 的解析、地图和 OR-Tools 能力只允许服务器内部阶段调用，不进入 LLM Tool Schema；Companion 只暴露四个行中工具，并继续叠加 Trip State、Consent、确认与预算 Policy；
+- Cost-aware Model Router：Intent 按复杂度选择 Rule/Small/Strong Structured Output，Critic 使用 Rule/Strong Hybrid，Companion 仅使用 Rule/Small；Supervisor、Search、Safety、Planner、Replanner 显式锁定 deterministic。路由按模型档位计算成本，模型不可用时降级 Rule，高风险只会触发 Critic/HITL，不会扩大工具权限；
 - Agent Memory：短期规划上下文保存在 Redis/RuntimeStore，任务终止时主动删除、TTL 仅兜底；长期偏好只接受用户明确确认并写 PostgreSQL，本次请求优先，可单次关闭、逐项撤销、导出或整库清除；Agent 本身没有用户偏好数据库访问权；
 - Agent Evaluation：版本化意图与路线 golden cases 进入 CI；路线按距离 40%、时间 30%、偏好 30% 确定性评分，截止时间、重复 POI、硬约束和极端距离一票否决；同一评分器由运行时 Critic 复用并写入 Review Report；
 - `off | shadow | enforce` 灰度模式、工作流总成本/交接上限、角色级 Token/延迟/回退审计与 Prometheus 指标；
 - 伴游 Agent：LLM 在受限 JSON 输出中根据 Trip State、Observation 和工具结果逐步决定下一工具；Policy、调用步数、Token/费用预算与完整 AgentRun/AgentToolCall 审计始终生效；
-- 高影响事件可经 Worker 的行程级分布式锁触发 Agent 工具循环，生成 `pending` Plan Patch，并通过最新状态 SSE 快照通知前端；正式 Version 只能由用户确认后创建；
-- 动态重规划支持 `replace_stop`、`remove_stop`、`move_stop`、`change_transport_mode`；闭馆可找替代 POI，暴雨可将室外地点替为室内候选；
+- 行中事件执行 `Companion → Supervisor → Replanner → Planner → Critic` 的可恢复工作流；每个任务、交接和 Artifact 均持久化，Replanner 只选择受限策略，OR-Tools/路线矩阵仍只由 Planner 作为确定性工具调用；
+- 动态重规划支持 `replace_stop`、`remove_stop`、`move_stop`、`change_transport_mode`、`change_departure_time`。Agent 永不覆盖正式路线：先生成 `PlanPatch(base_version=N)`，Critic 审查后，高风险进入 HITL；显式 opt-in 的低风险补丁可经硬约束复验和 CAS 生成 `PlanVersion N+1`；
 - 策展知识库 + 本地 TF-IDF RAG 检索与引文；拒绝无来源编造；
 - 行程复盘摘要（站间偏差、重规划、建议接受/拒绝、ETA 误差）；
 - 站内通知服务（去重、重试、投递状态；Web Push/邮件为可扩展通道）；
@@ -114,6 +115,8 @@ npm start
 python backend/tests/evaluation/evaluate_intent.py
 python backend/tests/evaluation/evaluate_agents.py
 python backend/tests/evaluation/evaluate_routes.py
+python backend/tests/evaluation/evaluate_multi_agent.py
+python backend/tests/evaluation/replay_agent_benchmark.py
 python backend/tests/chaos/run_chaos.py
 python backend/tests/load/planning_load.py --token <token>
 ```
@@ -127,6 +130,32 @@ python backend/tests/chaos/run_chaos.py
 ```
 
 AI 离线评测对 RuleBased 解析器施加质量门禁（Schema 合法率等）。压测与混沌脚本输出实测 JSON，不在文档中伪造 QPS。
+
+ModelRouter 另有 12 条离线路由门禁，检查 Rule/Small/Strong 选择准确率、确定性角色零模型调用、高风险 HITL 标记、缺少模型凭证时的 Rule 降级，以及 Small/Strong 独立价格配置。
+
+### Single-Agent vs Multi-Agent Replay Benchmark
+
+以下结果来自 100 条离线确定性回放，数据集哈希为
+`b6ac33236f0ace74fecedb244014cbd74dfeb79e614d99e658556c1adbad6d56`。两组使用相同的
+Intent、Mock Map 数据、搜索工具和确定性路线算法；Single-Agent 基线也允许搜索重试和动态事件回放。
+
+| 指标 | Single-Agent | Multi-Agent |
+| --- | ---: | ---: |
+| Task Success | 85.00% | 100.00% |
+| Constraint Satisfaction | 100.00% | 100.00% |
+| Tool Selection Accuracy | 92.00% | 100.00% |
+| Recovery Rate | 84.44% | 100.00% |
+| Replanning Success | 100.00% | 100.00% |
+| Critic Bad-plan Recall | 0.00% | 100.00% |
+| Illegal Tool Execution | 0.00% | 0.00% |
+| Average Agent Count | 1.00 | 4.55 |
+| P50 Latency | 20.90 ms | 64.47 ms |
+| P95 Latency | 336.26 ms | 390.69 ms |
+| LLM Calls / Token Cost | 0 / $0 | 0 / $0 |
+
+该结果说明 Multi-Agent 在错误证据拦截和 Worker 故障恢复场景更可靠，但增加了执行角色和延迟。默认基准不调用
+LLM 或外部网络，因此 Token 成本为真实的零，延迟也只代表本机确定性回放，不能当作生产环境性能数据。完整快照见
+[`replay_agent_benchmark_result.json`](backend/tests/evaluation/replay_agent_benchmark_result.json)。
 
 更多设计见 [架构说明](docs/ARCHITECTURE.md)、[威胁模型](docs/THREAT_MODEL.md)、[版本演进](docs/CHANGELOG.md) 和 [ADR](docs/adr/0001-deterministic-planning-boundary.md)。
 

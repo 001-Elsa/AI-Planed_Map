@@ -4,6 +4,7 @@ from backend.app.services.agent_tool_registry import TOOL_REGISTRY, InvocationMo
 COMPANION_AGENT_SPEC = AgentSpec(
     agent_type=AgentType.companion,
     prompt_version="companion-agent-v2",
+    context_view="companion_trip_execution",
     allowed_tools=TOOL_REGISTRY.names_for(AgentType.companion, InvocationMode.agent_callable),
     input_artifact_types=frozenset({"trip_observation"}),
     output_artifact_type="companion_action_report",

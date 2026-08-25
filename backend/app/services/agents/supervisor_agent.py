@@ -184,37 +184,81 @@ class SupervisorAgent:
                 step_id="intent",
                 agent_type=AgentType.intent,
                 responsibility="parse_intent_and_constraints",
+                status="pending",
+                depends_on=[],
                 input_artifact_type="planning_request",
                 output_artifact_type="intent_artifact",
+                output_schema_ref="PlanningIntent",
+                budget=AgentBudget(max_steps=1, max_input_tokens=4_000, max_output_tokens=800),
                 trigger_reason="always_required",
             ),
             AgentPlanStep(
                 step_id="search",
                 agent_type=AgentType.search,
                 responsibility="recall_provider_poi_candidates",
+                status="pending",
+                depends_on=["intent"],
                 input_artifact_type="intent_artifact",
                 output_artifact_type="search_artifact",
+                output_schema_ref="CandidateSet",
+                budget=AgentBudget(max_steps=1, max_input_tokens=2_000, max_output_tokens=800),
                 trigger_reason="verified_poi_required",
             ),
         ]
+        weather_required = any(
+            token in (item.field + item.reason).casefold()
+            for item in intent.constraints.uncertain
+            for token in ("weather", "rain", "storm", "precipitation", "天气", "下雨", "雨")
+        )
+        if weather_required:
+            steps.append(
+                AgentPlanStep(
+                    step_id="weather",
+                    agent_type=AgentType.safety,
+                    responsibility="query_weather_risk_for_time_windows",
+                    status="pending",
+                    depends_on=["intent"],
+                    input_artifact_type="intent_artifact",
+                    output_artifact_type="weather_evidence",
+                    output_schema_ref="WeatherEvidence",
+                    budget=AgentBudget(max_steps=1, max_input_tokens=1_000, max_output_tokens=400),
+                    trigger_reason="weather_constraint_detected",
+                )
+            )
         if safety_reasons:
+            safety_dependencies = ["intent", "search"]
+            if weather_required:
+                safety_dependencies.append("weather")
             steps.append(
                 AgentPlanStep(
                     step_id="safety_check",
                     agent_type=AgentType.safety,
                     responsibility="check_party_accessibility_and_walking_risk",
+                    status="pending",
+                    depends_on=safety_dependencies,
                     input_artifact_type="search_artifact",
                     output_artifact_type="safety_report",
+                    output_schema_ref="SafetyCheckReport",
+                    budget=AgentBudget(max_steps=1, max_input_tokens=2_000, max_output_tokens=800),
                     trigger_reason=",".join(safety_reasons),
                 )
             )
+        planner_dependencies = ["search"]
+        if safety_reasons:
+            planner_dependencies.append("safety_check")
+        if weather_required and not safety_reasons:
+            planner_dependencies.append("weather")
         steps.append(
             AgentPlanStep(
                 step_id="planner",
                 agent_type=AgentType.planner,
                 responsibility="solve_route_with_hard_constraints",
+                status="pending",
+                depends_on=planner_dependencies,
                 input_artifact_type="safety_report" if safety_reasons else "search_artifact",
                 output_artifact_type="plan_candidate",
+                output_schema_ref="RouteSolution",
+                budget=AgentBudget(max_steps=1, max_input_tokens=2_000, max_output_tokens=800),
                 trigger_reason="candidate_route_required",
             )
         )
@@ -225,8 +269,12 @@ class SupervisorAgent:
                     step_id="critic",
                     agent_type=AgentType.critic,
                     responsibility="review_plan_evidence_and_preferences",
+                    status="pending",
+                    depends_on=["planner"],
                     input_artifact_type="plan_candidate",
                     output_artifact_type="review_report",
+                    output_schema_ref="ReviewReport",
+                    budget=AgentBudget(max_steps=1, max_input_tokens=4_000, max_output_tokens=800),
                     trigger_reason=f"critic_mode:{mode.value}",
                 )
             )
@@ -237,13 +285,19 @@ class SupervisorAgent:
                 step_id="final_answer",
                 agent_type=AgentType.supervisor,
                 responsibility="assemble_final_answer",
+                status="pending",
+                depends_on=["critic"] if mode != AgentWorkflowMode.off else ["planner"],
                 input_artifact_type="plan_candidate",
                 output_artifact_type="final_answer",
+                output_schema_ref="AIPlanResult",
+                budget=AgentBudget(max_steps=1, max_input_tokens=1_000, max_output_tokens=400),
                 trigger_reason="always_required",
             )
         )
         if not safety_reasons:
             skipped_optional_steps.append("safety_check")
+        if not weather_required:
+            skipped_optional_steps.append("weather")
         return AgentExecutionPlan(
             plan_kind="safety_sensitive_trip" if safety_reasons else "standard_trip",
             steps=steps,

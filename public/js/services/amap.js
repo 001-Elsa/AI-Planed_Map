@@ -27,8 +27,8 @@ export function loadAMap(key, jscode, useProxy, onload, onerror) {
 /* ---- 高德错误码 → 用户能看懂的话 ----
  * 覆盖 Key 配置错误与配额类错误(10003 日调用量超限 / 10004·CUQPS 并发超限 等) */
 const AMAP_ERRORS = [
-  ['INVALID_USER_KEY', 'Key 无效,请点右上 ⚙ 检查'],
-  ['INVALID_USER_SCODE', '安全密钥(jscode)校验失败,请点右上 ⚙ 重新填写'],
+  ['INVALID_USER_KEY', '地图 Key 无效,请联系管理员检查服务端配置'],
+  ['INVALID_USER_SCODE', '地图安全密钥校验失败,请联系管理员检查服务端配置'],
   ['USERKEY_PLAT_NOMATCH', 'Key 平台类型不对:需在高德控制台选「Web端(JS API)」'],
   ['DAILY_QUERY_OVER_LIMIT', '该 Key 今日调用量已用完(10003),明天恢复或到高德控制台提额'],
   ['USER_DAILY_QUERY_OVER_LIMIT', '该 Key 今日调用量已用完,明天恢复或提额'],
@@ -567,6 +567,68 @@ export async function searchNearbyPlaces({
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
+  });
+}
+
+/* ---- GPS(WGS-84) → 高德(GCJ-02)，国内否则会偏几十到几百米 ---- */
+export function convertGpsToAmap(lng, lat) {
+  return new Promise((resolve) => {
+    const fallback = { lng: Number(lng), lat: Number(lat) };
+    if (!window.AMap || typeof AMap.convertFrom !== 'function') {
+      resolve(fallback);
+      return;
+    }
+    AMap.convertFrom([fallback.lng, fallback.lat], 'gps', (status, result) => {
+      const point = result && result.locations && result.locations[0];
+      if (status === 'complete' && point) {
+        resolve({ lng: Number(point.lng), lat: Number(point.lat) });
+        return;
+      }
+      resolve(fallback);
+    });
+  });
+}
+
+function formatRegeoName(regeo) {
+  if (!regeo) return '';
+  const formatted = String(regeo.formattedAddress || regeo.formatted_address || '').trim();
+  if (formatted) return formatted;
+  const component = regeo.addressComponent || {};
+  const parts = [
+    component.province,
+    component.city,
+    component.district,
+    component.township,
+    component.street,
+    component.streetNumber || component.street_number,
+  ].map((part) => (Array.isArray(part) ? part[0] : part)).map((part) => String(part || '').trim()).filter(Boolean);
+  return parts.filter((part, index) => index === 0 || part !== parts[index - 1]).join('');
+}
+
+export async function reverseGeocode(lng, lat) {
+  if (!Number.isFinite(Number(lng)) || !Number.isFinite(Number(lat))) return '';
+  if (amapUsesProxy && amapServiceKey) {
+    const result = await fetchProxyJson('v3/geocode/regeo', {
+      location: Number(lng) + ',' + Number(lat),
+      radius: '100',
+      extensions: 'base',
+    });
+    if (String(result.status) !== '1') return '';
+    return formatRegeoName(result.regeocode);
+  }
+  return new Promise((resolve) => {
+    if (!window.AMap) { resolve(''); return; }
+    const finish = (status, result) => {
+      resolve(status === 'complete' ? formatRegeoName(result && result.regeocode) : '');
+    };
+    try {
+      AMap.plugin('AMap.Geocoder', () => {
+        const geocoder = new AMap.Geocoder({ radius: 100, extensions: 'base' });
+        geocoder.getAddress([Number(lng), Number(lat)], finish);
+      });
+    } catch (error) {
+      resolve('');
+    }
   });
 }
 

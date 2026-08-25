@@ -310,6 +310,16 @@ async def create_pending_replan(
         operations.append(
             {"operation": "change_transport_mode", "transport_mode": chosen_mode.value}
         )
+    snapshot_departure = datetime.fromisoformat(snapshot["departure_time"])
+    if snapshot_departure.tzinfo is None:
+        snapshot_departure = snapshot_departure.replace(tzinfo=timezone.utc)
+    if abs((current_time - snapshot_departure).total_seconds()) >= 60:
+        operations.append(
+            {
+                "operation": "change_departure_time",
+                "departure_time": current_time.isoformat(),
+            }
+        )
 
     before_cost = sum(
         float((stop.get("poi") or {}).get("estimated_cost_yuan") or 0) for stop in original_stops
@@ -336,7 +346,11 @@ async def create_pending_replan(
             "feasible": evaluation.feasible,
             "constraint_conflicts": evaluation.conflicts,
         },
-        "changes": {"replacements": replacements, "dropped_optional": drop_optional},
+        "changes": {
+            "replacements": replacements,
+            "dropped_optional": drop_optional,
+            "completed_stop_ids": sorted(completed),
+        },
         "algorithm": algorithm,
         "alternatives": options,
         "replan_context": {

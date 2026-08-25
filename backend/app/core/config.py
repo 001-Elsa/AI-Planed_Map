@@ -1,6 +1,8 @@
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -25,6 +27,12 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_base_url: str = "https://api.openai.com/v1"
     llm_model: str = "gpt-4.1-mini"
+    llm_small_model: str = ""
+    llm_strong_model: str = ""
+    model_router_enabled: bool = True
+    model_router_rule_max_complexity: int = Field(default=1, ge=0, le=20)
+    model_router_strong_min_complexity: int = Field(default=5, ge=1, le=20)
+    model_router_strong_min_uncertainty: int = Field(default=2, ge=1, le=20)
     max_llm_output_tokens: int = 2_000
     prompt_version: str = "intent-v2"
     external_timeout_seconds: float = 8.0
@@ -75,6 +83,12 @@ class Settings(BaseSettings):
     worker_lock_ttl_seconds: int = 30
     worker_lock_renew_interval_seconds: int = 10
     redis_url: str = ""
+    agent_message_transport: Literal["auto", "memory", "redis_stream"] = "auto"
+    agent_stream_prefix: str = "mapgo:agent-messages"
+    agent_consumer_group_prefix: str = "mapgo:agent-workers"
+    agent_stream_max_length: int = 20_000
+    agent_message_max_attempts: int = 3
+    agent_message_reclaim_idle_ms: int = 30_000
     api_requests_per_minute: int = 120
     api_ip_requests_per_minute: int = 3000
     auth_device_requests_per_minute: int = 30
@@ -86,12 +100,25 @@ class Settings(BaseSettings):
     mock_weather_provider: bool = True
     llm_input_cost_per_million_usd: float = 0.40
     llm_output_cost_per_million_usd: float = 1.60
+    llm_small_input_cost_per_million_usd: float = Field(default=0.40, ge=0)
+    llm_small_output_cost_per_million_usd: float = Field(default=1.60, ge=0)
+    llm_strong_input_cost_per_million_usd: float = Field(default=2.00, ge=0)
+    llm_strong_output_cost_per_million_usd: float = Field(default=8.00, ge=0)
 
     model_config = SettingsConfigDict(
         env_file=ROOT / ".env",
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    @model_validator(mode="after")
+    def validate_model_router_thresholds(self) -> "Settings":
+        if self.model_router_rule_max_complexity >= self.model_router_strong_min_complexity:
+            raise ValueError(
+                "MODEL_ROUTER_RULE_MAX_COMPLEXITY must be lower than "
+                "MODEL_ROUTER_STRONG_MIN_COMPLEXITY"
+            )
+        return self
 
     @property
     def use_mock_map(self) -> bool:

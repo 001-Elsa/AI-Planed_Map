@@ -10,7 +10,7 @@
 <link rel="manifest" href="manifest.json">
 <link rel="icon" href="icons/icon-192.png">
 <link rel="apple-touch-icon" href="icons/icon-192.png">
-<link rel="stylesheet" href="css/style.css?v=30">
+<link rel="stylesheet" href="css/style.css?v=33">
 </head>
 <body>
 
@@ -56,7 +56,14 @@
     <span id="mode-name">随行地图</span>
   </div>
   <form id="my-location-search" class="location-search" role="search">
-    <span class="location-search-icon" aria-hidden="true">⌕</span>
+    <button type="button" id="btn-locate" class="location-locate-btn" title="手动定位" aria-label="手动定位">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <circle cx="12" cy="12" r="6.4" fill="none" stroke="currentColor" stroke-width="2.4"/>
+        <circle cx="12" cy="12" r="2.3" fill="currentColor"/>
+        <path d="M12 1.2v3.8M12 19v3.8M1.2 12h3.8M19 12h3.8" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
+      </svg>
+      <span>手动定位</span>
+    </button>
     <input
       type="search"
       id="my-location-input"
@@ -73,8 +80,6 @@
   <div class="top-actions">
     <button id="btn-dark" class="icon-btn" title="夜间模式">🌙</button>
     <button id="btn-user" class="icon-btn" title="账号">👤</button>
-    <button id="btn-locate" class="icon-btn" title="输入我的位置">⌖</button>
-    <button id="btn-settings" class="icon-btn" title="地图 Key 设置">⚙</button>
   </div>
 </header>
 
@@ -378,26 +383,6 @@
   </div>
 </nav>
 
-<!-- Key 设置弹层 -->
-<div id="setup-mask" class="mask hidden">
-  <div class="dialog">
-    <h2>配置高德地图 Key</h2>
-    <p class="muted">前往 <b>lbs.amap.com</b> 控制台 → 应用管理 → 创建应用 →
-      添加 Key(服务平台选 <b>Web端(JS API)</b>),获得 Key 和「安全密钥」。详见 README。</p>
-    <label>Key
-      <input type="text" id="inp-key" placeholder="例如 1a2b3c4d5e6f...">
-    </label>
-    <label>安全密钥 (jscode)
-      <input type="text" id="inp-jscode" placeholder="创建 Key 时生成的安全密钥">
-    </label>
-    <p id="setup-err" class="err hidden"></p>
-    <div class="dialog-actions">
-      <button id="btn-setup-cancel" class="small-btn hidden">取消</button>
-      <button id="btn-setup-save" class="primary-btn">保存并加载地图</button>
-    </div>
-  </div>
-</div>
-
-<script type="module" src="js/main.js?v=33"></script>
+<script type="module" src="js/main.js?v=36"></script>
 </body>
 </html>

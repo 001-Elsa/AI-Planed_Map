@@ -7,6 +7,7 @@ import pytest
 from sqlalchemy import func, select
 
 from backend.app.clients.weather_client import WeatherSnapshot
+from backend.app.core.exceptions import AppError
 from backend.app.db.session import SessionLocal
 from backend.app.infrastructure.runtime_store import InMemoryRuntimeStore
 from backend.app.main import app
@@ -14,12 +15,16 @@ from backend.app.models import (
     AgentRun,
     AgentSession,
     AgentToolCall,
+    AgentWorkflowRun,
+    AgentWorkflowTask,
     PlanPatch,
+    PlanVersion,
     TripEvent,
     TripSession,
 )
 from backend.app.services.agent_controller import AgentController
 from backend.app.services.agent_decider import AgentDecision, DecisionResult
+from backend.app.services.plan_versioning import apply_plan_patch_cas
 from backend.app.worker import process_trip_event
 
 
@@ -240,6 +245,29 @@ async def test_worker_llm_tool_loop_creates_one_pending_patch_and_transport_swit
     assert any(item["operation"] == "change_transport_mode" for item in operations)
     assert calls >= 2
     assert run_status == "succeeded"
+    async with SessionLocal() as db:
+        workflow = await db.scalar(
+            select(AgentWorkflowRun)
+            .where(AgentWorkflowRun.trip_session_id == trip_id)
+            .order_by(AgentWorkflowRun.id.desc())
+        )
+        assert workflow is not None
+        tasks = (
+            await db.scalars(
+                select(AgentWorkflowTask)
+                .where(AgentWorkflowTask.workflow_run_id == workflow.id)
+                .order_by(AgentWorkflowTask.id)
+            )
+        ).all()
+        assert [task.role for task in tasks] == [
+            "companion",
+            "supervisor",
+            "replanner",
+            "planner",
+            "critic",
+            "supervisor",
+        ]
+        assert all(task.status == "succeeded" for task in tasks)
     stream = await store.get_json(f"trip-stream:{trip_id}")
     assert stream["plan_patch"]["patch_id"] == patch.id
     assert any(
@@ -420,6 +448,61 @@ async def test_agent_rejects_illegal_tool_and_stops_at_step_limit(
     )
     assert limited["status"] == "step_limit_reached"
     assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_plan_patch_cas_allows_only_one_writer_for_a_base_version(
+    async_client: httpx.AsyncClient,
+):
+    _, _, trip_id = await _active_trip(
+        async_client, "caswriter", "明天下午从酒店出发去博物馆"
+    )
+    async with SessionLocal() as db:
+        trip = await db.get(TripSession, trip_id)
+        assert trip is not None
+        patches = [
+            PlanPatch(
+                planning_run_id=trip.planning_run_id,
+                user_id=trip.user_id,
+                base_version=1,
+                operations_json=json.dumps(
+                    [{"operation": "change_transport_mode", "transport_mode": "driving"}]
+                ),
+                reason="single writer CAS test",
+                impact_json="{}",
+                status="pending",
+            )
+            for _ in range(2)
+        ]
+        db.add_all(patches)
+        await db.commit()
+        first_id, second_id = patches[0].id, patches[1].id
+
+        applied = await apply_plan_patch_cas(
+            db=db,
+            patch_id=first_id,
+            provider=app.state.map_provider,
+            trace_id="cas-test",
+            policy_result="integration_test",
+        )
+        assert applied["plan_version"] == 2
+        with pytest.raises(AppError) as conflict:
+            await apply_plan_patch_cas(
+                db=db,
+                patch_id=second_id,
+                provider=app.state.map_provider,
+                trace_id="cas-test",
+                policy_result="integration_test",
+            )
+        assert conflict.value.code == "PLAN_VERSION_CONFLICT"
+        versions = (
+            await db.scalars(
+                select(PlanVersion).where(
+                    PlanVersion.planning_run_id == trip.planning_run_id
+                )
+            )
+        ).all()
+        assert sorted(version.version for version in versions) == [1, 2]
 
 
 @pytest.mark.asyncio

@@ -1,12 +1,12 @@
-/* 认证与 Key 配置 UI:登录/注册视图、游客模式、用户按钮、高德 Key 弹窗、应用启动 */
+/* 认证 UI:登录/注册视图、游客模式、用户按钮、应用启动 */
 'use strict';
 
 import { S } from '../state.js';
 import { $, toast } from './dom.js';
 import { store } from '../services/store.js';
-import { API } from '../services/api.js?v=33';
-import { loadAMap } from '../services/amap.js?v=33';
-import { initMap, refreshModeData } from '../modes/registry.js?v=33';
+import { API } from '../services/api.js?v=36';
+import { loadAMap } from '../services/amap.js?v=36';
+import { initMap, refreshModeData, locateCurrentPosition } from '../modes/registry.js?v=36';
 
 let authMode = 'login';
 let authAccountType = 'user';
@@ -70,10 +70,9 @@ function refreshAccountTypeUI() {
     : (isAdmin ? '注册管理员' : '注册用户');
 }
 
-/* ---- 启动流程:登录 → Key → 地图 ---- */
+/* ---- 启动流程:登录 → 地图 ---- */
 export function boot() {
   bindAuthUI();
-  bindKeyUI();
   API.config().catch(() => {});
   window.setInterval(() => {
     if (API.offline) void recoverBackend();
@@ -165,7 +164,10 @@ function bindAuthUI() {
       store.set('mapgo_guest', '0');
       toast((submitMode === 'login' ? '欢迎回来,' : '注册成功,') + r.user.nickname);
       hideAuth();
-      if (S.map) refreshUserUI(); else await startApp();
+      if (S.map) {
+        refreshUserUI();
+        void locateCurrentPosition(false);
+      } else await startApp();
     } catch (e) {
       const message = e.code === 'USERNAME_EXISTS'
         ? '该用户名已经注册，请切换到登录'
@@ -212,35 +214,6 @@ function bindAuthUI() {
   });
 }
 
-/* ---- 高德 Key 弹窗 ---- */
-function bindKeyUI() {
-  $('btn-setup-save').addEventListener('click', () => {
-    const key = $('inp-key').value.trim();
-    const js = $('inp-jscode').value.trim();
-    if (!key || !js) { setupErr('Key 和安全密钥都要填哦'); return; }
-    store.set('amap_key', key);
-    store.set('amap_jscode', js);
-    location.reload();
-  });
-  $('btn-setup-cancel').addEventListener('click', () => showSetup(false));
-  $('btn-settings').addEventListener('click', () => {
-    $('inp-key').value = store.get('amap_key') || '';
-    $('inp-jscode').value = store.get('amap_jscode') || '';
-    showSetup(true, true);
-  });
-}
-
-export function showSetup(show, cancellable) {
-  $('setup-mask').classList.toggle('hidden', !show);
-  if (show) $('btn-setup-cancel').classList.toggle('hidden', !cancellable);
-  if (show) fillSetupDefaults();
-}
-export function setupErr(msg) {
-  const e = $('setup-err');
-  e.textContent = msg;
-  e.classList.remove('hidden');
-}
-
 function getLocalAmapConfig() {
   if (!localAmapConfigPromise) {
     localAmapConfigPromise = import('/js/local-config.js')
@@ -253,27 +226,20 @@ function getLocalAmapConfig() {
   return localAmapConfigPromise;
 }
 
-function fillSetupDefaults() {
-  getLocalAmapConfig().then((cfg) => {
-    if (!cfg || !cfg.key || !cfg.jscode) return;
-    if (!$('inp-key').value) $('inp-key').value = cfg.key;
-    if (!$('inp-jscode').value) $('inp-jscode').value = cfg.jscode;
-  });
-}
-
-/* Key 来源优先级:服务端托管(代理模式)> 本机 localStorage > 弹窗引导 */
+/* Key 来源优先级:服务端托管(代理模式)> 本机 localStorage > 本地默认凭据 */
 async function startApp() {
   refreshUserUI();
   let cfg = null;
   try { cfg = await API.config(); } catch (e) { /* 离线 */ }
-  const onerror = () => { showSetup(true, false); setupErr('高德脚本加载失败,请检查网络或 Key。'); };
+  const onerror = () => { toast('地图加载失败,请检查网络', 4000); };
   if (cfg && cfg.amapKey && cfg.proxy) { loadAMap(cfg.amapKey, null, true, initMap, onerror); return; }
   const key = store.get('amap_key');
   const jscode = store.get('amap_jscode');
-  if (key && jscode) loadAMap(key, jscode, false, initMap, onerror);
-  else {
-    const localCfg = await getLocalAmapConfig();
-    if (localCfg && localCfg.key && localCfg.jscode) loadAMap(localCfg.key, localCfg.jscode, false, initMap, onerror);
-    else showSetup(true, false);
+  if (key && jscode) { loadAMap(key, jscode, false, initMap, onerror); return; }
+  const localCfg = await getLocalAmapConfig();
+  if (localCfg && localCfg.key && localCfg.jscode) {
+    loadAMap(localCfg.key, localCfg.jscode, false, initMap, onerror);
+    return;
   }
+  toast('地图服务暂不可用', 4000);
 }

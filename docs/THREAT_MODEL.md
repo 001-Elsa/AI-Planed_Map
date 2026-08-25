@@ -42,6 +42,9 @@
 | 持续保存精确位置 | 显式 Consent、加密字段、短期 TTL、可导出/清除 | 更细粒度设备级授权 |
 | Worker 在 `BRPOP` 后硬崩溃导致事件丢失 | 数据库保留 TripEvent；捕获到的异常会延迟重试并进入 DLQ | Redis Streams/消息代理 ACK、pending reclaim、outbox/inbox |
 | 分布式锁 TTL 到期后出现并发执行 | token 校验释放；事件状态和 source_event_id 去重 | 锁续租或 fencing token；数据库唯一约束 |
+| Companion/重规划角色直接覆盖正式路线 | Companion 仅可请求重规划；Replanner 无工具；Planner 只产出候选 Patch；Critic 只读；正式版本仅经 Validator + HITL/低风险显式 opt-in + CAS 写入 | 对自动应用阈值持续做线上灰度与回放评测 |
+| 两个补丁同时从 Version N 写入 N+1 | Patch 与最新版本行锁、base_version 比较、事务内硬约束复验、`(planning_run_id, version)` 唯一约束和冲突回滚 | 多地域写入时升级为数据库 fencing token/单写区域 |
+| 所有角色共用强模型导致成本放大或模型故障扩大 | ModelRouter 将规划/搜索/安全角色锁定 deterministic；Intent/Companion 使用 Rule/Small，Critic 仅复杂高风险时使用 Strong；独立价格预算和 Rule fallback | 根据线上质量、成本和 P95 延迟持续校准阈值 |
 | SSE 重连遗漏中间事件 | 最新状态快照 + Last-Event-ID 去重 | 持久化事件序列与按 ID 回放 |
 | Patch 路径遗漏部分首次规划约束 | deadline、最晚返回、步行和总费用复验 | 统一复用完整 Constraint Validator |
 | 高德大响应挤占代理缓存 | 流式读取时限制总响应体；仅缓存成功、合法且不超过独立缓存上限的 JSON 响应 | 项目级配额、缓存命中率和大响应告警 |

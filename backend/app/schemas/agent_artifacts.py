@@ -71,6 +71,7 @@ class AgentType(str, Enum):
     planner = "planner"
     critic = "critic"
     companion = "companion"
+    replanner = "replanner"
 
 
 class AgentEndpoint(str, Enum):
@@ -85,6 +86,7 @@ class AgentEndpoint(str, Enum):
     planner = "planner"
     critic = "critic"
     companion = "companion"
+    replanner = "replanner"
     tool_runtime = "tool_runtime"
     final_answer = "final_answer"
 
@@ -168,12 +170,27 @@ class AgentRecoveryDecision(StrictModel):
     fallback_source: str | None = Field(default=None, max_length=80)
 
 
+class AgentBudget(StrictModel):
+    max_steps: int = Field(default=1, ge=1, le=20)
+    max_input_tokens: int = Field(default=4_000, ge=0)
+    max_output_tokens: int = Field(default=800, ge=0)
+    max_cost_usd: float = Field(default=0.03, ge=0)
+    timeout_seconds: float = Field(default=10, gt=0, le=120)
+
+
 class AgentPlanStep(StrictModel):
     step_id: str = Field(min_length=1, max_length=80)
     agent_type: AgentType
     responsibility: str = Field(min_length=1, max_length=120)
+    status: Literal["pending", "running", "succeeded", "failed", "skipped"] = "pending"
+    depends_on: list[str] = Field(default_factory=list, max_length=10)
     input_artifact_type: str = Field(min_length=1, max_length=80)
     output_artifact_type: str = Field(min_length=1, max_length=80)
+    input_artifact_refs: list[str] = Field(default_factory=list, max_length=20)
+    output_schema_ref: str | None = Field(default=None, max_length=120)
+    budget: AgentBudget | None = None
+    attempt_count: int = Field(default=0, ge=0, le=10)
+    version: int = Field(default=1, ge=1)
     required: bool = True
     trigger_reason: str | None = Field(default=None, max_length=300)
 
@@ -184,18 +201,24 @@ class AgentExecutionPlan(StrictModel):
     rationale: list[str] = Field(default_factory=list, max_length=10)
     skipped_optional_steps: list[str] = Field(default_factory=list, max_length=10)
 
-
-class AgentBudget(StrictModel):
-    max_steps: int = Field(default=1, ge=1, le=20)
-    max_input_tokens: int = Field(default=4_000, ge=0)
-    max_output_tokens: int = Field(default=800, ge=0)
-    max_cost_usd: float = Field(default=0.03, ge=0)
-    timeout_seconds: float = Field(default=10, gt=0, le=120)
-
+    @model_validator(mode="after")
+    def validate_task_graph(self) -> AgentExecutionPlan:
+        seen: set[str] = set()
+        for step in self.steps:
+            if step.step_id in seen:
+                raise ValueError(f"duplicate task graph step: {step.step_id}")
+            missing = set(step.depends_on) - seen
+            if missing:
+                raise ValueError(
+                    f"task {step.step_id} depends on unknown or later tasks: {sorted(missing)}"
+                )
+            seen.add(step.step_id)
+        return self
 
 class AgentSpec(StrictModel):
     agent_type: AgentType
     prompt_version: str = Field(min_length=1, max_length=50)
+    context_view: str = Field(default="role_minimal", min_length=1, max_length=80)
     # Model-selectable tools and deterministic server-side capabilities are
     # deliberately separate.  Giving an Agent an internal capability must
     # never make that capability visible in an LLM tool schema.

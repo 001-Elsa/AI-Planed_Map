@@ -4,6 +4,22 @@
 
 ---
 
+## v7.17 — Event-Driven Dynamic Multi-Agent
+
+- 行中事件新增 Companion → Supervisor → Replanner → Planner → Critic 显式执行链，并持久化动态工作流、任务、交接和制品；
+- Replanner 只生成强类型重规划指令且没有工具权限，地图矩阵、OR-Tools/Beam Search 继续由 Planner 调用；
+- 新增动态 Patch Critic：阻断必经点删除、约束冲突、陈旧版本证据和缺失 Provider 证据的替代 POI；
+- PlanPatch 新增 `change_departure_time`，任何 Agent 都不能直接覆盖 PlanVersion；
+- Patch 提交增加行锁、CAS、硬约束复验、唯一版本 fencing 和并发冲突回滚；高风险默认 HITL，低风险自动应用必须在 Trip 创建时显式 opt-in；
+
+## v7.18 — Cost-aware Model Router
+
+- 新增 Rule/Small/Strong/Deterministic 四档 ModelRouter，按任务复杂度、不确定性、风险、模型可用性和故障状态动态路由；
+- Intent 接入 Rule/Small/Strong Structured Output，Critic 接入 Rule/Strong Hybrid，Companion 限定 Rule/Small；
+- Supervisor、Search、Safety、Planner、Replanner 显式锁定确定性执行，OR-Tools/Beam Search 不进入模型调用链；
+- Small/Strong 分别配置模型名和输入输出单价，Agent Runtime 使用实际路由价格执行预算检查；
+- 路由指标记录角色、tier、风险与复杂度，高风险继续进入 Critic/HITL，ModelRouter 不改变工具和状态权限；
+
 ## v7.6 — Agent 自动评测
 
 - `PlanningPreferences` 新增 `avoid_hiking` 与 `travel_style`，规则解析器覆盖轻松/紧凑旅行和登山规避表达；

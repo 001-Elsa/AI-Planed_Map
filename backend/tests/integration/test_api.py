@@ -17,10 +17,31 @@ def test_auth_plan_and_ai_pipeline():
         shared_capability = capabilities.json()["data"]["multi_agent"]["shared_state"]
         evaluation_capability = capabilities.json()["data"]["multi_agent"]["evaluation"]
         hitl_capability = capabilities.json()["data"]["multi_agent"]["human_in_the_loop"]
+        role_contracts = capabilities.json()["data"]["multi_agent"]["role_contracts"]
+        agent_runtime = capabilities.json()["data"]["multi_agent"]["agent_runtime"]
+        tool_schemas = capabilities.json()["data"]["multi_agent"]["tool_argument_schemas"]
+        model_router = capabilities.json()["data"]["multi_agent"]["model_router"]
         assert evaluation_capability["runtime_critic_scoring"] is True
         assert evaluation_capability["hard_fail_zero_score"] is True
         assert hitl_capability["enabled"] is True
         assert hitl_capability["reject_replans"] is True
+        assert set(role_contracts) == {
+            "requirement_clarification",
+            "place_research",
+            "itinerary_coordination",
+            "plan_review",
+            "runtime_companion",
+        }
+        assert agent_runtime["implementation"] == "framework_independent"
+        assert agent_runtime["spec_driven"] is True
+        assert agent_runtime["active_model_tool_loops"] == ["companion"]
+        assert set(agent_runtime["runtime_eligible_roles"]) >= {"search", "planner", "critic"}
+        assert "get_weather" in tool_schemas["companion"]
+        assert "search_poi" in tool_schemas["search_internal"]
+        assert "get_route_matrix" in tool_schemas["planner_internal"]
+        assert model_router["role_policy"]["planner"] == "deterministic_route_optimizer"
+        assert model_router["role_policy"]["critic"] == "rule_or_strong_hybrid"
+        assert model_router["high_risk_action"] == "hitl"
         assert shared_capability["version"] == "1.0"
         assert shared_capability["optimistic_concurrency"] is True
         assert shared_capability["role_scoped_views"] is True

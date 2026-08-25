@@ -22,7 +22,7 @@ from backend.app.models import (
     TripEvent,
     TripSession,
 )
-from backend.app.schemas.agent_artifacts import AgentWorkflowTrace
+from backend.app.schemas.agent_artifacts import AgentType, AgentWorkflowTrace
 from backend.app.schemas.ai_intent import (
     MAX_PLANNING_TASKS,
     AIPlanRequest,
@@ -36,9 +36,12 @@ from backend.app.services.agent_memory import (
     load_confirmed_preferences,
 )
 from backend.app.services.agent_orchestrator import persist_agent_workflow
+from backend.app.services.agent_role_contracts import public_role_contracts
 from backend.app.services.agent_shared_state import AgentSharedStateManager
+from backend.app.services.agent_tool_registry import TOOL_REGISTRY, InvocationMode
 from backend.app.services.agents.critic_agent import build_critic_agent
 from backend.app.services.intent_parser import build_intent_parser
+from backend.app.services.model_router import ModelRouter
 from backend.app.services.plan_patch_validator import (
     apply_patch_structure,
     recalculate_and_validate_snapshot,
@@ -168,7 +171,9 @@ def _execution_trace_v2(result, parser, request: Request, latency_ms: int) -> di
         (step for step in agent_trace.steps if step.agent_type.value == "critic"), None
     )
     human_questions = [
-        question for question in result.questions if getattr(question, "kind", None) == "confirmation"
+        question
+        for question in result.questions
+        if getattr(question, "kind", None) == "confirmation"
     ]
     stages = [
         {
@@ -276,9 +281,62 @@ async def planning_capabilities(request: Request):
                     "planner",
                     "critic",
                     "companion",
+                    "replanner",
                 ],
                 "max_handoffs": settings.max_agent_handoffs,
                 "max_workflow_cost_usd": settings.max_agent_workflow_cost_usd,
+                "role_contracts": public_role_contracts(),
+                "agent_runtime": {
+                    "implementation": "framework_independent",
+                    "spec_driven": True,
+                    "bounded_tool_loop": True,
+                    "context_loader_port": True,
+                    "tool_policy_port": True,
+                    "artifact_validator_port": True,
+                    "shared_state_updater_port": True,
+                    "trace_emitter_port": True,
+                    "runtime_eligible_roles": [
+                        "intent",
+                        "search",
+                        "safety",
+                        "planner",
+                        "critic",
+                        "companion",
+                        "replanner",
+                    ],
+                    "active_model_tool_loops": ["companion"],
+                    "deterministic_execution_roles": [
+                        "search",
+                        "safety",
+                        "planner",
+                        "replanner",
+                    ],
+                },
+                "dynamic_event_workflow": {
+                    "roles": [
+                        "companion",
+                        "supervisor",
+                        "replanner",
+                        "planner",
+                        "critic",
+                    ],
+                    "versioned_patch_only": True,
+                    "cas_commit": True,
+                    "high_risk_requires_confirmation": True,
+                    "low_risk_auto_apply_requires_trip_opt_in": True,
+                },
+                "model_router": ModelRouter(settings).public_policy(),
+                "tool_argument_schemas": {
+                    "companion": TOOL_REGISTRY.argument_schemas_for(
+                        AgentType.companion, InvocationMode.agent_callable
+                    ),
+                    "planner_internal": TOOL_REGISTRY.argument_schemas_for(
+                        AgentType.planner, InvocationMode.internal_stage
+                    ),
+                    "search_internal": TOOL_REGISTRY.argument_schemas_for(
+                        AgentType.search, InvocationMode.internal_stage
+                    ),
+                },
                 "message_protocol": {
                     "version": "1.0",
                     "structured_content": True,
@@ -291,8 +349,7 @@ async def planning_capabilities(request: Request):
                     "version": "1.0",
                     "runtime_backend": (
                         "redis"
-                        if request.app.state.runtime_store.__class__.__name__
-                        == "RedisRuntimeStore"
+                        if request.app.state.runtime_store.__class__.__name__ == "RedisRuntimeStore"
                         else "in_memory"
                     ),
                     "ttl_seconds": settings.agent_shared_state_ttl_seconds,
@@ -499,7 +556,7 @@ async def _execute_conversation_plan(
             intent_json=json.dumps(data["intent"], ensure_ascii=False),
             result_json=json.dumps(data, ensure_ascii=False),
             status=result.status,
-            model_name=parser.name,
+            model_name=getattr(parser, "last_parser", parser.name),
             prompt_version=settings.prompt_version,
             map_provider=request.app.state.map_provider.name,
             trace_id=request.state.trace_id,
@@ -567,7 +624,12 @@ async def start_planning_conversation(
             raise AppError(400, "IDEMPOTENCY_KEY_INVALID", "Idempotency-Key 过长")
         settings = get_settings()
         parser = build_intent_parser(settings, request.app.state.http_client)
-        fingerprint = request_fingerprint(str(user.id), body, parser.name, settings.prompt_version)
+        fingerprint = request_fingerprint(
+            str(user.id),
+            body,
+            getattr(parser, "routing_fingerprint", parser.name),
+            settings.prompt_version,
+        )
         owner_key = f"{user.id}:conversation"
         now = datetime.now(timezone.utc)
         record = await db.scalar(
@@ -698,7 +760,12 @@ async def create_ai_plan(
 ):
     settings = get_settings()
     parser = build_intent_parser(settings, request.app.state.http_client)
-    fingerprint = request_fingerprint(str(user.id), body, parser.name, settings.prompt_version)
+    fingerprint = request_fingerprint(
+        str(user.id),
+        body,
+        getattr(parser, "routing_fingerprint", parser.name),
+        settings.prompt_version,
+    )
     record = None
     budget_checked = False
     now = datetime.now(timezone.utc)
@@ -808,7 +875,7 @@ async def create_ai_plan(
         intent_json=json.dumps(response_data["intent"], ensure_ascii=False),
         result_json=json.dumps(response_data, ensure_ascii=False),
         status=result.status,
-        model_name=parser.name,
+        model_name=getattr(parser, "last_parser", parser.name),
         prompt_version=settings.prompt_version,
         map_provider=request.app.state.map_provider.name,
         trace_id=request.state.trace_id,
@@ -1077,11 +1144,13 @@ async def decide_plan_patch(
 ):
     await _owned_run(db, run_id, user.id)
     patch = await db.scalar(
-        select(PlanPatch).where(
+        select(PlanPatch)
+        .where(
             PlanPatch.id == patch_id,
             PlanPatch.planning_run_id == run_id,
             PlanPatch.user_id == user.id,
         )
+        .with_for_update()
     )
     if not patch:
         raise AppError(404, "PLAN_PATCH_NOT_FOUND", "计划补丁不存在")
@@ -1127,9 +1196,14 @@ async def decide_plan_patch(
         await db.commit()
         return {"ok": True, "data": {"status": "rejected"}}
 
-    current = await db.scalar(
-        select(func.max(PlanVersion.version)).where(PlanVersion.planning_run_id == run_id)
+    current_version = await db.scalar(
+        select(PlanVersion)
+        .where(PlanVersion.planning_run_id == run_id)
+        .order_by(PlanVersion.version.desc())
+        .limit(1)
+        .with_for_update()
     )
+    current = current_version.version if current_version is not None else None
     if current != patch.base_version:
         raise AppError(
             409,
@@ -1238,7 +1312,15 @@ async def decide_plan_patch(
             trace_id=request.state.trace_id,
         )
     )
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise AppError(
+            409,
+            "PLAN_VERSION_CONFLICT",
+            "计划已由另一个写入者更新，请基于最新版本重新生成补丁",
+        ) from exc
     return {
         "ok": True,
         "data": {

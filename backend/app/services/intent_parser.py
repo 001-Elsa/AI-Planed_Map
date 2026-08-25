@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from backend.app.core.config import Settings
 from backend.app.core.exceptions import UpstreamError
+from backend.app.schemas.agent_artifacts import AgentType
 from backend.app.schemas.ai_intent import (
     MAX_PLANNING_TASKS,
     PlanningIntent,
@@ -16,6 +17,12 @@ from backend.app.schemas.ai_intent import (
     PlanningTask,
     TransportMode,
     UncertainConstraint,
+)
+from backend.app.services.model_router import (
+    ModelRouteDecision,
+    ModelRouter,
+    ModelTier,
+    routing_context_from_text,
 )
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -279,11 +286,13 @@ class RuleBasedIntentParser:
 
 
 class OpenAICompatibleIntentParser:
-    name = "openai-compatible"
-
-    def __init__(self, settings: Settings, client: httpx.AsyncClient) -> None:
+    def __init__(
+        self, settings: Settings, client: httpx.AsyncClient, *, model_name: str | None = None
+    ) -> None:
         self.settings = settings
         self.client = client
+        self.model_name = model_name or settings.llm_model
+        self.name = f"openai-compatible:{self.model_name}"
         self.input_tokens = 0
         self.output_tokens = 0
 
@@ -304,7 +313,7 @@ class OpenAICompatibleIntentParser:
 
         make_strict(schema)
         payload = {
-            "model": self.settings.llm_model,
+            "model": self.model_name,
             "max_tokens": self.settings.max_llm_output_tokens,
             "messages": [
                 {
@@ -391,7 +400,59 @@ class FallbackIntentParser:
             return intent
 
 
+class RoutedIntentParser:
+    """Select Rule/Small/Strong per request while preserving deterministic fallback."""
+
+    def __init__(self, settings: Settings, client: httpx.AsyncClient) -> None:
+        self.settings = settings
+        self.router = ModelRouter(settings)
+        self.name = "model-router-intent-v1"
+        self.routing_fingerprint = (
+            f"{self.name}:{self.router.small_model}:{self.router.strong_model}:"
+            f"{settings.model_router_rule_max_complexity}:"
+            f"{settings.model_router_strong_min_complexity}:"
+            f"{settings.model_router_strong_min_uncertainty}"
+        )
+        self.rule = RuleBasedIntentParser()
+        self.small = FallbackIntentParser(
+            OpenAICompatibleIntentParser(settings, client, model_name=self.router.small_model),
+            self.rule,
+        )
+        self.strong = FallbackIntentParser(
+            OpenAICompatibleIntentParser(settings, client, model_name=self.router.strong_model),
+            self.rule,
+        )
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.last_parser = self.rule.name
+        self.fallback_used = False
+        self.fallback_reason: str | None = None
+        self.last_route: ModelRouteDecision | None = None
+
+    async def parse(self, text: str) -> PlanningIntent:
+        decision = self.router.route(
+            routing_context_from_text(
+                text,
+                agent_type=AgentType.intent,
+                model_available=bool(self.settings.llm_api_key),
+            )
+        )
+        self.last_route = decision
+        selected: IntentParser
+        if decision.tier == ModelTier.strong:
+            selected = self.strong
+        elif decision.tier == ModelTier.small:
+            selected = self.small
+        else:
+            selected = self.rule
+        intent = await selected.parse(text)
+        self.input_tokens = int(getattr(selected, "input_tokens", 0) or 0)
+        self.output_tokens = int(getattr(selected, "output_tokens", 0) or 0)
+        self.last_parser = getattr(selected, "last_parser", selected.name)
+        self.fallback_used = bool(getattr(selected, "fallback_used", False))
+        self.fallback_reason = getattr(selected, "fallback_reason", None)
+        return intent
+
+
 def build_intent_parser(settings: Settings, client: httpx.AsyncClient) -> IntentParser:
-    if settings.llm_api_key:
-        return FallbackIntentParser(OpenAICompatibleIntentParser(settings, client))
-    return RuleBasedIntentParser()
+    return RoutedIntentParser(settings, client)

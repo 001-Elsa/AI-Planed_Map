@@ -48,6 +48,7 @@ class ConsentScope(str, Enum):
 class CreateTripSessionRequest(StrictModel):
     planning_run_id: int = Field(gt=0)
     reminder_cooldown_minutes: int = Field(default=15, ge=1, le=240)
+    auto_apply_low_risk_patches: bool = False
 
 
 class ConsentRequest(StrictModel):

@@ -24,18 +24,20 @@ from backend.app.schemas.ai_intent import (
     PlanningIntent,
     PlanningTask,
     TripConstraintSet,
+    UncertainConstraint,
 )
 from backend.app.services.agent_protocol import AgentMessageRouter, AgentProtocolError
 from backend.app.services.agent_readiness import build_critic_readiness_report
+from backend.app.services.agent_role_contracts import ROLE_CONTRACTS
 from backend.app.services.agents.base import AgentExecution, canonical_hash
 from backend.app.services.agents.companion_agent import COMPANION_AGENT_SPEC
 from backend.app.services.agents.critic_agent import CRITIC_AGENT_SPEC
 from backend.app.services.agents.intent_agent import INTENT_AGENT_SPEC, IntentAgent
 from backend.app.services.agents.planner_agent import PLANNER_AGENT_SPEC
 from backend.app.services.agents.safety_agent import SAFETY_AGENT_SPEC
-from backend.app.services.agents.search_agent import SEARCH_AGENT_SPEC
+from backend.app.services.agents.search_agent import _POI_RECOVERY_CACHE, SEARCH_AGENT_SPEC
 from backend.app.services.agents.supervisor_agent import SUPERVISOR_AGENT_SPEC, SupervisorAgent
-from backend.app.services.planning_service import _POI_RECOVERY_CACHE, PlanningService
+from backend.app.services.planning_service import PlanningService
 
 
 class StableParser:
@@ -169,6 +171,23 @@ def test_agent_tool_and_schema_boundaries_are_disjoint():
         CriticSoftAdjustments.model_validate({"latest_return_time": "2030-01-01T18:00:00Z"})
 
 
+def test_five_role_contracts_make_responsibility_boundaries_explicit():
+    assert set(ROLE_CONTRACTS) == {
+        "requirement_clarification",
+        "place_research",
+        "itinerary_coordination",
+        "plan_review",
+        "runtime_companion",
+    }
+    assert ROLE_CONTRACTS["place_research"].allowed_internal_capabilities == frozenset(
+        {"search_poi"}
+    )
+    assert "modify_formal_plan" in ROLE_CONTRACTS["place_research"].forbidden_actions
+    assert ROLE_CONTRACTS["runtime_companion"].allowed_tools == COMPANION_AGENT_SPEC.allowed_tools
+    assert "overwrite_formal_plan" in ROLE_CONTRACTS["runtime_companion"].forbidden_actions
+    assert "modify_hard_constraints" in ROLE_CONTRACTS["plan_review"].forbidden_actions
+
+
 @pytest.mark.asyncio
 async def test_supervisor_agent_schedules_expected_topology_without_tools():
     execution = await SupervisorAgent().start(
@@ -208,6 +227,38 @@ async def test_supervisor_dynamic_plan_inserts_safety_for_elderly_trip():
         "critic",
         "final_answer",
     ]
+    assert execution.output["steps"][2]["depends_on"] == ["intent", "search"]
+    assert execution.output["steps"][3]["output_schema_ref"] == "RouteSolution"
+
+
+@pytest.mark.asyncio
+async def test_supervisor_dynamic_plan_is_explicit_acyclic_task_graph_with_weather():
+    intent = PlanningIntent(
+        tasks=[PlanningTask(description="museum")],
+        constraints=TripConstraintSet(
+            uncertain=[
+                UncertainConstraint(
+                    field="weather",
+                    reason="avoid rain windows",
+                    confidence=0.6,
+                    safety_buffer_minutes=30,
+                )
+            ]
+        ),
+    )
+
+    execution = await SupervisorAgent().plan(intent, mode=AgentWorkflowMode.shadow)
+    steps = execution.output["steps"]
+    seen: set[str] = set()
+    for step in steps:
+        assert set(step["depends_on"]) <= seen
+        assert step["status"] == "pending"
+        assert step["attempt_count"] == 0
+        assert step["version"] == 1
+        assert step["output_schema_ref"]
+        assert step["budget"]
+        seen.add(step["step_id"])
+    assert "weather" in [item["step_id"] for item in steps]
 
 
 def test_critic_retry_report_rejects_hard_constraint_adjustments():

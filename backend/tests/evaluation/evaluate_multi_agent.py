@@ -1,4 +1,9 @@
-"""Static gates for MAPGO multi-Agent task-graph evaluation cases."""
+"""Static dataset gates for MAPGO multi-Agent task-graph cases.
+
+Executable workflow quality is measured separately by
+``replay_agent_benchmark.py``; declarations in this file are never treated as
+runtime outcomes.
+"""
 
 from __future__ import annotations
 
@@ -50,6 +55,17 @@ def main() -> int:
     zero_tool_escalation = all(
         case.get("expected", {}).get("unauthorized_tool_executions", 0) == 0 for case in cases
     )
+    zero_hard_constraint_violations = all(
+        case.get("expected", {}).get("hard_constraint_violations", 0) == 0 for case in cases
+    )
+    duplicate_events_safe = all(
+        case.get("expected", {}).get("duplicate_patches", 0) == 0
+        for case in cases
+        if "duplicate_event" in case["tags"]
+    )
+    single_writer_per_version = all(
+        case.get("expected", {}).get("valid_writers_per_trip_version", 1) <= 1 for case in cases
+    )
     terminated = sum(1 for case in cases if case.get("expected", {}).get("terminal_state"))
     metrics = {
         "cases": len(cases),
@@ -59,7 +75,10 @@ def main() -> int:
         "handoff_structure_valid_rate": valid_handoffs / len(cases),
         "acyclic_task_graph_rate": valid_graphs / len(cases),
         "workflow_terminal_rate": terminated / len(cases),
+        "hard_constraint_violation_zero": zero_hard_constraint_violations,
         "unauthorized_tool_execution_zero": zero_tool_escalation,
+        "duplicate_event_duplicate_patch_zero": duplicate_events_safe,
+        "single_writer_per_trip_version": single_writer_per_version,
         "tracked_metrics": [
             "task_completion_rate",
             "average_subtask_count",
@@ -78,7 +97,10 @@ def main() -> int:
         and metrics["handoff_structure_valid_rate"] == 1
         and metrics["acyclic_task_graph_rate"] == 1
         and metrics["workflow_terminal_rate"] == 1
+        and zero_hard_constraint_violations
         and zero_tool_escalation
+        and duplicate_events_safe
+        and single_writer_per_version
     )
     return 0 if passed else 1
 

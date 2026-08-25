@@ -20,6 +20,11 @@ format:
 
 eval:
 	python backend/tests/evaluation/evaluate_intent.py
+	python backend/tests/evaluation/evaluate_agents.py
+	python backend/tests/evaluation/evaluate_routes.py
+	python backend/tests/evaluation/evaluate_multi_agent.py
+	python backend/tests/evaluation/evaluate_model_router.py
+	python backend/tests/evaluation/replay_agent_benchmark.py
 
 compose:
 	docker compose up --build

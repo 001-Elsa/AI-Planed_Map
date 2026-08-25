@@ -86,6 +86,7 @@ async def main() -> int:
         AgentType.planner,
         AgentType.critic,
         AgentType.companion,
+        AgentType.replanner,
     }
     isolation_ok = (
         not AGENT_REGISTRY[AgentType.supervisor].allowed_tools
@@ -94,6 +95,7 @@ async def main() -> int:
         and not AGENT_REGISTRY[AgentType.safety].allowed_tools
         and not AGENT_REGISTRY[AgentType.planner].allowed_tools
         and not AGENT_REGISTRY[AgentType.critic].allowed_tools
+        and not AGENT_REGISTRY[AgentType.replanner].allowed_tools
         and "propose_replan" in AGENT_REGISTRY[AgentType.companion].allowed_tools
     )
     shared_state_isolation_ok = (

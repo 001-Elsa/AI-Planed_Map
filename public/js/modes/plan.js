@@ -3,12 +3,12 @@
 
 import { S } from '../state.js';
 import { $, escapeHtml, toast } from '../ui/dom.js';
-import { API } from '../services/api.js?v=33';
+import { API } from '../services/api.js?v=36';
 import { store } from '../services/store.js';
 import { fmtDist, fmtDur, fmtClock, toXY, copyText } from '../services/format.js';
-import { routeLeg, searchNearestPOI } from '../services/amap.js?v=33';
+import { routeLeg, searchNearestPOI } from '../services/amap.js?v=36';
 import { solveOrder, solveOrderExact } from '../services/algo.js';
-import { requireLogin } from '../ui/auth.js?v=33';
+import { requireLogin } from '../ui/auth.js?v=36';
 
 let activeTripId = null;
 let activePlanningRunId = null;

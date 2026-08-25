@@ -15,10 +15,19 @@ class EmptyToolArgs(StrictModel):
     pass
 
 
+class ParseRequirementArgs(StrictModel):
+    text: str = Field(min_length=2, max_length=4000)
+
+
 class SearchPoiArgs(StrictModel):
     keyword: str = Field(min_length=1, max_length=120)
     origin: Coordinate
     city: str | None = Field(default=None, max_length=50)
+
+
+class SafetyCheckArgs(StrictModel):
+    party: dict[str, Any] = Field(default_factory=dict)
+    route_constraints: dict[str, Any] = Field(default_factory=dict)
 
 
 class WeatherQueryArgs(StrictModel):
@@ -28,6 +37,20 @@ class WeatherQueryArgs(StrictModel):
 class RouteMatrixArgs(StrictModel):
     points: list[Coordinate] = Field(min_length=2, max_length=25)
     transport_mode: TransportMode = TransportMode.walking
+
+
+class OptimizeRouteArgs(StrictModel):
+    candidate_group_count: int = Field(ge=1, le=24)
+    transport_mode: TransportMode = TransportMode.walking
+    hard_constraints: dict[str, Any] = Field(default_factory=dict)
+
+
+class TripStateQueryArgs(EmptyToolArgs):
+    pass
+
+
+class CurrentLocationQueryArgs(EmptyToolArgs):
+    pass
 
 
 class ReplanProposalArgs(StrictModel):
@@ -46,14 +69,16 @@ class ToolResultEnvelope(StrictModel):
 
 
 TOOL_ARGUMENT_MODELS: dict[str, type[StrictModel]] = {
-    "get_trip_state": EmptyToolArgs,
-    "get_current_location": EmptyToolArgs,
+    "parse_requirement": ParseRequirementArgs,
+    "check_travel_safety": SafetyCheckArgs,
+    "get_trip_state": TripStateQueryArgs,
+    "get_current_location": CurrentLocationQueryArgs,
     "get_weather": WeatherQueryArgs,
     "propose_replan": ReplanProposalArgs,
     "search_poi": SearchPoiArgs,
     "get_route_matrix": RouteMatrixArgs,
     "verify_transit_edges": RouteMatrixArgs,
-    "optimize_route": EmptyToolArgs,
+    "optimize_route": OptimizeRouteArgs,
 }
 
 
@@ -117,6 +142,15 @@ def tool_result_error(
 def stable_tool_error(exc: Exception) -> str:
     """Map internal exceptions to model-safe error codes."""
 
+    explicit = str(exc).strip().upper()
+    if explicit in {
+        "UPSTREAM_TIMEOUT",
+        "QUOTA_EXHAUSTED",
+        "DATA_EXPIRED",
+        "INVALID_TOOL_ARGUMENTS",
+        "UPSTREAM_ERROR",
+    }:
+        return explicit
     if isinstance(exc, TimeoutError):
         return "UPSTREAM_TIMEOUT"
     if isinstance(exc, ValidationError):

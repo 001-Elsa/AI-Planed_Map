@@ -89,6 +89,24 @@ def test_agent_tool_contracts_expose_and_validate_strict_arguments():
         validate_tool_arguments("get_weather", {"location": {"lng": 200, "lat": 30}})
 
 
+def test_tool_registry_carries_argument_schemas_for_authorized_tools():
+    schemas = TOOL_REGISTRY.argument_schemas_for(
+        AgentType.companion, InvocationMode.agent_callable
+    )
+    assert set(schemas) == COMPANION_AGENT_SPEC.allowed_tools
+    assert schemas["get_weather"]["properties"]["location"]
+
+    grant = _authorize(
+        AgentType.search,
+        "search_poi",
+        InvocationMode.internal_stage,
+        DataScope.map_search,
+    )
+    assert grant.capability.argument_schema_ref == "SearchPoiArgs"
+    assert grant.argument_schema is not None
+    assert "keyword" in grant.argument_schema["properties"]
+
+
 def test_expected_internal_stage_capabilities_are_allowed():
     assert (
         _authorize(

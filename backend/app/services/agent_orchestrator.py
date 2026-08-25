@@ -30,21 +30,22 @@ from backend.app.schemas.agent_artifacts import (
     AgentType,
     AgentWorkflowMode,
     AgentWorkflowTrace,
-    ArtifactEnvelope,
     ReviewReport,
     SafetyCheckReport,
     minimize_agent_payload,
 )
 from backend.app.schemas.agent_state import AgentSharedStateAudit
-from backend.app.schemas.ai_intent import AIPlanRequest, PlanningIntent, PoiCandidate
+from backend.app.schemas.ai_intent import AIPlanRequest, AIPlanResult, PlanningIntent
+from backend.app.services.agent_context import build_critic_context, build_planning_context
 from backend.app.services.agent_protocol import AgentMessageRouter, AgentProtocolError
 from backend.app.services.agent_shared_state import AgentSharedStateManager
+from backend.app.services.agent_tool_contracts import stable_tool_error
 from backend.app.services.agents.base import AgentExecution, canonical_hash
 from backend.app.services.agents.critic_agent import CriticAgent
 from backend.app.services.agents.intent_agent import IntentAgent
-from backend.app.services.agents.planner_agent import PLANNER_AGENT_SPEC
+from backend.app.services.agents.planner_agent import PlannerAgent
 from backend.app.services.agents.safety_agent import SafetyAgent
-from backend.app.services.agents.search_agent import SEARCH_AGENT_SPEC
+from backend.app.services.agents.search_agent import SearchAgent, SearchAgentInput, SearchArtifact
 from backend.app.services.agents.supervisor_agent import SupervisorAgent
 
 
@@ -57,14 +58,18 @@ class PlanningAgentOrchestrator:
         settings: Settings,
         supervisor_agent: SupervisorAgent,
         intent_agent: IntentAgent,
+        search_agent: SearchAgent,
         safety_agent: SafetyAgent,
+        planner_agent: PlannerAgent,
         critic_agent: CriticAgent,
         shared_state: AgentSharedStateManager,
     ) -> None:
         self.settings = settings
         self.supervisor_agent = supervisor_agent
         self.intent_agent = intent_agent
+        self.search_agent = search_agent
         self.safety_agent = safety_agent
+        self.planner_agent = planner_agent
         self.critic_agent = critic_agent
         self.shared_state = shared_state
         try:
@@ -270,7 +275,9 @@ class PlanningAgentOrchestrator:
         )
         return plan
 
-    async def begin_search(self, fallback_intent: PlanningIntent) -> PlanningIntent:
+    async def run_search(
+        self, request: AIPlanRequest, fallback_intent: PlanningIntent
+    ) -> SearchArtifact:
         inbound = self._consume(
             AgentEndpoint.search, frozenset({"intent_artifact", "retry_directive"})
         )
@@ -289,42 +296,23 @@ class PlanningAgentOrchestrator:
             fallback_intent.model_dump(mode="json")
         ):
             raise AgentProtocolError("search input intent does not match workflow state")
-        return intent
-
-    async def record_search(
-        self,
-        *,
-        keywords: list[str],
-        candidate_counts: list[int],
-        provider_name: str,
-        recovered_failures: int,
-        candidates: list[list[PoiCandidate]],
-        recovery_actions: list[dict[str, Any]] | None = None,
-    ) -> None:
-        payload = {
-            "workflow_state": "search_completed",
-            "provider": provider_name,
-            "keyword_count": len(keywords),
-            "candidate_counts": candidate_counts,
-            "total_candidates": sum(candidate_counts),
-            "recovered_failures": recovered_failures,
-            "recovery_actions": recovery_actions or [],
-        }
-        artifact = ArtifactEnvelope(
-            artifact_type=SEARCH_AGENT_SPEC.output_artifact_type,
-            producer_agent=AgentType.search,
-            payload=payload,
-            confidence=0.7 if recovered_failures else 1,
-            evidence_refs=[f"provider:{provider_name}"],
-            input_hash=canonical_hash({"keywords": keywords, "provider": provider_name}),
+        if request.origin is None:
+            raise AgentProtocolError("search context is missing the confirmed origin")
+        execution = await self.search_agent.run(
+            SearchAgentInput(
+                intent=intent,
+                origin=request.origin,
+                city=request.city,
+                task_poi_overrides=request.task_poi_overrides,
+            ),
+            recovery_handler=self.recover,
         )
-        inbound = self._active_inputs.pop(AgentEndpoint.search)
         state = await self.shared_state.update(
             self.trace.task_id,
             actor=AgentType.search,
             expected_revision=self.state_revision,
             action="search_completed",
-            changes={"poi_candidates": candidates},
+            changes={"poi_candidates": execution.output.candidate_groups},
             message_id=inbound.message_id,
         )
         self.state_revision = state.revision
@@ -335,7 +323,8 @@ class PlanningAgentOrchestrator:
             message_type=AgentMessageType.artifact,
             artifact_type="search_artifact",
             content={
-                "summary": payload,
+                "summary": execution.artifact.payload,
+                "artifact_hash": canonical_hash(execution.output.model_dump(mode="json")),
                 "shared_state_ref": self.trace.task_id,
                 "state_revision": self.state_revision,
                 "state_hash": state.state_hash,
@@ -344,24 +333,33 @@ class PlanningAgentOrchestrator:
             causation_id=inbound.message_id,
         )
         self._record(
-            AgentExecution(
-                spec=SEARCH_AGENT_SPEC,
-                output=payload,
-                artifact=artifact,
-                latency_ms=0,
-                fallback_used=bool(recovered_failures),
-                reason="search_retry_recovered" if recovered_failures else None,
-            ),
+            execution,
             "intent_artifact",
             input_message=inbound,
             output_message=outbound,
         )
+        return execution.output
 
     def safety_required(self) -> bool:
         return bool(
             self.execution_plan
             and any(step.step_id == "safety_check" for step in self.execution_plan.steps)
         )
+
+    async def execute_planning_stages(
+        self, request: AIPlanRequest, intent: PlanningIntent
+    ) -> AIPlanResult:
+        """Execute the Supervisor-selected planning subgraph in topological order."""
+
+        if self.execution_plan is None:
+            raise AgentProtocolError("Supervisor task graph has not been created")
+        executable_steps = {step.step_id for step in self.execution_plan.steps}
+        if not {"search", "planner"}.issubset(executable_steps):
+            raise AgentProtocolError("Supervisor task graph is missing required planning stages")
+        search = await self.run_search(request, intent)
+        if "safety_check" in executable_steps:
+            await self.check_safety()
+        return await self.run_planner(request, intent, search)
 
     async def check_safety(self) -> SafetyCheckReport:
         inbound = self._consume(AgentEndpoint.safety, frozenset({"search_artifact"}))
@@ -382,7 +380,9 @@ class PlanningAgentOrchestrator:
             actor=AgentType.safety,
             expected_revision=self.state_revision,
             action="safety_checked",
-            changes={"execution_context": {"safety_check": execution.output.model_dump(mode="json")}},
+            changes={
+                "execution_context": {"safety_check": execution.output.model_dump(mode="json")}
+            },
             message_id=inbound.message_id,
         )
         self.state_revision = state.revision
@@ -393,6 +393,8 @@ class PlanningAgentOrchestrator:
             artifact_type="safety_report",
             content={
                 "summary": execution.output.model_dump(mode="json"),
+                "artifact_hash": canonical_hash(execution.output.model_dump(mode="json")),
+                "search_artifact_hash": inbound.content["artifact_hash"],
                 "shared_state_ref": self.trace.task_id,
                 "state_revision": self.state_revision,
                 "state_hash": state.state_hash,
@@ -408,63 +410,40 @@ class PlanningAgentOrchestrator:
         )
         return execution.output
 
-    async def begin_planner(
-        self, fallback: list[list[PoiCandidate]]
-    ) -> list[list[PoiCandidate]]:
+    async def run_planner(
+        self,
+        request: AIPlanRequest,
+        fallback_intent: PlanningIntent,
+        search: SearchArtifact,
+    ) -> AIPlanResult:
         inbound = self._consume(
             AgentEndpoint.planner, frozenset({"search_artifact", "safety_report"})
         )
         view = await self.shared_state.read_for_agent(self.trace.task_id, AgentType.planner)
-        if view.revision != int(inbound.content.get("state_revision", -1)):
-            raise AgentProtocolError("planner message references a stale shared-state revision")
-        if view.state_hash != inbound.content.get("state_hash"):
-            raise AgentProtocolError("planner message references a different shared-state hash")
-        groups = view.poi_candidates or []
-        if canonical_hash([[item.model_dump(mode="json") for item in group] for group in groups]) != canonical_hash(
-            [[item.model_dump(mode="json") for item in group] for group in fallback]
-        ):
-            raise AgentProtocolError("planner candidates do not match search output")
-        return groups
-
-    async def record_planner(
-        self,
-        *,
-        status: str,
-        algorithm: str | None,
-        candidate_count: int,
-        stop_count: int,
-        conflict_count: int,
-        warning_count: int,
-        result: dict[str, Any],
-    ) -> None:
-        payload = {
-            "workflow_state": "plan_candidate_ready",
-            "status": status,
-            "algorithm": algorithm,
-            "candidate_count": candidate_count,
-            "stop_count": stop_count,
-            "conflict_count": conflict_count,
-            "warning_count": warning_count,
-        }
-        artifact = ArtifactEnvelope(
-            artifact_type=PLANNER_AGENT_SPEC.output_artifact_type,
-            producer_agent=AgentType.planner,
-            payload=payload,
-            confidence=1 if status == "success" else 0.6,
-            evidence_refs=[f"algorithm:{algorithm or 'none'}"],
-            input_hash=canonical_hash(payload),
+        if request.origin is None:
+            raise AgentProtocolError("planner context is missing the confirmed origin")
+        context = build_planning_context(
+            view=view,
+            message=inbound,
+            search=search,
+            origin=request.origin,
+            city=request.city,
+            max_candidates_per_task=request.max_candidates_per_task,
+            fallback_intent=fallback_intent,
         )
-        inbound = self._active_inputs.pop(AgentEndpoint.planner)
+        execution = await self.planner_agent.run(context)
+        result = execution.output
+        formal_plan = result.model_dump(mode="json", exclude={"critic_review", "agent_workflow"})
         state = await self.shared_state.update(
             self.trace.task_id,
             actor=AgentType.planner,
             expected_revision=self.state_revision,
             action="plan_completed",
-            changes={"route_plan": result},
+            changes={"route_plan": formal_plan},
             message_id=inbound.message_id,
         )
         self.state_revision = state.revision
-        run_critic = status not in {"need_clarification"} and self.may_run_critic()
+        run_critic = result.status != "need_clarification" and self.may_run_critic()
         receiver = AgentEndpoint.critic if run_critic else AgentEndpoint.supervisor
         outbound = self._dispatch(
             sender=AgentEndpoint.planner,
@@ -475,22 +454,19 @@ class PlanningAgentOrchestrator:
                 "shared_state_ref": self.trace.task_id,
                 "state_revision": self.state_revision,
                 "state_hash": state.state_hash,
-                **payload,
+                "plan_hash": canonical_hash(formal_plan),
+                **execution.artifact.payload,
             },
             correlation_id=inbound.correlation_id,
             causation_id=inbound.message_id,
         )
         self._record(
-            AgentExecution(
-                spec=PLANNER_AGENT_SPEC,
-                output=payload,
-                artifact=artifact,
-                latency_ms=0,
-            ),
+            execution,
             inbound.artifact_type,
             input_message=inbound,
             output_message=outbound,
         )
+        return result
 
     def may_run_critic(self) -> bool:
         return (
@@ -504,13 +480,8 @@ class PlanningAgentOrchestrator:
             return None
         inbound = self._consume(AgentEndpoint.critic, frozenset({"plan_candidate"}))
         view = await self.shared_state.read_for_agent(self.trace.task_id, AgentType.critic)
-        if view.revision != int(inbound.content.get("state_revision", -1)):
-            raise AgentProtocolError("critic message references a stale shared-state revision")
-        if view.state_hash != inbound.content.get("state_hash"):
-            raise AgentProtocolError("critic message references a different shared-state hash")
-        if view.route_plan is None or canonical_hash(view.route_plan) != canonical_hash(plan):
-            raise AgentProtocolError("critic shared state does not match planner output")
-        execution = await self.critic_agent.run(view.route_plan)
+        context = build_critic_context(view=view, message=inbound, plan=plan)
+        execution = await self.critic_agent.run(context)
         projected = self.trace.total_cost_usd + execution.estimated_cost_usd
         if projected > self.settings.max_agent_workflow_cost_usd:
             self.trace.status = "budget_exceeded"
@@ -610,6 +581,7 @@ class PlanningAgentOrchestrator:
         fallback_available: bool = False,
         fallback_source: str | None = None,
     ) -> AgentRecoveryDecision:
+        error_code = stable_tool_error(exc)
         inbound = self._dispatch(
             sender=AgentEndpoint.system,
             receiver=AgentEndpoint.supervisor,
@@ -617,8 +589,8 @@ class PlanningAgentOrchestrator:
             artifact_type="recovery_event",
             content={
                 "stage": stage,
-                "error_type": type(exc).__name__,
-                "message": str(exc),
+                "error_type": error_code,
+                "message": error_code,
                 "attempt": attempt,
                 "max_attempts": max_attempts,
                 "timeout_seconds": timeout_seconds,
@@ -629,8 +601,8 @@ class PlanningAgentOrchestrator:
         inbound = self._consume(AgentEndpoint.supervisor, frozenset({"recovery_event"}))
         execution = await self.supervisor_agent.recover(
             stage=stage,
-            error_type=type(exc).__name__,
-            message=str(exc),
+            error_type=error_code,
+            message=error_code,
             attempt=attempt,
             max_attempts=max_attempts,
             timeout_seconds=timeout_seconds,
@@ -702,9 +674,9 @@ class PlanningAgentOrchestrator:
             input_message=inbound,
             output_message=outbound,
         )
-        self.trace.shared_state = (
-            await self.shared_state.audit(self.trace.task_id)
-        ).model_dump(mode="json")
+        self.trace.shared_state = (await self.shared_state.audit(self.trace.task_id)).model_dump(
+            mode="json"
+        )
 
     def finish(self, status: str) -> AgentWorkflowTrace:
         if self.trace.status == "running":
@@ -795,6 +767,16 @@ async def persist_agent_workflow(
         await db.flush()
         parent_run_id = run.id
         artifact = step.output_artifact
+        artifact_plan_version = None
+        if planning_run_id is not None:
+            candidate_version = minimized_payload.get("base_version")
+            if candidate_version is None:
+                candidate_version = minimized_payload.get("base_plan_version")
+            if candidate_version is None:
+                candidate_version = minimized_payload.get("checked_base_version")
+            artifact_plan_version = (
+                int(candidate_version) if candidate_version is not None else 1
+            )
         db.add(
             AgentArtifact(
                 workflow_run_id=workflow.id,
@@ -804,7 +786,7 @@ async def persist_agent_workflow(
                 artifact_key=f"{trace.task_id}:{index:02d}:{artifact.artifact_type}",
                 artifact_version=1,
                 status="active",
-                plan_version=1 if planning_run_id is not None else None,
+                plan_version=artifact_plan_version,
                 producer_agent=artifact.producer_agent.value,
                 payload_json=json.dumps(minimized_payload, ensure_ascii=False, default=str),
                 confidence=artifact.confidence,

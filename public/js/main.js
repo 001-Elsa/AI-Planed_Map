@@ -1,7 +1,7 @@
 /* 应用入口:启动认证流程,注册 Service Worker */
 'use strict';
 
-import { boot } from './ui/auth.js?v=33';
+import { boot } from './ui/auth.js?v=36';
 
 if ('serviceWorker' in navigator && location.protocol !== 'file:') {
   navigator.serviceWorker.addEventListener('controllerchange', () => {
