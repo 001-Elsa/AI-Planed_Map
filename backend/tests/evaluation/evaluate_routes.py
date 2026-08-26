@@ -29,9 +29,9 @@ def main() -> int:
         )
         expected_hard = set(case["expected_hard_failures"])
         detected = expected_hard.issubset(report.hard_failures)
-        score_ok = report.final_score >= float(case.get("min_score", 0)) and report.final_score <= float(
-            case.get("max_score", 100)
-        )
+        score_ok = report.final_score >= float(
+            case.get("min_score", 0)
+        ) and report.final_score <= float(case.get("max_score", 100))
         passed = report.passed is case["expected_pass"] and detected and score_ok
         correct += int(passed)
         if expected_hard:

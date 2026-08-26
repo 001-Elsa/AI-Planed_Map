@@ -119,7 +119,4 @@ ROLE_CONTRACTS: dict[AgentResponsibilityRole, AgentRoleContract] = {
 
 
 def public_role_contracts() -> dict[str, dict]:
-    return {
-        role: contract.model_dump(mode="json")
-        for role, contract in ROLE_CONTRACTS.items()
-    }
+    return {role: contract.model_dump(mode="json") for role, contract in ROLE_CONTRACTS.items()}

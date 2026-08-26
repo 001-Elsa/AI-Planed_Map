@@ -68,9 +68,7 @@ def apply_patch_structure(
             try:
                 departure = datetime.fromisoformat(raw) if isinstance(raw, str) else raw
             except ValueError as exc:
-                raise AppError(
-                    422, "PATCH_DEPARTURE_TIME_INVALID", "补丁出发时间无效"
-                ) from exc
+                raise AppError(422, "PATCH_DEPARTURE_TIME_INVALID", "补丁出发时间无效") from exc
             if departure is None or departure.tzinfo is None:
                 raise AppError(422, "PATCH_DEPARTURE_TIME_INVALID", "补丁出发时间必须含时区")
             snapshot["departure_time"] = departure.isoformat()

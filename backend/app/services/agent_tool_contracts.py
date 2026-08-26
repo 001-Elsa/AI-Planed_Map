@@ -89,9 +89,7 @@ def tool_argument_schema(tool: str) -> dict[str, Any] | None:
 
 def tool_argument_schemas_for(tools: list[str] | set[str] | frozenset[str]) -> dict[str, Any]:
     return {
-        tool: schema
-        for tool in sorted(tools)
-        if (schema := tool_argument_schema(tool)) is not None
+        tool: schema for tool in sorted(tools) if (schema := tool_argument_schema(tool)) is not None
     }
 
 

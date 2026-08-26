@@ -5,8 +5,9 @@ extend-exclude = ["data"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]
-# UP042 (StrEnum) is ignored because local dev still runs Python 3.10, which lacks enum.StrEnum.
-ignore = ["B008", "E501", "UP017", "UP042"]
+# UP042 (StrEnum) and UP046 (PEP 695 generics) are ignored because local dev
+# still runs Python 3.10, which does not support their replacement syntax.
+ignore = ["B008", "E501", "UP017", "UP042", "UP046"]
 
 [tool.ruff.format]
 quote-style = "double"

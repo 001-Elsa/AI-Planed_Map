@@ -275,7 +275,7 @@ class AgentToolRuntime:
         agent_type: AgentType,
         invocation_mode: InvocationMode,
         scopes_by_tool: Mapping[str, frozenset[DataScope]],
-    ) -> ToolHandler:
+    ) -> Callable[[str, dict[str, Any]], Awaitable[ToolResultEnvelope]]:
         async def execute(tool: str, arguments: dict[str, Any]) -> ToolResultEnvelope:
             scopes = scopes_by_tool.get(tool, frozenset())
             return await self.execute(

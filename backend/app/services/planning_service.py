@@ -63,8 +63,7 @@ class PlanningService:
             safety_agent=SafetyAgent(),
             planner_agent=PlannerAgent(map_provider, settings),
             critic_agent=critic_agent or RuleBasedCriticAgent(),
-            shared_state=shared_state
-            or AgentSharedStateManager(InMemoryRuntimeStore(), settings),
+            shared_state=shared_state or AgentSharedStateManager(InMemoryRuntimeStore(), settings),
         )
 
     async def plan(self, request: AIPlanRequest) -> AIPlanResult:
@@ -117,9 +116,7 @@ class PlanningService:
                 adjusted_intent = await self.orchestrator.apply_soft_adjustments(intent, review)
                 result = await self._solve(request, adjusted_intent)
                 second_review = await self.orchestrator.review(
-                    result.model_dump(
-                        mode="json", exclude={"critic_review", "agent_workflow"}
-                    )
+                    result.model_dump(mode="json", exclude={"critic_review", "agent_workflow"})
                 )
                 if second_review is not None:
                     review = second_review
@@ -136,9 +133,7 @@ class PlanningService:
                 result.planning_state = PlanningState.need_clarification
                 result.questions = confirmation_questions
                 result.warnings.append("方案触发 Human-in-the-loop 人工确认门槛")
-        await self.orchestrator.finalize(
-            result.model_dump(mode="json", exclude={"agent_workflow"})
-        )
+        await self.orchestrator.finalize(result.model_dump(mode="json", exclude={"agent_workflow"}))
         result.agent_workflow = self.orchestrator.finish(result.status)
         return result
 

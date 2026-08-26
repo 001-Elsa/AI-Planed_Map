@@ -212,9 +212,7 @@ async def test_runtime_prefers_spec_aware_model_port_for_non_companion_role():
     async def executor(_tool, _arguments):
         raise AssertionError("finish decision must not execute a tool")
 
-    result = await AgentRuntime(
-        decider=decider, settings=Settings(mock_map_provider=True)
-    ).execute(
+    result = await AgentRuntime(decider=decider, settings=Settings(mock_map_provider=True)).execute(
         AgentRuntimeRequest(
             spec=_search_runtime_spec(),
             state="searching",
@@ -240,9 +238,7 @@ async def test_runtime_validates_and_executes_authorized_tool_with_result_envelo
     runtime = AgentRuntime(
         decider=SequenceDecider(
             [
-                AgentDecision(
-                    action="call_tool", tool="get_trip_state", reason="read state"
-                ),
+                AgentDecision(action="call_tool", tool="get_trip_state", reason="read state"),
                 AgentDecision(action="finish", reason="state loaded"),
             ]
         ),

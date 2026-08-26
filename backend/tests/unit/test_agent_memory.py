@@ -117,12 +117,8 @@ async def test_planning_short_term_memory_is_deleted_after_trace_is_captured():
 def test_memory_discovery_fields_are_applied_only_to_generic_requests(
     preferences: dict[str, Any],
 ):
-    generic, _ = apply_long_term_preferences(
-        AIPlanRequest(text="帮我规划杭州旅游"), preferences
-    )
-    specific, audit = apply_long_term_preferences(
-        AIPlanRequest(text="去西湖公园"), preferences
-    )
+    generic, _ = apply_long_term_preferences(AIPlanRequest(text="帮我规划杭州旅游"), preferences)
+    specific, audit = apply_long_term_preferences(AIPlanRequest(text="去西湖公园"), preferences)
     assert generic.preferences_answers
     assert specific.preferences_answers == {}
     assert set(audit.skipped_explicit_keys) == set(preferences)

@@ -454,9 +454,7 @@ async def test_agent_rejects_illegal_tool_and_stops_at_step_limit(
 async def test_plan_patch_cas_allows_only_one_writer_for_a_base_version(
     async_client: httpx.AsyncClient,
 ):
-    _, _, trip_id = await _active_trip(
-        async_client, "caswriter", "明天下午从酒店出发去博物馆"
-    )
+    _, _, trip_id = await _active_trip(async_client, "caswriter", "明天下午从酒店出发去博物馆")
     async with SessionLocal() as db:
         trip = await db.get(TripSession, trip_id)
         assert trip is not None
@@ -497,9 +495,7 @@ async def test_plan_patch_cas_allows_only_one_writer_for_a_base_version(
         assert conflict.value.code == "PLAN_VERSION_CONFLICT"
         versions = (
             await db.scalars(
-                select(PlanVersion).where(
-                    PlanVersion.planning_run_id == trip.planning_run_id
-                )
+                select(PlanVersion).where(PlanVersion.planning_run_id == trip.planning_run_id)
             )
         ).all()
         assert sorted(version.version for version in versions) == [1, 2]

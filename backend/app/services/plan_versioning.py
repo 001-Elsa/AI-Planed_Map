@@ -55,7 +55,7 @@ async def apply_plan_patch_cas(
             "计划版本已经变化，旧补丁不能继续应用",
             {"current_version": current},
         )
-    assert current_row is not None
+    assert current_row is not None  # nosec B101
     snapshot = json.loads(current_row.snapshot_json)
     operations = json.loads(patch.operations_json)
     stops = apply_patch_structure(snapshot, operations)

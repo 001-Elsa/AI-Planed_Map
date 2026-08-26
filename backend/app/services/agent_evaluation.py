@@ -37,9 +37,7 @@ class RouteEvaluationPolicy(StrictModel):
     relaxed_max_travel_seconds: float = Field(default=14_400, gt=0)
     min_preferred_rating: float = Field(default=4.2, ge=0, le=5)
     pass_score: float = Field(default=75, ge=0, le=100)
-    expected_preferences: ExpectedRoutePreferences = Field(
-        default_factory=ExpectedRoutePreferences
-    )
+    expected_preferences: ExpectedRoutePreferences = Field(default_factory=ExpectedRoutePreferences)
 
 
 class RouteEvaluationFinding(StrictModel):
@@ -122,7 +120,7 @@ def _route_contains_hiking(stops: list[dict[str, Any]]) -> bool:
 
 
 def _expected_preferences_from_plan(plan: dict[str, Any]) -> ExpectedRoutePreferences:
-    preferences = ((plan.get("intent") or {}).get("preferences") or {})
+    preferences = (plan.get("intent") or {}).get("preferences") or {}
     return ExpectedRoutePreferences(
         avoid_hiking=True if preferences.get("avoid_hiking") else None,
         travel_style=(
@@ -183,9 +181,7 @@ def evaluate_route_plan(
             if comparison is None:
                 finding("time_evidence_invalid", "blocking", "路线时间证据的时区不一致")
             elif comparison:
-                finding(
-                    "task_deadline_exceeded", "blocking", f"第 {index + 1} 站超过截止时间"
-                )
+                finding("task_deadline_exceeded", "blocking", f"第 {index + 1} 站超过截止时间")
 
     latest_return = _datetime(hard.get("latest_return_time"))
     last_departure = _datetime(stops[-1].get("departure_time")) if stops else None
@@ -198,7 +194,10 @@ def evaluate_route_plan(
     max_duration = hard.get("max_total_duration_minutes")
     if max_duration is not None and total_seconds > _number(max_duration) * 60:
         finding("duration_constraint_exceeded", "blocking", "路线超过总时长硬限制")
-    if policy.hard_time_limit_seconds is not None and total_seconds > policy.hard_time_limit_seconds:
+    if (
+        policy.hard_time_limit_seconds is not None
+        and total_seconds > policy.hard_time_limit_seconds
+    ):
         finding("time_limit_exceeded", "blocking", "路线超过评测时间上限")
     max_cost = hard.get("max_total_cost_yuan")
     if max_cost is not None and _number(plan.get("estimated_cost_yuan")) > _number(max_cost):
@@ -245,8 +244,7 @@ def evaluate_route_plan(
         preference_checks.append(
             bool(preferences.get("minimize_walking")) == expected.minimize_walking
             and (
-                not expected.minimize_walking
-                or walking_meters <= policy.relaxed_max_walking_meters
+                not expected.minimize_walking or walking_meters <= policy.relaxed_max_walking_meters
             )
         )
     if expected.prefer_high_rating is not None:

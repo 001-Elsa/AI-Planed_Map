@@ -155,13 +155,9 @@ def test_agent_tool_and_schema_boundaries_are_disjoint():
             "propose_replan",
         }
     )
-    assert INTENT_AGENT_SPEC.allowed_internal_capabilities == frozenset(
-        {"parse_requirement"}
-    )
+    assert INTENT_AGENT_SPEC.allowed_internal_capabilities == frozenset({"parse_requirement"})
     assert SEARCH_AGENT_SPEC.allowed_internal_capabilities == frozenset({"search_poi"})
-    assert SAFETY_AGENT_SPEC.allowed_internal_capabilities == frozenset(
-        {"check_travel_safety"}
-    )
+    assert SAFETY_AGENT_SPEC.allowed_internal_capabilities == frozenset({"check_travel_safety"})
     assert PLANNER_AGENT_SPEC.allowed_internal_capabilities == frozenset(
         {"get_route_matrix", "optimize_route", "verify_transit_edges"}
     )
@@ -215,9 +211,7 @@ async def test_supervisor_dynamic_plan_inserts_safety_for_elderly_trip():
         mode=AgentWorkflowMode.shadow,
     )
 
-    assert "safety_check" not in [
-        item["step_id"] for item in standard.output["steps"]
-    ]
+    assert "safety_check" not in [item["step_id"] for item in standard.output["steps"]]
     assert execution.output["plan_kind"] == "safety_sensitive_trip"
     assert [item["step_id"] for item in execution.output["steps"]] == [
         "intent",
@@ -503,9 +497,7 @@ async def test_enforced_critic_can_trigger_only_one_bounded_soft_retry():
     assert result.intent.preferences.weights.uncertainty == 1.5
     assert result.agent_workflow and result.agent_workflow.retry_count == 1
     assert result.agent_workflow.messages
-    assert all(
-        message.delivery_status == "delivered" for message in result.agent_workflow.messages
-    )
+    assert all(message.delivery_status == "delivered" for message in result.agent_workflow.messages)
     assert result.agent_workflow.messages[0].content_summary["text"] == "[REDACTED_TEXT]"
     assert [step.agent_type.value for step in result.agent_workflow.steps] == [
         "supervisor",

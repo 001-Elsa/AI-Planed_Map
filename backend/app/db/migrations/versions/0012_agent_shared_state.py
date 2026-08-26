@@ -41,4 +41,3 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_table("agent_shared_state_snapshots")
-

@@ -42,8 +42,7 @@ def select_human_confirmation_questions(
                 field=f"human_confirmation.{WALKING_CONFIRMATION_KEY}",
                 kind="confirmation",
                 reason=(
-                    f"预计步行约 {walked_km:.1f} 公里，超过人工确认阈值 "
-                    f"{threshold / 1000:.1f} 公里"
+                    f"预计步行约 {walked_km:.1f} 公里，超过人工确认阈值 {threshold / 1000:.1f} 公里"
                 ),
                 question=(
                     f"当前路线预计步行约 {walked_km:.1f} 公里，是否继续？"
@@ -98,14 +97,9 @@ def _walking_threshold_meters(result: AIPlanResult) -> int:
         or preferences.travel_style == "relaxed"
     )
     return (
-        SENSITIVE_WALKING_CONFIRMATION_METERS
-        if sensitive
-        else GENERAL_WALKING_CONFIRMATION_METERS
+        SENSITIVE_WALKING_CONFIRMATION_METERS if sensitive else GENERAL_WALKING_CONFIRMATION_METERS
     )
 
 
 def _estimated_plan_cost_yuan(result: AIPlanResult) -> float:
-    return sum(
-        stop.poi.estimated_cost_yuan or 0
-        for stop in result.stops
-    )
+    return sum(stop.poi.estimated_cost_yuan or 0 for stop in result.stops)

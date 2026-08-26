@@ -774,9 +774,7 @@ async def persist_agent_workflow(
                 candidate_version = minimized_payload.get("base_plan_version")
             if candidate_version is None:
                 candidate_version = minimized_payload.get("checked_base_version")
-            artifact_plan_version = (
-                int(candidate_version) if candidate_version is not None else 1
-            )
+            artifact_plan_version = int(candidate_version) if candidate_version is not None else 1
         db.add(
             AgentArtifact(
                 workflow_run_id=workflow.id,

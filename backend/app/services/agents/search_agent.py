@@ -157,9 +157,7 @@ class SearchAgent:
                         continue
                     normalized = self._deduplicate(retry.data)
                     results[index] = normalized
-                    self._cache_results(
-                        keywords[index], context.origin, context.city, normalized
-                    )
+                    self._cache_results(keywords[index], context.origin, context.city, normalized)
                     break
                 if decision.action == "fallback_cached":
                     results[index] = self._cached_results(
@@ -271,8 +269,7 @@ class SearchAgent:
             candidate
             for candidate in candidates
             if not any(
-                term in f"{candidate.name} {candidate.address}".casefold()
-                for term in hiking_terms
+                term in f"{candidate.name} {candidate.address}".casefold() for term in hiking_terms
             )
         ]
 
@@ -337,10 +334,7 @@ class SearchAgent:
     @staticmethod
     def _cache_key(keyword: str, origin: Coordinate, city: str | None) -> str:
         normalized_city = (city or "").strip().casefold()
-        return (
-            f"{normalized_city}|{keyword.strip().casefold()}|"
-            f"{origin.lng:.3f},{origin.lat:.3f}"
-        )
+        return f"{normalized_city}|{keyword.strip().casefold()}|{origin.lng:.3f},{origin.lat:.3f}"
 
     @classmethod
     def _cache_results(
@@ -359,9 +353,7 @@ class SearchAgent:
             _POI_RECOVERY_CACHE.popitem(last=False)
 
     @classmethod
-    def _cached_results_available(
-        cls, keyword: str, origin: Coordinate, city: str | None
-    ) -> bool:
+    def _cached_results_available(cls, keyword: str, origin: Coordinate, city: str | None) -> bool:
         return cls._cache_key(keyword, origin, city) in _POI_RECOVERY_CACHE
 
     @classmethod

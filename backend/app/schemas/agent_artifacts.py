@@ -215,6 +215,7 @@ class AgentExecutionPlan(StrictModel):
             seen.add(step.step_id)
         return self
 
+
 class AgentSpec(StrictModel):
     agent_type: AgentType
     prompt_version: str = Field(min_length=1, max_length=50)

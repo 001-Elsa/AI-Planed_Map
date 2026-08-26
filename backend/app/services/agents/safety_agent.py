@@ -25,9 +25,7 @@ SAFETY_AGENT_SPEC = AgentSpec(
     ),
     input_artifact_types=frozenset({"search_artifact"}),
     output_artifact_type="safety_report",
-    budget=AgentBudget(
-        max_steps=1, max_input_tokens=2_000, max_output_tokens=800, max_cost_usd=0
-    ),
+    budget=AgentBudget(max_steps=1, max_input_tokens=2_000, max_output_tokens=800, max_cost_usd=0),
 )
 
 
@@ -100,8 +98,7 @@ class SafetyAgent:
                 {
                     "intent": intent.model_dump(mode="json"),
                     "candidates": [
-                        [item.model_dump(mode="json") for item in group]
-                        for group in candidates
+                        [item.model_dump(mode="json") for item in group] for group in candidates
                     ],
                 }
             ),

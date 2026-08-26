@@ -329,9 +329,7 @@ class AgentWorkflowRun(Base):
 
 class AgentWorkflowTask(Base):
     __tablename__ = "agent_workflow_tasks"
-    __table_args__ = (
-        UniqueConstraint("workflow_run_id", "task_key"),
-    )
+    __table_args__ = (UniqueConstraint("workflow_run_id", "task_key"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     workflow_run_id: Mapped[int] = mapped_column(
@@ -354,9 +352,7 @@ class AgentWorkflowTask(Base):
 
 class AgentHandoff(Base):
     __tablename__ = "agent_handoffs"
-    __table_args__ = (
-        UniqueConstraint("workflow_run_id", "message_id"),
-    )
+    __table_args__ = (UniqueConstraint("workflow_run_id", "message_id"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     workflow_run_id: Mapped[int] = mapped_column(
@@ -545,7 +541,7 @@ class Share(Base):
     __tablename__ = "shares"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    token: Mapped[str] = mapped_column(String(16), unique=True, index=True)
+    token: Mapped[str] = mapped_column(String(32), unique=True, index=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     type: Mapped[str] = mapped_column(String(10))
     payload: Mapped[str] = mapped_column(Text)

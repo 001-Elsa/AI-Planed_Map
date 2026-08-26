@@ -104,31 +104,69 @@ ACTION_ACTORS: dict[str, frozenset[AgentType]] = {
 
 ALLOWED_TRANSITIONS: dict[AgentSharedStatePhase, frozenset[AgentSharedStatePhase]] = {
     AgentSharedStatePhase.initialized: frozenset(
-        {AgentSharedStatePhase.intent_ready, AgentSharedStatePhase.plan_ready, AgentSharedStatePhase.retrying, AgentSharedStatePhase.failed}
+        {
+            AgentSharedStatePhase.intent_ready,
+            AgentSharedStatePhase.plan_ready,
+            AgentSharedStatePhase.retrying,
+            AgentSharedStatePhase.failed,
+        }
     ),
     AgentSharedStatePhase.intent_ready: frozenset(
-        {AgentSharedStatePhase.search_ready, AgentSharedStatePhase.retrying, AgentSharedStatePhase.finalized, AgentSharedStatePhase.failed}
+        {
+            AgentSharedStatePhase.search_ready,
+            AgentSharedStatePhase.retrying,
+            AgentSharedStatePhase.finalized,
+            AgentSharedStatePhase.failed,
+        }
     ),
     AgentSharedStatePhase.search_ready: frozenset(
-        {AgentSharedStatePhase.safety_ready, AgentSharedStatePhase.plan_ready, AgentSharedStatePhase.retrying, AgentSharedStatePhase.failed}
+        {
+            AgentSharedStatePhase.safety_ready,
+            AgentSharedStatePhase.plan_ready,
+            AgentSharedStatePhase.retrying,
+            AgentSharedStatePhase.failed,
+        }
     ),
     AgentSharedStatePhase.safety_ready: frozenset(
-        {AgentSharedStatePhase.plan_ready, AgentSharedStatePhase.retrying, AgentSharedStatePhase.failed}
+        {
+            AgentSharedStatePhase.plan_ready,
+            AgentSharedStatePhase.retrying,
+            AgentSharedStatePhase.failed,
+        }
     ),
     AgentSharedStatePhase.plan_ready: frozenset(
-        {AgentSharedStatePhase.reviewed, AgentSharedStatePhase.retrying, AgentSharedStatePhase.finalized, AgentSharedStatePhase.in_trip, AgentSharedStatePhase.failed}
+        {
+            AgentSharedStatePhase.reviewed,
+            AgentSharedStatePhase.retrying,
+            AgentSharedStatePhase.finalized,
+            AgentSharedStatePhase.in_trip,
+            AgentSharedStatePhase.failed,
+        }
     ),
     AgentSharedStatePhase.reviewed: frozenset(
-        {AgentSharedStatePhase.retrying, AgentSharedStatePhase.finalized, AgentSharedStatePhase.failed}
+        {
+            AgentSharedStatePhase.retrying,
+            AgentSharedStatePhase.finalized,
+            AgentSharedStatePhase.failed,
+        }
     ),
     AgentSharedStatePhase.retrying: frozenset(
-        {AgentSharedStatePhase.retrying, AgentSharedStatePhase.search_ready, AgentSharedStatePhase.plan_ready, AgentSharedStatePhase.failed}
+        {
+            AgentSharedStatePhase.retrying,
+            AgentSharedStatePhase.search_ready,
+            AgentSharedStatePhase.plan_ready,
+            AgentSharedStatePhase.failed,
+        }
     ),
     AgentSharedStatePhase.finalized: frozenset(
         {AgentSharedStatePhase.in_trip, AgentSharedStatePhase.completed}
     ),
     AgentSharedStatePhase.in_trip: frozenset(
-        {AgentSharedStatePhase.in_trip, AgentSharedStatePhase.completed, AgentSharedStatePhase.failed}
+        {
+            AgentSharedStatePhase.in_trip,
+            AgentSharedStatePhase.completed,
+            AgentSharedStatePhase.failed,
+        }
     ),
     AgentSharedStatePhase.completed: frozenset(),
     AgentSharedStatePhase.failed: frozenset(),
@@ -187,7 +225,11 @@ class AgentSharedStateManager:
         if route_plan is not None and route_plan.get("status") != "success":
             raise SharedStateAccessError("only a successful formal plan can seed trip state")
         now = datetime.now(timezone.utc)
-        phase = AgentSharedStatePhase.plan_ready if route_plan is not None else AgentSharedStatePhase.initialized
+        phase = (
+            AgentSharedStatePhase.plan_ready
+            if route_plan is not None
+            else AgentSharedStatePhase.initialized
+        )
         initial_change = {"route_plan": route_plan} if route_plan is not None else {}
         event = AgentSharedStateEvent(
             revision=0,
@@ -217,7 +259,10 @@ class AgentSharedStateManager:
                 raise SharedStateConflictError(
                     "shared state initialization was not stored"
                 ) from exc
-        metrics.increment("mapgo_agent_shared_state_updates_total", {"actor": "supervisor", "action": "state_initialized"})
+        metrics.increment(
+            "mapgo_agent_shared_state_updates_total",
+            {"actor": "supervisor", "action": "state_initialized"},
+        )
         return state
 
     async def sync_formal_route_plan(
@@ -271,9 +316,7 @@ class AgentSharedStateManager:
             self.ttl_seconds,
         )
         if not stored:
-            metrics.increment(
-                "mapgo_agent_shared_state_conflicts_total", {"actor": "supervisor"}
-            )
+            metrics.increment("mapgo_agent_shared_state_conflicts_total", {"actor": "supervisor"})
             raise SharedStateConflictError("shared state changed during formal plan refresh")
         metrics.increment(
             "mapgo_agent_shared_state_updates_total",
@@ -290,9 +333,7 @@ class AgentSharedStateManager:
             raise SharedStateError("shared state content hash mismatch")
         return state
 
-    async def read_for_agent(
-        self, task_id: str, actor: AgentType
-    ) -> AgentSharedStateView:
+    async def read_for_agent(self, task_id: str, actor: AgentType) -> AgentSharedStateView:
         state = await self.read(task_id)
         fields = READ_FIELDS[actor]
         payload: dict[str, Any] = {
@@ -317,7 +358,9 @@ class AgentSharedStateManager:
         message_id: UUID | None = None,
     ) -> AgentSharedState:
         if action not in ACTION_PHASE or actor not in ACTION_ACTORS[action]:
-            raise SharedStateAccessError(f"{actor.value} cannot perform shared-state action {action}")
+            raise SharedStateAccessError(
+                f"{actor.value} cannot perform shared-state action {action}"
+            )
         forbidden = set(changes) - WRITE_FIELDS[actor]
         if forbidden:
             raise SharedStateAccessError(
@@ -325,9 +368,7 @@ class AgentSharedStateManager:
             )
         current = await self.read(task_id)
         if current.revision != expected_revision:
-            metrics.increment(
-                "mapgo_agent_shared_state_conflicts_total", {"actor": actor.value}
-            )
+            metrics.increment("mapgo_agent_shared_state_conflicts_total", {"actor": actor.value})
             raise SharedStateConflictError(
                 f"shared state revision is {current.revision}, expected {expected_revision}"
             )
@@ -368,9 +409,7 @@ class AgentSharedStateManager:
             self.ttl_seconds,
         )
         if not stored:
-            metrics.increment(
-                "mapgo_agent_shared_state_conflicts_total", {"actor": actor.value}
-            )
+            metrics.increment("mapgo_agent_shared_state_conflicts_total", {"actor": actor.value})
             raise SharedStateConflictError("shared state changed concurrently")
         metrics.increment(
             "mapgo_agent_shared_state_updates_total",

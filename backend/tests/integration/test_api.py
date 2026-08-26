@@ -1,5 +1,3 @@
-import asyncio
-
 from fastapi.testclient import TestClient  # noqa: E402
 from sqlalchemy import select
 
@@ -109,7 +107,9 @@ def test_auth_plan_and_ai_pipeline():
         assert shared_state["candidate_count"] >= 3
         assert shared_state["stop_count"] == 3
         assert len(shared_state["state_hash"]) == 64
-        graph_counts = asyncio.run(_agent_graph_counts(payload["agent_workflow"]["workflow_id"]))
+        graph_counts = client.portal.call(
+            _agent_graph_counts, payload["agent_workflow"]["workflow_id"]
+        )
         assert graph_counts["tasks"] == len(payload["agent_workflow"]["steps"])
         assert graph_counts["handoffs"] == len(payload["agent_workflow"]["messages"])
         assert graph_counts["active_artifacts"] == len(payload["agent_workflow"]["steps"])
@@ -171,7 +171,9 @@ def test_auth_plan_and_ai_pipeline():
         )
         assert accepted.status_code == 200, accepted.text
         assert accepted.json()["data"]["plan_version"] == 2
-        stale_counts = asyncio.run(_agent_graph_counts(payload["agent_workflow"]["workflow_id"]))
+        stale_counts = client.portal.call(
+            _agent_graph_counts, payload["agent_workflow"]["workflow_id"]
+        )
         assert stale_counts["stale_artifacts"] == graph_counts["active_artifacts"]
 
         versions = client.get(
@@ -422,9 +424,7 @@ def test_confirmed_long_term_memory_is_applied_listed_and_revocable():
             ("minimize_walking", True)
         ]
 
-        deleted = client.delete(
-            "/api/companion/preferences/minimize_walking", headers=headers
-        )
+        deleted = client.delete("/api/companion/preferences/minimize_walking", headers=headers)
         assert deleted.status_code == 200
         assert client.get("/api/companion/preferences", headers=headers).json()["data"] == []
 

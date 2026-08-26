@@ -30,8 +30,10 @@ BOOLEAN_KEYS = frozenset(
 )
 LIST_KEYS = frozenset({"dietary_restrictions", "preferred_categories"})
 ENVIRONMENT_VALUES = frozenset({"quiet", "uncrowded", "indoor", "outdoor"})
-SUPPORTED_LONG_TERM_KEYS = BOOLEAN_KEYS | LIST_KEYS | frozenset(
-    {"optimization_goal", "preferred_environment", "travel_style"}
+SUPPORTED_LONG_TERM_KEYS = (
+    BOOLEAN_KEYS
+    | LIST_KEYS
+    | frozenset({"optimization_goal", "preferred_environment", "travel_style"})
 )
 OPTIMIZATION_GOALS = frozenset({"balanced", "shortest_time", "shortest_distance"})
 TRAVEL_STYLES = frozenset({"balanced", "relaxed", "intensive"})

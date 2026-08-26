@@ -86,7 +86,7 @@ def test_auth_rate_limit_cannot_be_bypassed_with_device_headers():
     settings.auth_device_requests_per_minute = 1
     settings.auth_ip_requests_per_minute = 100
     try:
-        with TestClient(app) as client:
+        with TestClient(app, client=("rate-limit-test", 50000)) as client:
             first = client.post(
                 "/api/login",
                 json={"username": "not-a-user", "password": "not-a-password"},

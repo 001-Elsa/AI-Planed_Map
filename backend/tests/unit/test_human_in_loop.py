@@ -50,9 +50,7 @@ def test_human_confirmation_triggers_for_long_walking_plan():
         result=_walking_result(distance_meters=8500),
     )
 
-    assert [question.field for question in questions] == [
-        "human_confirmation.walking_distance"
-    ]
+    assert [question.field for question in questions] == ["human_confirmation.walking_distance"]
     assert questions[0].kind == "confirmation"
 
 

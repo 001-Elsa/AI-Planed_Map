@@ -83,9 +83,7 @@ def main() -> int:
         for item in results
         if next(case for case in cases if case[0] == item["case"])[5]
         in {RoutingRisk.high, RoutingRisk.critical}
-    ) / sum(
-        case[5] in {RoutingRisk.high, RoutingRisk.critical} for case in cases
-    )
+    ) / sum(case[5] in {RoutingRisk.high, RoutingRisk.critical} for case in cases)
     output = {
         "cases": len(cases),
         "route_accuracy": sum(item["passed"] for item in results) / len(results),

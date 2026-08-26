@@ -133,9 +133,10 @@ class InMemoryRuntimeStore:
                     return False
             else:
                 current_value = current[0]
-                if not isinstance(current_value, dict) or int(
-                    current_value.get("revision", -1)
-                ) != expected_revision:
+                if (
+                    not isinstance(current_value, dict)
+                    or int(current_value.get("revision", -1)) != expected_revision
+                ):
                     return False
             encoded_size = len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
             if encoded_size > self._max_value_bytes:

@@ -158,9 +158,7 @@ async def create_trip_session(body: CreateTripSessionRequest, user: CurrentUser,
         state=TripState.plan_ready.value,
         current_plan_version=version.version,
         reminder_cooldown_minutes=body.reminder_cooldown_minutes,
-        context_json=json.dumps(
-            {"auto_apply_low_risk_patches": body.auto_apply_low_risk_patches}
-        ),
+        context_json=json.dumps({"auto_apply_low_risk_patches": body.auto_apply_low_risk_patches}),
     )
     db.add(trip)
     await db.flush()
@@ -987,9 +985,7 @@ async def replan_remaining_trip(
     try:
         from backend.app.services.dynamic_replanning import DynamicReplanningOrchestrator
 
-        data = await DynamicReplanningOrchestrator(
-            db, request.app.state.map_provider
-        ).run(
+        data = await DynamicReplanningOrchestrator(db, request.app.state.map_provider).run(
             trip=trip,
             event=TripEventArtifact(
                 trip_id=trip.id,
@@ -1139,9 +1135,7 @@ async def purge_private_data(
     runtime_task_ids = set(task_ids) | {f"trip-{trip_id}-state" for trip_id in trip_ids}
     runtime_states_deleted = 0
     for task_id in runtime_task_ids:
-        if await request.app.state.runtime_store.delete_json(
-            f"agent-shared-state:v1:{task_id}"
-        ):
+        if await request.app.state.runtime_store.delete_json(f"agent-shared-state:v1:{task_id}"):
             runtime_states_deleted += 1
     await db.commit()
     return {

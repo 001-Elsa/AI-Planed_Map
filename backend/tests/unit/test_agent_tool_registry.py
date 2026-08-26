@@ -36,13 +36,9 @@ def _authorize(
 
 
 def test_registry_is_the_single_source_for_agent_manifests():
-    assert INTENT_AGENT_SPEC.allowed_internal_capabilities == frozenset(
-        {"parse_requirement"}
-    )
+    assert INTENT_AGENT_SPEC.allowed_internal_capabilities == frozenset({"parse_requirement"})
     assert SEARCH_AGENT_SPEC.allowed_internal_capabilities == frozenset({"search_poi"})
-    assert SAFETY_AGENT_SPEC.allowed_internal_capabilities == frozenset(
-        {"check_travel_safety"}
-    )
+    assert SAFETY_AGENT_SPEC.allowed_internal_capabilities == frozenset({"check_travel_safety"})
     assert PLANNER_AGENT_SPEC.allowed_internal_capabilities == frozenset(
         {"get_route_matrix", "optimize_route", "verify_transit_edges"}
     )
@@ -82,17 +78,13 @@ def test_agent_tool_contracts_expose_and_validate_strict_arguments():
         "get_weather",
         "propose_replan",
     }
-    assert validate_tool_arguments("propose_replan", {"reason": "delay"}) == {
-        "reason": "delay"
-    }
+    assert validate_tool_arguments("propose_replan", {"reason": "delay"}) == {"reason": "delay"}
     with pytest.raises(ValueError):
         validate_tool_arguments("get_weather", {"location": {"lng": 200, "lat": 30}})
 
 
 def test_tool_registry_carries_argument_schemas_for_authorized_tools():
-    schemas = TOOL_REGISTRY.argument_schemas_for(
-        AgentType.companion, InvocationMode.agent_callable
-    )
+    schemas = TOOL_REGISTRY.argument_schemas_for(AgentType.companion, InvocationMode.agent_callable)
     assert set(schemas) == COMPANION_AGENT_SPEC.allowed_tools
     assert schemas["get_weather"]["properties"]["location"]
 
@@ -160,9 +152,7 @@ def test_expected_internal_stage_capabilities_are_allowed():
         (AgentType.companion, "optimize_route"),
     ],
 )
-def test_cross_role_capability_escalation_is_denied(
-    agent_type: AgentType, capability: str
-):
+def test_cross_role_capability_escalation_is_denied(agent_type: AgentType, capability: str):
     registered = TOOL_REGISTRY.get(capability)
     assert registered is not None
     with pytest.raises(CapabilityAuthorizationError) as caught:

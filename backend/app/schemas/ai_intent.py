@@ -203,7 +203,10 @@ class AIPlanRequest(StrictModel):
             if (
                 not isinstance(items, list)
                 or len(items) > limit
-                or any(not isinstance(item, str) or not item.strip() or len(item) > 50 for item in items)
+                or any(
+                    not isinstance(item, str) or not item.strip() or len(item) > 50
+                    for item in items
+                )
             ):
                 raise ValueError(f"invalid {key}")
         environments = values.get("preferred_environment")
@@ -213,10 +216,7 @@ class AIPlanRequest(StrictModel):
         if environments is not None and (
             not isinstance(environments, list)
             or len(environments) > 4
-            or any(
-                item not in {"quiet", "uncrowded", "indoor", "outdoor"}
-                for item in environments
-            )
+            or any(item not in {"quiet", "uncrowded", "indoor", "outdoor"} for item in environments)
         ):
             raise ValueError("invalid preferred_environment")
         return values

@@ -21,6 +21,8 @@ os.environ["MOCK_MAP_PROVIDER"] = "true"
 os.environ["ADMIN_INIT_TOKEN"] = ""
 os.environ["ENVIRONMENT"] = "test"
 os.environ["LOCATION_ENCRYPTION_KEY"] = "test-only-location-key-for-field-encryption"
+os.environ["AUTH_DEVICE_REQUESTS_PER_MINUTE"] = "10000"
+os.environ["AUTH_IP_REQUESTS_PER_MINUTE"] = "10000"
 
 from backend.app.main import app  # noqa: E402
 

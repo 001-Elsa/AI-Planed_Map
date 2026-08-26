@@ -41,14 +41,10 @@ async def main() -> None:
         )
         if "expected_avoid_hiking" in case:
             avoid_hiking_cases += 1
-            avoid_hiking_correct += (
-                intent.preferences.avoid_hiking is case["expected_avoid_hiking"]
-            )
+            avoid_hiking_correct += intent.preferences.avoid_hiking is case["expected_avoid_hiking"]
         if "expected_travel_style" in case:
             travel_style_cases += 1
-            travel_style_correct += (
-                intent.preferences.travel_style == case["expected_travel_style"]
-            )
+            travel_style_correct += intent.preferences.travel_style == case["expected_travel_style"]
     total = len(cases)
     metrics = {
         "cases": total,

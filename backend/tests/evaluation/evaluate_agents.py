@@ -144,9 +144,7 @@ async def main() -> int:
             agent_type=AgentType.planner,
             capability="get_route_matrix",
             invocation_mode=InvocationMode.internal_stage,
-            requested_scopes=frozenset(
-                {DataScope.route_matrix, DataScope.user_preferences}
-            ),
+            requested_scopes=frozenset({DataScope.route_matrix, DataScope.user_preferences}),
         )
     except CapabilityAuthorizationError:
         pass

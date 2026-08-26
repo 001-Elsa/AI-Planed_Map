@@ -221,9 +221,7 @@ async def process_trip_event(
                                 "reason": "missing_provider_or_location",
                             }
                         trip_context = json.loads(trip.context_json or "{}")
-                        replan_result = await DynamicReplanningOrchestrator(
-                            db, map_provider
-                        ).run(
+                        replan_result = await DynamicReplanningOrchestrator(db, map_provider).run(
                             trip=trip,
                             event=TripEventArtifact(
                                 trip_id=trip.id,
@@ -241,8 +239,7 @@ async def process_trip_event(
                             ),
                             current_location=current_location,
                             completed_stop_ids=[
-                                str(item)
-                                for item in trip_context.get("completed_stop_ids", [])
+                                str(item) for item in trip_context.get("completed_stop_ids", [])
                             ],
                             event_payload=event_payload,
                             weather=weather_observation,
