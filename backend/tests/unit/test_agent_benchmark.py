@@ -36,4 +36,8 @@ def test_replay_executes_every_scenario_and_computes_runtime_metrics():
     assert report["multi_agent"]["illegal_tool_execution_rate"] == 0
     assert report["multi_agent"]["agent_handoff_success_rate"] == 1
     assert report["multi_agent"]["critic_bad_plan_recall"] == 1
+    assert report["multi_agent"]["production_dynamic_replay_rate"] == 1
+    assert report["multi_agent"]["workflow_graph_accuracy"] == 1
+    assert report["multi_agent"]["average_true_agent_tasks_per_dynamic_run"] == 1
+    assert report["multi_agent"]["average_deterministic_stages_per_dynamic_run"] == 5
     assert report["multi_agent"]["latency_p95_ms"] >= report["multi_agent"]["latency_p50_ms"]

@@ -22,11 +22,25 @@ from pathlib import Path
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.pool import StaticPool
+
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 
 from backend.app.clients.amap_client import MockMapProvider  # noqa: E402
 from backend.app.core.config import Settings  # noqa: E402
+from backend.app.db.session import Base  # noqa: E402
+from backend.app.models import (  # noqa: E402
+    AgentWorkflowRun,
+    AgentWorkflowTask,
+    PlanningRun,
+    PlanPatch,
+    PlanVersion,
+    TripSession,
+    User,
+)
 from backend.app.schemas.agent_artifacts import (  # noqa: E402
     AgentEndpoint,
     AgentMessageType,
@@ -47,6 +61,7 @@ from backend.app.schemas.ai_intent import (  # noqa: E402
     TransportMode,
     TripConstraintSet,
 )
+from backend.app.schemas.dynamic_replanning import TripEventArtifact  # noqa: E402
 from backend.app.services.agent_evaluation import (  # noqa: E402
     evaluate_route_plan,
     runtime_route_policy,
@@ -70,6 +85,7 @@ from backend.app.services.agents.search_agent import (  # noqa: E402
     SearchAgent,
     SearchAgentInput,
 )
+from backend.app.services.dynamic_replanning import DynamicReplanningOrchestrator  # noqa: E402
 from backend.app.services.planning_service import PlanningService  # noqa: E402
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -147,6 +163,22 @@ class ReplayResult:
     terminal_status: str
     actual_tools: list[str] = field(default_factory=list)
     expected_tools: list[str] = field(default_factory=list)
+    production_replan_executed: bool = False
+    workflow_graph_valid: bool = False
+    execution_mode: str | None = None
+    agent_task_count: int = 0
+    stage_task_count: int = 0
+
+
+@dataclass(frozen=True)
+class DynamicReplayEvidence:
+    status: str
+    replanning_succeeded: bool
+    workflow_graph_valid: bool
+    execution_mode: str
+    agent_task_count: int
+    stage_task_count: int
+    handoff_count: int
 
 
 class ReplayIntentParser:
@@ -169,12 +201,15 @@ class FaultInjectingMapProvider(MockMapProvider):
         self.search_calls = 0
         self.matrix_calls = 0
         self.successful_matrix_calls = 0
+        self.search_arguments: list[tuple[str, Coordinate, str | None]] = []
+        self.matrix_arguments: list[tuple[int, TransportMode]] = []
         self._failed_keywords: set[str] = set()
 
     async def search_poi(
         self, keyword: str, origin: Coordinate, city: str | None
     ) -> list[PoiCandidate]:
         self.search_calls += 1
+        self.search_arguments.append((keyword, origin, city))
         if self.scenario == "search_recovery" and keyword not in self._failed_keywords:
             self._failed_keywords.add(keyword)
             raise TimeoutError("scripted provider timeout")
@@ -185,6 +220,7 @@ class FaultInjectingMapProvider(MockMapProvider):
 
     async def route_matrix(self, points, mode):
         self.matrix_calls += 1
+        self.matrix_arguments.append((len(points), mode))
         if self.scenario == "matrix_failure":
             raise TimeoutError("scripted matrix timeout")
         result = await super().route_matrix(points, mode)
@@ -428,7 +464,8 @@ async def _worker_crash_replay(case: ReplayCase, runner: str) -> ReplayResult:
     )
 
 
-def _dynamic_intent(case: ReplayCase) -> PlanningIntent:
+def _baseline_dynamic_intent(case: ReplayCase) -> PlanningIntent:
+    """Simulated updated intent used only by the Single Controller baseline."""
     intent = case.intent.model_copy(deep=True)
     if case.scenario in {"weather_change", "poi_closed"}:
         intent.tasks[1] = PlanningTask(
@@ -437,6 +474,175 @@ def _dynamic_intent(case: ReplayCase) -> PlanningIntent:
             service_duration_minutes=25,
         )
     return intent
+
+
+def _dynamic_event(
+    case: ReplayCase,
+    result: AIPlanResult,
+) -> tuple[TripEventArtifact, Coordinate, dict[str, Any], dict[str, Any] | None]:
+    stops = result.model_dump(mode="json").get("stops") or []
+    first_stop_id = str(stops[0]["poi"]["id"])
+    second_stop_id = str(stops[-1]["poi"]["id"])
+    event_type = {
+        "weather_change": "WeatherAlertReceived",
+        "poi_closed": "PoiStatusChanged",
+        "off_route": "UserOffRoute",
+        "duplicate_event": "TrafficChanged",
+    }[case.scenario]
+    payload: dict[str, Any] = {}
+    weather = None
+    if case.scenario == "weather_change":
+        payload = {"outdoor_stop_ids": [second_stop_id]}
+        weather = {"precipitation_probability": 90, "weather_code": 82}
+    elif case.scenario == "poi_closed":
+        payload = {"closed_poi_id": first_stop_id}
+    elif case.scenario == "duplicate_event":
+        payload = {"delay_minutes": 20, "allow_transport_switch": True}
+    current_location = result.origin or ORIGIN
+    if case.scenario == "off_route":
+        current_location = Coordinate(lng=ORIGIN.lng + 0.01, lat=ORIGIN.lat + 0.01)
+    event_number = int(hashlib.sha256(case.case_id.encode()).hexdigest()[:8], 16) + 1
+    event = TripEventArtifact(
+        trip_id=1,
+        event_id=event_number,
+        event_type=event_type,
+        occurred_at=DEPARTURE + timedelta(minutes=30),
+        impact_level="high",
+        reason=f"production replay: {case.scenario}",
+        payload_summary=payload,
+        base_plan_version=1,
+    )
+    return event, current_location, payload, weather
+
+
+async def _run_production_dynamic_replay(
+    case: ReplayCase,
+    result: AIPlanResult,
+    provider: FaultInjectingMapProvider,
+) -> DynamicReplayEvidence:
+    engine = create_async_engine(
+        "sqlite+aiosqlite://",
+        poolclass=StaticPool,
+        connect_args={"check_same_thread": False},
+    )
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with session_factory() as db:
+            user = User(
+                username="agent-eval",
+                nickname="Agent Eval",
+                pass_hash="evaluation-only",
+            )
+            db.add(user)
+            await db.flush()
+            snapshot = result.model_dump(mode="json", exclude={"agent_workflow"})
+            planning_run = PlanningRun(
+                user_id=user.id,
+                input_text=case.request.text,
+                intent_json=json.dumps(snapshot["intent"], ensure_ascii=False),
+                result_json=json.dumps(snapshot, ensure_ascii=False),
+                status=result.status,
+                model_name="offline-replay",
+                prompt_version="evaluation-v1",
+                map_provider=provider.name,
+            )
+            db.add(planning_run)
+            await db.flush()
+            db.add(
+                PlanVersion(
+                    planning_run_id=planning_run.id,
+                    user_id=user.id,
+                    version=1,
+                    snapshot_json=json.dumps(snapshot, ensure_ascii=False),
+                    change_reason="evaluation_initial_plan",
+                )
+            )
+            trip = TripSession(
+                user_id=user.id,
+                planning_run_id=planning_run.id,
+                state="ACTIVE_TRIP",
+                current_plan_version=1,
+                context_json=json.dumps(
+                    {"completed_stop_ids": [], "auto_apply_low_risk_patches": False}
+                ),
+            )
+            db.add(trip)
+            await db.flush()
+
+            event, current_location, payload, weather = _dynamic_event(case, result)
+            event = event.model_copy(update={"trip_id": trip.id})
+            orchestrator = DynamicReplanningOrchestrator(db, provider)
+            first = await orchestrator.run(
+                trip=trip,
+                event=event,
+                current_location=current_location,
+                completed_stop_ids=[],
+                event_payload=payload,
+                weather=weather,
+                trace_id=f"eval-{case.case_id}",
+            )
+            duplicate_valid = True
+            if case.scenario == "duplicate_event":
+                second = await orchestrator.run(
+                    trip=trip,
+                    event=event,
+                    current_location=current_location,
+                    completed_stop_ids=[],
+                    event_payload=payload,
+                    weather=weather,
+                    trace_id=f"eval-{case.case_id}-duplicate",
+                )
+                duplicate_valid = second.get("patch_id") == first.get("patch_id")
+
+            workflow = await db.scalar(
+                select(AgentWorkflowRun)
+                .where(AgentWorkflowRun.trip_session_id == trip.id)
+                .order_by(AgentWorkflowRun.id.desc())
+            )
+            assert workflow is not None
+            tasks = (
+                await db.scalars(
+                    select(AgentWorkflowTask)
+                    .where(AgentWorkflowTask.workflow_run_id == workflow.id)
+                    .order_by(AgentWorkflowTask.id)
+                )
+            ).all()
+            expected_graph = {
+                "event_ingest": [],
+                "supervisor_dispatch": ["event_ingest"],
+                "replanner": ["supervisor_dispatch"],
+                "deterministic_replan": ["replanner"],
+                "deterministic_review": ["deterministic_replan"],
+                "final_answer": ["deterministic_review"],
+            }
+            graph_valid = len(tasks) == len(expected_graph) and all(
+                json.loads(task.dependency_keys_json) == expected_graph.get(task.task_key)
+                for task in tasks
+            )
+            patch_count = int(
+                await db.scalar(
+                    select(func.count(PlanPatch.id)).where(
+                        PlanPatch.planning_run_id == planning_run.id
+                    )
+                )
+                or 0
+            )
+            replanning_succeeded = bool(first.get("patch_id"))
+            if case.scenario == "duplicate_event":
+                replanning_succeeded = replanning_succeeded and duplicate_valid and patch_count == 1
+            return DynamicReplayEvidence(
+                status=str(first.get("status") or "unknown"),
+                replanning_succeeded=replanning_succeeded,
+                workflow_graph_valid=graph_valid,
+                execution_mode=workflow.execution_mode,
+                agent_task_count=sum(task.execution_kind == "agent" for task in tasks),
+                stage_task_count=sum(task.execution_kind == "stage" for task in tasks),
+                handoff_count=workflow.handoff_count,
+            )
+    finally:
+        await engine.dispose()
 
 
 async def run_multi_agent(case: ReplayCase) -> ReplayResult:
@@ -449,27 +655,10 @@ async def run_multi_agent(case: ReplayCase) -> ReplayResult:
     result = await service.plan(case.request)
     traces = [AgentWorkflowTrace.model_validate(result.agent_workflow)]
     replanning_success = False
-    if case.requires_replan:
-        if case.scenario == "duplicate_event":
-            seen: set[str] = set()
-            event_id = f"event-{case.case_id}"
-            applied = 0
-            for _ in range(2):
-                if event_id in seen:
-                    continue
-                seen.add(event_id)
-                applied += 1
-            replanning_success = applied == 1
-        else:
-            updated_intent = _dynamic_intent(case)
-            updated_request = case.request.model_copy(deep=True)
-            if case.scenario == "off_route":
-                updated_request.origin = Coordinate(lng=ORIGIN.lng + 0.01, lat=ORIGIN.lat + 0.01)
-            next_service = PlanningService(ReplayIntentParser(updated_intent), provider, settings)
-            replanned = await next_service.plan(updated_request)
-            traces.append(AgentWorkflowTrace.model_validate(replanned.agent_workflow))
-            result = replanned
-            replanning_success = replanned.status == "success"
+    dynamic_evidence: DynamicReplayEvidence | None = None
+    if case.requires_replan and result.status == "success":
+        dynamic_evidence = await _run_production_dynamic_replay(case, result, provider)
+        replanning_success = dynamic_evidence.replanning_succeeded
     unauthorized_attempts = unauthorized_executions = 0
     if case.scenario == "tool_escalation":
         unauthorized_attempts, unauthorized_executions = _attempt_tool_escalation()
@@ -508,6 +697,11 @@ async def run_multi_agent(case: ReplayCase) -> ReplayResult:
         terminal_status=result.status,
         actual_tools=sorted(actual_tools),
         expected_tools=sorted(case.expected_tools),
+        production_replan_executed=dynamic_evidence is not None,
+        workflow_graph_valid=bool(dynamic_evidence and dynamic_evidence.workflow_graph_valid),
+        execution_mode=dynamic_evidence.execution_mode if dynamic_evidence else None,
+        agent_task_count=dynamic_evidence.agent_task_count if dynamic_evidence else 0,
+        stage_task_count=dynamic_evidence.stage_task_count if dynamic_evidence else 0,
     )
 
 
@@ -578,7 +772,7 @@ async def run_single_agent(case: ReplayCase) -> ReplayResult:
             updated_request = case.request.model_copy(deep=True)
             if case.scenario == "off_route":
                 updated_request.origin = Coordinate(lng=ORIGIN.lng + 0.01, lat=ORIGIN.lat + 0.01)
-            result = await execute_once(_dynamic_intent(case), updated_request)
+            result = await execute_once(_baseline_dynamic_intent(case), updated_request)
             replanning_success = result.status == "success"
     unauthorized_attempts = unauthorized_executions = 0
     if case.scenario == "tool_escalation":
@@ -634,6 +828,7 @@ def _percentile(values: list[float], percentile: float) -> float:
 def aggregate(results: list[ReplayResult]) -> dict[str, Any]:
     recovery = [item for item in results if item.recovery_required]
     replan = [item for item in results if item.replanning_required]
+    production_replans = [item for item in replan if item.production_replan_executed]
     critic = [item for item in results if item.critic_intercept_expected]
     executable = [item for item in results if item.terminal_status == "success"]
     total_tool_attempts = sum(
@@ -660,6 +855,22 @@ def aggregate(results: list[ReplayResult]) -> dict[str, Any]:
         ),
         "recovery_success_rate": round(_rate([item.recovery_success for item in recovery]), 4),
         "replanning_success_rate": round(_rate([item.replanning_success for item in replan]), 4),
+        "production_dynamic_replay_rate": round(
+            _rate([item.production_replan_executed for item in replan]), 4
+        ),
+        "workflow_graph_accuracy": round(
+            _rate([item.workflow_graph_valid for item in production_replans]), 4
+        ),
+        "average_true_agent_tasks_per_dynamic_run": round(
+            statistics.fmean(item.agent_task_count for item in production_replans), 2
+        )
+        if production_replans
+        else 0,
+        "average_deterministic_stages_per_dynamic_run": round(
+            statistics.fmean(item.stage_task_count for item in production_replans), 2
+        )
+        if production_replans
+        else 0,
         "critic_bad_plan_recall": round(_rate([item.critic_intercepted for item in critic]), 4),
         "average_agent_count": round(statistics.fmean(item.agent_count for item in results), 2),
         "average_llm_calls": round(statistics.fmean(item.llm_calls for item in results), 2),
@@ -693,7 +904,7 @@ async def benchmark(case_count: int = 100) -> dict[str, Any]:
         json.dumps(dataset_payload, sort_keys=True, ensure_ascii=False).encode()
     ).hexdigest()
     return {
-        "benchmark": "mapgo-agent-replay-v1",
+        "benchmark": "mapgo-agent-replay-v2",
         "profile": "offline_deterministic",
         "dataset_hash": dataset_hash,
         "case_count": len(cases),
@@ -709,6 +920,10 @@ async def benchmark(case_count: int = 100) -> dict[str, Any]:
                 "one controller using the same deterministic search and route tools, without "
                 "Supervisor, Safety, Critic or role handoffs; it may replay dynamic events"
             ),
+            "dynamic_replay": (
+                "multi-agent dynamic cases execute the production DynamicReplanningOrchestrator "
+                "against an isolated SQLite database and score the persisted workflow DAG"
+            ),
         },
         "failures": {
             "single_agent": [asdict(item) for item in single_results if not item.task_success],
@@ -721,10 +936,21 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--cases", type=int, default=100)
     parser.add_argument("--details", action="store_true")
+    parser.add_argument(
+        "--snapshot",
+        type=Path,
+        help="Write the reproducible benchmark report to this JSON path.",
+    )
     args = parser.parse_args()
     report = asyncio.run(benchmark(args.cases))
     if not args.details:
         report["failures"] = {key: len(value) for key, value in report["failures"].items()}
+    if args.snapshot:
+        args.snapshot.parent.mkdir(parents=True, exist_ok=True)
+        args.snapshot.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
     print(json.dumps(report, ensure_ascii=False, indent=2))
     multi = report["multi_agent"]
     single = report["single_agent"]
@@ -739,6 +965,10 @@ def main() -> int:
         and multi["agent_handoff_success_rate"] == 1
         and multi["recovery_success_rate"] >= single["recovery_success_rate"]
         and multi["critic_bad_plan_recall"] == 1
+        and multi["production_dynamic_replay_rate"] == 1
+        and multi["workflow_graph_accuracy"] == 1
+        and multi["average_true_agent_tasks_per_dynamic_run"] == 1
+        and multi["average_deterministic_stages_per_dynamic_run"] == 5
     )
     return 0 if passed else 1
 

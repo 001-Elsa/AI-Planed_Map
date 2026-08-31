@@ -70,6 +70,10 @@ jobs:
           alembic downgrade 0001
           alembic upgrade head
           alembic check
+      - name: Real Redis/PostgreSQL Worker fault recovery
+        run: |
+          mkdir -p artifacts
+          python -m pytest -c backend/pytest.ini backend/tests/integration/test_worker_fault_recovery_real.py -vv --junitxml=artifacts/worker-fault-recovery.xml
       - name: Tests and coverage
         run: python -m pytest -c backend/pytest.ini --cov --cov-report=term-missing --cov-report=xml
       - name: Chaos / fault injection smoke
@@ -82,10 +86,15 @@ jobs:
           python backend/tests/evaluation/evaluate_multi_agent.py
           python backend/tests/evaluation/evaluate_model_router.py
           python backend/tests/evaluation/replay_agent_benchmark.py
+          python backend/tests/evaluation/agent_evaluation_framework.py --mode offline --suite full
       - uses: actions/upload-artifact@v4
         with:
-          name: coverage
-          path: coverage.xml
+          name: python-evidence
+          path: |
+            coverage.xml
+            artifacts/worker-fault-recovery.xml
+            artifacts/agent-evaluation/*.json
+            artifacts/agent-evaluation/*.md
 
   frontend-e2e:
     runs-on: ubuntu-latest

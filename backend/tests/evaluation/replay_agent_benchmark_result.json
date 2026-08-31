@@ -1,9 +1,25 @@
 {
-  "benchmark": "mapgo-agent-replay-v1",
+  "benchmark": "mapgo-agent-replay-v2",
   "profile": "offline_deterministic",
   "dataset_hash": "b6ac33236f0ace74fecedb244014cbd74dfeb79e614d99e658556c1adbad6d56",
   "case_count": 100,
+  "scenario_counts": {
+    "standard": 8,
+    "safety": 8,
+    "clarification": 8,
+    "search_recovery": 8,
+    "matrix_failure": 8,
+    "infeasible": 8,
+    "critic_bad_evidence": 8,
+    "weather_change": 8,
+    "poi_closed": 8,
+    "off_route": 7,
+    "duplicate_event": 7,
+    "worker_crash_recovery": 7,
+    "tool_escalation": 7
+  },
   "single_agent": {
+    "case_count": 100,
     "task_completion_rate": 0.85,
     "hard_constraint_satisfaction_rate": 1.0,
     "executable_plan_constraint_satisfaction_rate": 1.0,
@@ -12,14 +28,21 @@
     "agent_handoff_success_rate": 1.0,
     "recovery_success_rate": 0.8444,
     "replanning_success_rate": 1.0,
+    "production_dynamic_replay_rate": 0.0,
+    "workflow_graph_accuracy": 0,
+    "average_true_agent_tasks_per_dynamic_run": 0,
+    "average_deterministic_stages_per_dynamic_run": 0,
     "critic_bad_plan_recall": 0.0,
     "average_agent_count": 1.0,
     "average_llm_calls": 0.0,
+    "average_input_tokens": 0.0,
+    "average_output_tokens": 0.0,
     "average_token_cost_usd": 0.0,
-    "latency_p50_ms": 20.9,
-    "latency_p95_ms": 336.26
+    "latency_p50_ms": 9.93,
+    "latency_p95_ms": 323.56
   },
   "multi_agent": {
+    "case_count": 100,
     "task_completion_rate": 1.0,
     "hard_constraint_satisfaction_rate": 1.0,
     "executable_plan_constraint_satisfaction_rate": 1.0,
@@ -28,17 +51,27 @@
     "agent_handoff_success_rate": 1.0,
     "recovery_success_rate": 1.0,
     "replanning_success_rate": 1.0,
+    "production_dynamic_replay_rate": 1.0,
+    "workflow_graph_accuracy": 1.0,
+    "average_true_agent_tasks_per_dynamic_run": 1.0,
+    "average_deterministic_stages_per_dynamic_run": 5.0,
     "critic_bad_plan_recall": 1.0,
     "average_agent_count": 4.55,
     "average_llm_calls": 0.0,
+    "average_input_tokens": 0.0,
+    "average_output_tokens": 0.0,
     "average_token_cost_usd": 0.0,
-    "latency_p50_ms": 64.47,
-    "latency_p95_ms": 390.69
+    "latency_p50_ms": 28.91,
+    "latency_p95_ms": 341.05
   },
   "notes": {
-    "generated_at": "2026-08-24",
     "llm_metrics": "zero in offline profile; no model endpoint is called",
     "latency": "local deterministic execution; not production network latency",
-    "reproduce": "python backend/tests/evaluation/replay_agent_benchmark.py"
+    "single_agent_definition": "one controller using the same deterministic search and route tools, without Supervisor, Safety, Critic or role handoffs; it may replay dynamic events",
+    "dynamic_replay": "multi-agent dynamic cases execute the production DynamicReplanningOrchestrator against an isolated SQLite database and score the persisted workflow DAG"
+  },
+  "failures": {
+    "single_agent": 15,
+    "multi_agent": 0
   }
 }

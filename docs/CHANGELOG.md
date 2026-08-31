@@ -2,6 +2,13 @@
 
 > 本文档记录项目从纯前端地图到 AI 规划平台的历史。v1～v5 的 Node/SQLite、最近邻 + 2-opt 等描述是当时版本的真实实现，不代表当前 v6 正式后端；当前能力以 README、架构文档和代码为准。
 
+## v7.19 — Optional MCP Tool Runtime + isolated long-term Memory
+
+- 新增 Local/HTTP/MCP Tool Adapter；所有传输在调用前仍经过角色、模式、数据域和 Pydantic Schema 校验；
+- Search/Planner 可选注入 MCP Tool Runtime，默认继续走本地 Provider 与确定性求解器；
+- 新增默认关闭、内部鉴权的无状态 `/mcp`，仅导出四个只读事实工具，计划补丁与求解器不公开；
+- PostgreSQL 偏好读写收敛到 `UserPreferenceMemory`，保留原加载函数兼容层并明确 State、Memory、Conversation History 三者边界。
+
 ---
 
 ## v7.17 — Event-Driven Dynamic Multi-Agent
@@ -237,3 +244,30 @@
 | settings | 服务端配置 | k-v(高德 Key/jscode) |
 
 这是 v5 Node/SQLite 阶段的数据模型。v6 ORM 还包含规划会话、幂等记录、版本/Patch、决策审计、Trip/Agent/Consent/Location/外部数据快照等表；v6 外键删除策略也不再全部是 CASCADE，例如 `planning_runs.user_id` 使用 `SET NULL` 保留规划执行证据。
+# v7.20 - Truthful Agent Execution Graph and Runtime Modes
+
+- Dynamic replanning now persists the original Supervisor DAG, stable task keys, exact dependencies, execution kind (`agent` or `stage`), status, attempt count and compact output summaries.
+- Deterministic solver, validator and finalization work is represented as typed stages; only the Replanner role creates an `AgentRun` in the dynamic workflow.
+- Added explicit `sync` and `distributed` execution modes. Distributed mode publishes the Replanner command to Redis Streams and runs a real `AgentTaskWorker` with ACK, reclaim, retry and DLQ behavior.
+- Added transport-level coverage proving a Replanner worker consumes a typed event and returns a causally linked `replan_directive`.
+
+## v7.21 - Production Dynamic Replay Evaluation
+
+- Replaced Multi-Agent dynamic benchmark simulations with the production `DynamicReplanningOrchestrator` running against an isolated per-case SQLite database.
+- Closure, weather, off-route and duplicate-event cases now score real `PlanPatch`, workflow mode, persisted task dependencies, true Agent count and deterministic stage count.
+- A-F evaluation artifacts expose production dynamic replay coverage and DAG accuracy; the Single Agent baseline remains explicitly labelled as a simulation.
+
+## v7.22 - Reproducible Real-LLM Comparison Protocol
+
+- Added deterministic category-round-robin selection for 60 unique cases and configurable repeated trials; A/C/F now produce 540 task executions under the interview comparison protocol.
+- Reports retain combined metrics, per-trial metrics, every trial-tagged execution and a dedicated failure-case list, including hard-constraint satisfaction, tool accuracy, Critic precision/recall, tokens, cost and nearest-rank p95 latency.
+- Strong-model profiles require an explicit `LLM_STRONG_MODEL` and use strong-tier token prices; missing credentials produce `SKIPPED` evidence instead of silently reusing the default model.
+- Completed live runs can replace a guarded README comparison block; offline and skipped runs are unable to publish themselves as real-model evidence.
+
+## v7.23 - Fenced Worker Fault Recovery
+
+- Redis locks now carry monotonically increasing fencing tokens; `TripEvent` persists the winning fence and claims work through a database compare-and-set.
+- Every commit in a fenced Worker session rejects a lost lease or superseded fence, preventing a stale Worker from publishing later state after ownership changes.
+- Retry promotion now atomically performs due-item selection, `ZREM` and `LPUSH` in one Redis Lua script, removing the previous loss window.
+- Worker queue ACK now occurs only after successful handling or durable retry/DLQ persistence; a retry-store failure leaves the original processing item recoverable.
+- Added real PostgreSQL 16 and Redis 7 fault injection for commit-before-ACK recovery, Stream pending reclaim, stale-Worker rejection and competing retry promoters; CI uploads a dedicated JUnit artifact.

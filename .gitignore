@@ -10,3 +10,4 @@ node_modules/
 public/js/local-config.js
 *.log
 .DS_Store
+artifacts/
