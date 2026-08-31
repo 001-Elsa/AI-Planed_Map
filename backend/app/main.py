@@ -18,7 +18,7 @@ from sqlalchemy import delete
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from backend.app.api import ai_planner, auth, companion, data, social, system
+from backend.app.api import ai_planner, auth, companion, data, mcp, social, system
 from backend.app.clients.amap_client import build_map_provider
 from backend.app.clients.knowledge_client import CuratedKnowledgeProvider
 from backend.app.clients.weather_client import build_weather_provider
@@ -28,6 +28,11 @@ from backend.app.core.observability import metrics
 from backend.app.db.session import SessionLocal, check_database, engine
 from backend.app.infrastructure.runtime_store import build_runtime_store
 from backend.app.models import LocationSnapshot
+from backend.app.services.agent_tool_adapters import (
+    AgentToolRuntime,
+    MCPToolAdapter,
+    parse_mcp_server_configs,
+)
 from backend.app.services.agent_transport import build_agent_message_bus
 
 CORRELATION_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,100}$")
@@ -128,6 +133,18 @@ async def lifespan(application: FastAPI):
     application.state.weather_provider = build_weather_provider(
         client, settings.mock_weather_provider
     )
+    mcp_adapters = [
+        MCPToolAdapter(
+            client,
+            server,
+            timeout_seconds=settings.mcp_timeout_seconds,
+            max_response_bytes=settings.mcp_max_response_bytes,
+        )
+        for server in parse_mcp_server_configs(settings.mcp_servers_json)
+    ]
+    application.state.external_agent_tool_runtime = (
+        AgentToolRuntime(mcp_adapters) if mcp_adapters else None
+    )
     application.state.knowledge_provider = CuratedKnowledgeProvider()
     application.state.runtime_store = await build_runtime_store(settings.redis_url)
     application.state.agent_message_bus = build_agent_message_bus(
@@ -159,6 +176,7 @@ app = FastAPI(
     description="大模型意图解析 + 真实 POI + 确定性约束路线优化",
     lifespan=lifespan,
 )
+app.include_router(mcp.router)
 
 
 @app.middleware("http")  # Middleware理解成所有 API 的公共检查站。

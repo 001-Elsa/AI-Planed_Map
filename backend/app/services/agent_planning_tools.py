@@ -24,6 +24,7 @@ from backend.app.schemas.ai_intent import (
     RouteMatrix,
     TransportMode,
 )
+from backend.app.services.agent_tool_adapters import AgentToolRuntime, ToolInvocation
 from backend.app.services.agent_tool_contracts import (
     OptimizeRouteArgs,
     RouteMatrixArgs,
@@ -53,9 +54,16 @@ class ToolExecution(Generic[T]):
 
 
 class SearchPoiTool:
-    def __init__(self, provider: MapProvider, *, timeout_seconds: float) -> None:
+    def __init__(
+        self,
+        provider: MapProvider,
+        *,
+        timeout_seconds: float,
+        external_runtime: AgentToolRuntime | None = None,
+    ) -> None:
         self.provider = provider
         self.timeout_seconds = timeout_seconds
+        self.external_runtime = external_runtime
 
     async def execute(self, arguments: SearchPoiArgs) -> ToolExecution[list[PoiCandidate]]:
         arguments = SearchPoiArgs.model_validate(arguments)
@@ -66,6 +74,30 @@ class SearchPoiTool:
             requested_scopes=frozenset({DataScope.map_search}),
         )
         artifact_ref = f"poi:{canonical_hash(arguments.model_dump(mode='json'))[:24]}"
+        if self.external_runtime is not None:
+            result = await self.external_runtime.execute(
+                ToolInvocation(
+                    agent_type=AgentType.search,
+                    capability="search_poi",
+                    invocation_mode=InvocationMode.internal_stage,
+                    requested_scopes=frozenset({DataScope.map_search}),
+                    arguments=arguments.model_dump(mode="json"),
+                )
+            )
+            if not result.success:
+                return ToolExecution(data=None, result=result)
+            try:
+                candidates = [
+                    PoiCandidate.model_validate(item) for item in result.data.get("candidates", [])
+                ]
+            except Exception:
+                return ToolExecution(
+                    data=None,
+                    result=tool_result_error(
+                        "UPSTREAM_ERROR", retryable=False, source=result.source
+                    ),
+                )
+            return ToolExecution(data=candidates, result=result)
         try:
             candidates = await asyncio.wait_for(
                 self.provider.search_poi(arguments.keyword, arguments.origin, arguments.city),
@@ -94,8 +126,11 @@ class SearchPoiTool:
 
 
 class RouteMatrixTool:
-    def __init__(self, provider: MapProvider) -> None:
+    def __init__(
+        self, provider: MapProvider, *, external_runtime: AgentToolRuntime | None = None
+    ) -> None:
         self.provider = provider
+        self.external_runtime = external_runtime
 
     async def execute(
         self, points: list[Coordinate], transport_mode: TransportMode
@@ -107,6 +142,28 @@ class RouteMatrixTool:
             invocation_mode=InvocationMode.internal_stage,
             requested_scopes=frozenset({DataScope.route_matrix}),
         )
+        if self.external_runtime is not None:
+            result = await self.external_runtime.execute(
+                ToolInvocation(
+                    agent_type=AgentType.planner,
+                    capability="get_route_matrix",
+                    invocation_mode=InvocationMode.internal_stage,
+                    requested_scopes=frozenset({DataScope.route_matrix}),
+                    arguments=arguments.model_dump(mode="json"),
+                )
+            )
+            if not result.success:
+                return ToolExecution(data=None, result=result)
+            try:
+                matrix = RouteMatrix.model_validate(result.data.get("matrix"))
+            except Exception:
+                return ToolExecution(
+                    data=None,
+                    result=tool_result_error(
+                        "UPSTREAM_ERROR", retryable=False, source=result.source
+                    ),
+                )
+            return ToolExecution(data=matrix, result=result)
         try:
             matrix = await self.provider.route_matrix(arguments.points, arguments.transport_mode)
         except Exception as exc:
@@ -184,8 +241,11 @@ class OptimizeRouteTool:
 
 
 class VerifyTransitEdgesTool:
-    def __init__(self, provider: MapProvider) -> None:
+    def __init__(
+        self, provider: MapProvider, *, external_runtime: AgentToolRuntime | None = None
+    ) -> None:
         self.provider = provider
+        self.external_runtime = external_runtime
 
     async def execute(
         self, points: list[Coordinate], city: str | None
@@ -197,6 +257,28 @@ class VerifyTransitEdgesTool:
             invocation_mode=InvocationMode.internal_stage,
             requested_scopes=frozenset({DataScope.transit_routes}),
         )
+        if self.external_runtime is not None:
+            result = await self.external_runtime.execute(
+                ToolInvocation(
+                    agent_type=AgentType.planner,
+                    capability="verify_transit_edges",
+                    invocation_mode=InvocationMode.internal_stage,
+                    requested_scopes=frozenset({DataScope.transit_routes}),
+                    arguments=arguments.model_dump(mode="json"),
+                )
+            )
+            if not result.success:
+                return ToolExecution(data=None, result=result)
+            try:
+                edges = [RouteEdge.model_validate(item) for item in result.data.get("edges", [])]
+            except Exception:
+                return ToolExecution(
+                    data=None,
+                    result=tool_result_error(
+                        "UPSTREAM_ERROR", retryable=False, source=result.source
+                    ),
+                )
+            return ToolExecution(data=edges, result=result)
         try:
             edges = await self.provider.transit_route_edges(arguments.points, city)
         except Exception as exc:

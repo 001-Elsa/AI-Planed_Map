@@ -1,12 +1,14 @@
 import asyncio
 from collections import defaultdict
+from datetime import datetime, timezone
 from typing import Any
 
 from backend.app.schemas.agent_artifacts import (
     AgentEndpoint,
     AgentMessageType,
 )
-from backend.app.schemas.ai_intent import AIPlanRequest
+from backend.app.schemas.ai_intent import AIPlanRequest, Coordinate
+from backend.app.schemas.dynamic_replanning import TripEventArtifact
 from backend.app.services.agent_protocol import AgentMessageRouter
 from backend.app.services.agent_transport import (
     AgentTaskWorker,
@@ -230,3 +232,56 @@ def test_transport_factory_auto_selects_runtime_capability_without_silent_redis_
         assert "requires a Redis runtime store" in str(exc)
     else:
         raise AssertionError("explicit Redis transport must fail closed without Redis")
+
+
+def test_replanner_worker_owns_role_and_returns_typed_directive():
+    async def scenario() -> None:
+        router = AgentMessageRouter()
+        transport = InMemoryAgentMessageTransport(router)
+        bus = RecoverableAgentMessageBus(transport, router)
+        event = TripEventArtifact(
+            trip_id=42,
+            event_id=7,
+            event_type="TrafficChanged",
+            occurred_at=datetime.now(timezone.utc),
+            impact_level="high",
+            reason="traffic incident",
+            payload_summary={
+                "delay_minutes": 25,
+                "_runtime": {
+                    "current_location": Coordinate(lng=120.62, lat=31.32).model_dump(),
+                    "completed_stop_ids": ["stop-1"],
+                    "event_payload": {"delay_minutes": 25},
+                    "weather": None,
+                },
+            },
+            base_plan_version=3,
+        )
+        request = router.build(
+            task_id="distributed-replanner-test",
+            sender=AgentEndpoint.supervisor,
+            receiver=AgentEndpoint.replanner,
+            message_type=AgentMessageType.command,
+            artifact_type="trip_event_artifact",
+            content=event.model_dump(mode="json"),
+        )
+        await bus.publish(request)
+
+        from backend.app.worker import _handle_replanner_message
+
+        worker = AgentTaskWorker(
+            bus=bus,
+            endpoint=AgentEndpoint.replanner,
+            consumer="replanner-test-worker",
+            handler=lambda message: _handle_replanner_message(message, router),
+        )
+        assert await worker.run_once(block_ms=0) == "acked"
+
+        response = await bus.receive(AgentEndpoint.planner, "workflow-test", block_ms=0)
+        assert response is not None
+        assert response.message.sender == AgentEndpoint.replanner
+        assert response.message.causation_id == request.message_id
+        assert response.message.artifact_type == "replan_directive"
+        assert response.message.content["directive"]["strategy"] == "fastest_feasible_route"
+
+    asyncio.run(scenario())

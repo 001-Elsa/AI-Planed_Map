@@ -35,6 +35,7 @@ from backend.app.services.agent_planning_tools import (
     VerifyTransitEdgesTool,
     reevaluate_selected_route,
 )
+from backend.app.services.agent_tool_adapters import AgentToolRuntime
 from backend.app.services.agent_tool_contracts import ToolResultEnvelope
 from backend.app.services.agent_tool_registry import TOOL_REGISTRY, InvocationMode
 from backend.app.services.agents.base import AgentExecution, canonical_hash
@@ -79,12 +80,17 @@ class PlannerAgent:
 
     spec = PLANNER_AGENT_SPEC
 
-    def __init__(self, provider: MapProvider, settings: Settings) -> None:
+    def __init__(
+        self,
+        provider: MapProvider,
+        settings: Settings,
+        external_tool_runtime: AgentToolRuntime | None = None,
+    ) -> None:
         self.provider = provider
         self.settings = settings
-        self.matrix_tool = RouteMatrixTool(provider)
+        self.matrix_tool = RouteMatrixTool(provider, external_runtime=external_tool_runtime)
         self.optimizer_tool = OptimizeRouteTool()
-        self.transit_tool = VerifyTransitEdgesTool(provider)
+        self.transit_tool = VerifyTransitEdgesTool(provider, external_runtime=external_tool_runtime)
 
     async def run(self, context: PlannerRunContext) -> AgentExecution[AIPlanResult]:
         started = time.perf_counter()

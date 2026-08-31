@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
+from urllib.parse import urlparse
 
 import httpx
 
@@ -193,6 +194,22 @@ class MCPToolAdapter:
             raise ValueError("UPSTREAM_ERROR")
         return result
 
+    async def _notify(self, method: str, params: dict[str, Any]) -> None:
+        headers = {
+            "Accept": "application/json, text/event-stream",
+            "Content-Type": "application/json",
+            "MCP-Protocol-Version": self.server.protocol_version,
+        }
+        if self.server.bearer_token:
+            headers["Authorization"] = f"Bearer {self.server.bearer_token}"
+        response = await self.client.post(
+            self.server.endpoint,
+            json={"jsonrpc": "2.0", "method": method, "params": params},
+            headers=headers,
+            timeout=self.timeout_seconds,
+        )
+        response.raise_for_status()
+
     async def _discover(self) -> dict[str, dict[str, Any]]:
         if self._discovered is not None:
             return self._discovered
@@ -207,6 +224,7 @@ class MCPToolAdapter:
                     "clientInfo": {"name": "mapgo-agent-runtime", "version": "1.0.0"},
                 },
             )
+            await self._notify("notifications/initialized", {})
             listed = await self._rpc("tools/list", {})
             tools = listed.get("tools")
             if not isinstance(tools, list):
@@ -244,7 +262,7 @@ class AgentToolRuntime:
 
     def __init__(
         self,
-        adapters: list[ToolAdapter],
+        adapters: Sequence[ToolAdapter],
         *,
         registry: AgentToolRegistry = TOOL_REGISTRY,
     ) -> None:
@@ -299,14 +317,27 @@ def parse_mcp_server_configs(raw: str) -> list[MCPServerConfig]:
     payload = json.loads(raw)
     if not isinstance(payload, list):
         raise ValueError("MCP_SERVERS_JSON must be a JSON array")
-    return [
-        MCPServerConfig(
-            name=str(item["name"]),
-            endpoint=str(item["endpoint"]),
-            allowed_tools=frozenset(str(tool) for tool in item.get("allowed_tools", [])),
-            bearer_token=str(item.get("bearer_token", "")),
-            protocol_version=str(item.get("protocol_version", "2025-11-25")),
+    configs: list[MCPServerConfig] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            raise ValueError("every MCP server config must be an object")
+        endpoint = str(item["endpoint"])
+        parsed = urlparse(endpoint)
+        loopback = parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+        if parsed.scheme != "https" and not (parsed.scheme == "http" and loopback):
+            raise ValueError("MCP endpoints must use HTTPS except for loopback development")
+        allowed_tools = frozenset(str(tool) for tool in item.get("allowed_tools", []))
+        for tool in allowed_tools:
+            capability = TOOL_REGISTRY.get(tool)
+            if capability is None or capability.invocation_mode == InvocationMode.workflow_only:
+                raise ValueError(f"MCP tool is not an Agent capability: {tool}")
+        configs.append(
+            MCPServerConfig(
+                name=str(item["name"]),
+                endpoint=endpoint,
+                allowed_tools=allowed_tools,
+                bearer_token=str(item.get("bearer_token", "")),
+                protocol_version=str(item.get("protocol_version", "2025-11-25")),
+            )
         )
-        for item in payload
-        if isinstance(item, dict)
-    ]
+    return configs

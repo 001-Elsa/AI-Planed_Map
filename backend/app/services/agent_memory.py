@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.observability import metrics
@@ -102,6 +103,147 @@ class MemoryApplication:
         }
 
 
+@dataclass(frozen=True)
+class UserPreferenceRecord:
+    key: str
+    value: Any
+    source: str
+    confirmed_at: datetime
+    updated_at: datetime
+    valid: bool = True
+
+
+class UserPreferenceMemory:
+    """Long-term preference memory kept outside Agent and shared-state access."""
+
+    def __init__(self, db: AsyncSession) -> None:
+        self.db = db
+
+    async def list(
+        self, user_id: int, *, include_invalid: bool = False
+    ) -> list[UserPreferenceRecord]:
+        rows = (
+            await self.db.scalars(
+                select(UserPreference)
+                .where(UserPreference.user_id == user_id)
+                .order_by(UserPreference.key)
+            )
+        ).all()
+        records: list[UserPreferenceRecord] = []
+        for row in rows:
+            try:
+                value = normalize_long_term_preference(row.key, json.loads(row.value_json))
+            except (json.JSONDecodeError, MemoryPreferenceError):
+                metrics.increment(
+                    "mapgo_long_term_memory_ignored_total",
+                    {"reason": "invalid_or_unsupported"},
+                )
+                if not include_invalid:
+                    continue
+                try:
+                    value = json.loads(row.value_json)
+                except json.JSONDecodeError:
+                    value = row.value_json
+                records.append(
+                    UserPreferenceRecord(
+                        key=row.key,
+                        value=value,
+                        source=row.source,
+                        confirmed_at=row.confirmed_at,
+                        updated_at=row.updated_at,
+                        valid=False,
+                    )
+                )
+                continue
+            records.append(
+                UserPreferenceRecord(
+                    key=row.key,
+                    value=value,
+                    source=row.source,
+                    confirmed_at=row.confirmed_at,
+                    updated_at=row.updated_at,
+                )
+            )
+        return records
+
+    async def load_confirmed(self, user_id: int) -> tuple[dict[str, Any], tuple[str, ...]]:
+        rows = (
+            await self.db.scalars(
+                select(UserPreference)
+                .where(UserPreference.user_id == user_id)
+                .order_by(UserPreference.key)
+            )
+        ).all()
+        values: dict[str, Any] = {}
+        ignored: list[str] = []
+        for row in rows:
+            try:
+                values[row.key] = normalize_long_term_preference(
+                    row.key, json.loads(row.value_json)
+                )
+            except (json.JSONDecodeError, MemoryPreferenceError):
+                ignored.append(row.key)
+                metrics.increment(
+                    "mapgo_long_term_memory_ignored_total",
+                    {"reason": "invalid_or_unsupported"},
+                )
+        return values, tuple(ignored)
+
+    async def save_confirmed(self, user_id: int, key: str, value: Any) -> UserPreferenceRecord:
+        normalized = normalize_long_term_preference(key, value)
+        row = await self.db.scalar(
+            select(UserPreference).where(
+                UserPreference.user_id == user_id, UserPreference.key == key
+            )
+        )
+        now = datetime.now(timezone.utc)
+        if row is None:
+            row = UserPreference(
+                user_id=user_id,
+                key=key,
+                value_json=json.dumps(normalized, ensure_ascii=False),
+                source="explicit_user_confirmation",
+                confirmed_at=now,
+            )
+            self.db.add(row)
+        else:
+            row.value_json = json.dumps(normalized, ensure_ascii=False)
+            row.source = "explicit_user_confirmation"
+            row.confirmed_at = now
+        await self.db.commit()
+        await self.db.refresh(row)
+        metrics.increment("mapgo_long_term_memory_writes_total", {"result": "confirmed"})
+        return UserPreferenceRecord(
+            key=row.key,
+            value=normalized,
+            source=row.source,
+            confirmed_at=row.confirmed_at,
+            updated_at=row.updated_at,
+        )
+
+    async def delete(self, user_id: int, key: str) -> bool:
+        row = await self.db.scalar(
+            select(UserPreference).where(
+                UserPreference.user_id == user_id, UserPreference.key == key
+            )
+        )
+        if row is None:
+            return False
+        await self.db.delete(row)
+        await self.db.commit()
+        metrics.increment("mapgo_long_term_memory_deletes_total", {"scope": "key"})
+        return True
+
+    async def purge(self, user_id: int, *, commit: bool = True) -> int:
+        result = await self.db.execute(
+            delete(UserPreference).where(UserPreference.user_id == user_id)
+        )
+        if commit:
+            await self.db.commit()
+        metrics.increment("mapgo_long_term_memory_deletes_total", {"scope": "user"})
+        return int(result.rowcount or 0)
+
+
 def _normalized_string_list(value: Any, *, allowed: frozenset[str] | None = None) -> list[str]:
     if not isinstance(value, list):
         raise MemoryPreferenceError("preference value must be a list")
@@ -146,25 +288,7 @@ def normalize_long_term_preference(key: str, value: Any) -> Any:
 async def load_confirmed_preferences(
     db: AsyncSession, user_id: int
 ) -> tuple[dict[str, Any], tuple[str, ...]]:
-    rows = (
-        await db.scalars(
-            select(UserPreference)
-            .where(UserPreference.user_id == user_id)
-            .order_by(UserPreference.key)
-        )
-    ).all()
-    values: dict[str, Any] = {}
-    ignored: list[str] = []
-    for row in rows:
-        try:
-            raw = json.loads(row.value_json)
-            values[row.key] = normalize_long_term_preference(row.key, raw)
-        except (json.JSONDecodeError, MemoryPreferenceError):
-            ignored.append(row.key)
-            metrics.increment(
-                "mapgo_long_term_memory_ignored_total", {"reason": "invalid_or_unsupported"}
-            )
-    return values, tuple(ignored)
+    return await UserPreferenceMemory(db).load_confirmed(user_id)
 
 
 def apply_long_term_preferences(

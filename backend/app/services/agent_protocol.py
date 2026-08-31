@@ -172,6 +172,12 @@ ROUTES = (
         frozenset({"replan_directive"}),
     ),
     AgentRoute(
+        AgentEndpoint.replanner,
+        AgentEndpoint.planner,
+        AgentMessageType.result,
+        frozenset({"replan_directive"}),
+    ),
+    AgentRoute(
         AgentEndpoint.planner,
         AgentEndpoint.critic,
         AgentMessageType.artifact,
@@ -432,7 +438,7 @@ class AgentMessageRouter:
             elif message.artifact_type == "trip_event_artifact":
                 TripEventArtifact.model_validate(payload)
             elif message.artifact_type == "replan_directive":
-                ReplanDirective.model_validate(payload)
+                ReplanDirective.model_validate(payload.get("directive", payload))
             elif message.artifact_type == "plan_patch_candidate":
                 PlanPatchArtifact.model_validate(payload)
             elif message.artifact_type == "dynamic_patch_review":

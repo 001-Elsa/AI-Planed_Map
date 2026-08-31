@@ -126,6 +126,14 @@ Registry 解决“Agent 能否触达某能力”；Companion 的 Policy Engine �
 
 长期 Memory 使用 PostgreSQL `UserPreference`，但不是自动画像。只有显式确认且通过白名单 Schema 的软偏好可以持久化，包括少走路、距离/费用/评分目标、饮食限制、优化目标，以及有界的地点类别/环境召回提示。行程行为、定位、Critic 建议和隐式推断不会自动写入。
 
+长期偏好的数据库读写统一收敛到 `UserPreferenceMemory`。API/Supervisor 可以加载已确认偏好并生成最小化 Planning Context，但 Agent 没有数据库句柄，也没有 `load/save/delete_explicit_preference` 的角色授权。三类对象严格分离：Shared State 是有 TTL 和 revision 的任务事实，Memory 是用户显式确认的跨任务软偏好，Conversation History 只用于生成相关摘要，任何一类都不会复制成另一类。
+
+### 可选 MCP Tool Adapter
+
+MCP 位于 Agent/任务图之后的能力接入层，不是新的编排框架。执行顺序固定为：`AgentToolRuntime -> ToolRegistry authorize -> Pydantic arguments -> configured Adapter -> ToolResultEnvelope`。Local、HTTP、MCP Adapter 不能注册新权限；远端 MCP 的 `tools/list.inputSchema` 必须与本地固定 Schema 完全一致，发生漂移时调用在发送前失败关闭。
+
+MAPGO 提供默认关闭的无状态 Streamable HTTP `/mcp` 端点，只导出 `search_poi`、`get_route_matrix`、`verify_transit_edges` 和 `get_weather`。端点校验 Origin、Bearer Token、请求大小、本地角色权限和参数 Schema。`optimize_route` 保持本地确定性执行；`propose_replan`、正式计划提交和长期 Memory 写入不通过通用 MCP 暴露，它们仍受计划版本、CAS、HITL 和用户身份边界保护。
+
 ```text
 当前请求中的结构化偏好
   > 当前文本中明确表达的相关意图
@@ -268,3 +276,20 @@ API 和 Worker 会把最新行程事件写入 `trip-stream:{trip_id}`，SSE 端�
 每条路线边的 `source/quality/traffic_timestamp/confidence/fallback_used` 是正式 API 合同。任何回退都降低置信度并在前端显示“估算”，不能以精确概率 ETA 的口吻呈现。
 
 当前规划时使用的是 Provider 置信度与安全缓冲构成的启发式区间。`calibrate_from_history()` 仍是离线辅助函数，尚未获得按交通方式、时段聚合的真实 ETA 样本，所以不作为在线“历史残差校准”能力宣称。
+## Truthful dynamic execution (v7.20)
+
+Dynamic replanning now has an explicit Supervisor execution graph. Each node declares an `execution_kind`: `agent` means a role owns an `AgentRun`; `stage` means deterministic orchestration, solving, validation or finalization. The persisted `AgentWorkflowTask` rows retain stable task keys, exact `depends_on`, status, attempt count, budget and a compact summary, so the original DAG can be reconstructed without inferring it from trace order.
+
+The runtime supports two explicit modes:
+
+```text
+sync:
+  workflow owner -> ReplannerAgent -> deterministic Planner/Critic stages
+
+distributed:
+  workflow owner -> Redis Stream(replanner)
+  Replanner AgentTaskWorker -> Redis Stream(planner)
+  workflow owner -> deterministic Planner/Critic stages
+```
+
+Distributed mode is enabled with `AGENT_EXECUTION_MODE=distributed` and `AGENT_MESSAGE_TRANSPORT=redis_stream`. The worker owns the Replanner role and uses the existing validated protocol, ACK, reclaim, retry and DLQ contract. Planner and Critic remain stages in this workflow until they have independent model-backed role owners.

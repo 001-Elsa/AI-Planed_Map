@@ -267,6 +267,16 @@ async def test_worker_llm_tool_loop_creates_one_pending_patch_and_transport_swit
             "critic",
             "supervisor",
         ]
+        assert [task.execution_kind for task in tasks] == [
+            "stage",
+            "stage",
+            "agent",
+            "stage",
+            "stage",
+            "stage",
+        ]
+        assert json.loads(tasks[2].dependency_keys_json) == ["supervisor_dispatch"]
+        assert json.loads(tasks[3].dependency_keys_json) == ["replanner"]
         assert all(task.status == "succeeded" for task in tasks)
     stream = await store.get_json(f"trip-stream:{trip_id}")
     assert stream["plan_patch"]["patch_id"] == patch.id

@@ -706,6 +706,7 @@ async def persist_agent_workflow(
         trip_session_id=trip_session_id,
         trigger_type=trigger_type,
         mode=trace.mode.value,
+        execution_mode=trace.execution_mode.value,
         status=trace.status,
         trace_id=trace_id,
         handoff_count=trace.handoff_count,
@@ -716,31 +717,109 @@ async def persist_agent_workflow(
     db.add(workflow)
     await db.flush()
     task_keys_by_role: dict[str, str] = {}
-    previous_task_key: str | None = None
-    for index, step in enumerate(trace.steps, start=1):
-        task_key = f"{index:02d}_{step.agent_type.value}"
-        task_keys_by_role.setdefault(step.agent_type.value, task_key)
-        dependency_keys = [previous_task_key] if previous_task_key else []
-        db.add(
-            AgentWorkflowTask(
-                workflow_run_id=workflow.id,
-                task_key=task_key,
-                role=step.agent_type.value,
-                status=step.status,
-                dependency_keys_json=json.dumps(dependency_keys, ensure_ascii=False),
-                attempt_count=1 + int(step.fallback_used),
-                input_artifact_refs_json=json.dumps(
-                    [str(step.input_message_id)] if step.input_message_id else [],
-                    ensure_ascii=False,
-                ),
-                output_artifact_type=step.output_artifact.artifact_type,
-                budget_json=step.budget.model_dump_json(),
-                version=1,
-                created_at=now,
-                updated_at=now,
+    planned_steps = list(trace.execution_plan.steps) if trace.execution_plan else []
+    # Dynamic workflows carry an explicit Supervisor graph. Retry traces from
+    # the synchronous planner can contain repeated role executions, so retain
+    # their historical per-execution rows until retry edges are persisted too.
+    use_explicit_graph = bool(planned_steps and not trace.retry_count)
+    if use_explicit_graph:
+        stage_by_key = {stage.stage_key: stage for stage in trace.stages}
+        steps_by_role: dict[str, list[AgentStepTrace]] = {}
+        for step in trace.steps:
+            steps_by_role.setdefault(step.agent_type.value, []).append(step)
+        for plan_step in planned_steps:
+            task_keys_by_role.setdefault(plan_step.agent_type.value, plan_step.step_id)
+            stage = stage_by_key.get(plan_step.step_id)
+            role_steps = steps_by_role.get(plan_step.agent_type.value, [])
+            agent_step = (
+                role_steps[0] if plan_step.execution_kind == "agent" and role_steps else None
             )
-        )
-        previous_task_key = task_key
+            status = (
+                stage.status
+                if stage is not None
+                else (agent_step.status if agent_step is not None else plan_step.status)
+            )
+            summary = (
+                minimize_agent_payload(stage.summary)
+                if stage is not None
+                else (
+                    minimize_agent_payload(agent_step.output_artifact.payload) if agent_step else {}
+                )
+            )
+            output_type = (
+                stage.output_artifact_type
+                if stage is not None
+                else (
+                    agent_step.output_artifact.artifact_type
+                    if agent_step
+                    else plan_step.output_artifact_type
+                )
+            )
+            input_refs = []
+            if agent_step is not None and agent_step.input_message_id:
+                input_refs = [str(agent_step.input_message_id)]
+            db.add(
+                AgentWorkflowTask(
+                    workflow_run_id=workflow.id,
+                    task_key=plan_step.step_id,
+                    role=plan_step.agent_type.value,
+                    execution_kind=plan_step.execution_kind,
+                    status=status,
+                    dependency_keys_json=json.dumps(plan_step.depends_on, ensure_ascii=False),
+                    attempt_count=(
+                        stage.attempt_count
+                        if stage is not None
+                        else (
+                            1 + int(agent_step.fallback_used)
+                            if agent_step
+                            else plan_step.attempt_count
+                        )
+                    ),
+                    input_artifact_refs_json=json.dumps(input_refs, ensure_ascii=False),
+                    output_artifact_type=output_type,
+                    budget_json=(
+                        agent_step.budget.model_dump_json()
+                        if agent_step
+                        else (plan_step.budget.model_dump_json() if plan_step.budget else "{}")
+                    ),
+                    summary_json=json.dumps(summary, ensure_ascii=False, default=str)[:4000],
+                    version=plan_step.version,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+    else:
+        previous_task_key: str | None = None
+        for index, step in enumerate(trace.steps, start=1):
+            task_key = f"{index:02d}_{step.agent_type.value}"
+            task_keys_by_role.setdefault(step.agent_type.value, task_key)
+            dependency_keys = [previous_task_key] if previous_task_key else []
+            db.add(
+                AgentWorkflowTask(
+                    workflow_run_id=workflow.id,
+                    task_key=task_key,
+                    role=step.agent_type.value,
+                    execution_kind="agent",
+                    status=step.status,
+                    dependency_keys_json=json.dumps(dependency_keys, ensure_ascii=False),
+                    attempt_count=1 + int(step.fallback_used),
+                    input_artifact_refs_json=json.dumps(
+                        [str(step.input_message_id)] if step.input_message_id else [],
+                        ensure_ascii=False,
+                    ),
+                    output_artifact_type=step.output_artifact.artifact_type,
+                    budget_json=step.budget.model_dump_json(),
+                    summary_json=json.dumps(
+                        minimize_agent_payload(step.output_artifact.payload),
+                        ensure_ascii=False,
+                        default=str,
+                    )[:4000],
+                    version=1,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            previous_task_key = task_key
     parent_run_id: int | None = None
     for index, step in enumerate(trace.steps, start=1):
         minimized_payload = minimize_agent_payload(step.output_artifact.payload)

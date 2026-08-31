@@ -23,6 +23,7 @@ from backend.app.schemas.ai_intent import (
 )
 from backend.app.services.agent_orchestrator import PlanningAgentOrchestrator
 from backend.app.services.agent_shared_state import AgentSharedStateManager
+from backend.app.services.agent_tool_adapters import AgentToolRuntime
 from backend.app.services.agents.critic_agent import CriticAgent, RuleBasedCriticAgent
 from backend.app.services.agents.intent_agent import IntentAgent
 from backend.app.services.agents.planner_agent import PlannerAgent
@@ -51,6 +52,7 @@ class PlanningService:
         settings: Settings,
         critic_agent: CriticAgent | None = None,
         shared_state: AgentSharedStateManager | None = None,
+        external_tool_runtime: AgentToolRuntime | None = None,
     ) -> None:
         self.parser = parser
         self.map_provider = map_provider
@@ -59,9 +61,9 @@ class PlanningService:
             settings=settings,
             supervisor_agent=SupervisorAgent(),
             intent_agent=IntentAgent(parser),
-            search_agent=SearchAgent(map_provider, settings),
+            search_agent=SearchAgent(map_provider, settings, external_tool_runtime),
             safety_agent=SafetyAgent(),
-            planner_agent=PlannerAgent(map_provider, settings),
+            planner_agent=PlannerAgent(map_provider, settings, external_tool_runtime),
             critic_agent=critic_agent or RuleBasedCriticAgent(),
             shared_state=shared_state or AgentSharedStateManager(InMemoryRuntimeStore(), settings),
         )

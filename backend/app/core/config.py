@@ -47,7 +47,7 @@ class Settings(BaseSettings):
     max_request_bytes: int = 1_000_000
     max_route_matrix_points: int = 25
     idempotency_ttl_seconds: int = 86_400
-    required_schema_revision: str = "0014"
+    required_schema_revision: str = "0016"
     precise_location_ttl_minutes: int = 120
     location_encryption_key: str = ""
     max_agent_tool_calls: int = 8
@@ -84,11 +84,20 @@ class Settings(BaseSettings):
     worker_lock_renew_interval_seconds: int = 10
     redis_url: str = ""
     agent_message_transport: Literal["auto", "memory", "redis_stream"] = "auto"
+    agent_execution_mode: Literal["sync", "distributed"] = "sync"
     agent_stream_prefix: str = "mapgo:agent-messages"
     agent_consumer_group_prefix: str = "mapgo:agent-workers"
     agent_stream_max_length: int = 20_000
     agent_message_max_attempts: int = 3
     agent_message_reclaim_idle_ms: int = 30_000
+    # MCP is an optional edge adapter, not the primary orchestration path.
+    mcp_server_enabled: bool = False
+    mcp_internal_token: str = ""
+    mcp_allowed_origins: str = ""
+    mcp_servers_json: str = ""
+    mcp_timeout_seconds: float = 8.0
+    mcp_max_response_bytes: int = 512_000
+    mcp_requests_per_minute: int = 120
     api_requests_per_minute: int = 120
     api_ip_requests_per_minute: int = 3000
     auth_device_requests_per_minute: int = 30
@@ -117,6 +126,17 @@ class Settings(BaseSettings):
             raise ValueError(
                 "MODEL_ROUTER_RULE_MAX_COMPLEXITY must be lower than "
                 "MODEL_ROUTER_STRONG_MIN_COMPLEXITY"
+            )
+        if self.mcp_server_enabled and len(self.mcp_internal_token) < 24:
+            raise ValueError(
+                "MCP_INTERNAL_TOKEN must contain at least 24 characters when MCP is enabled"
+            )
+        if (
+            self.agent_execution_mode == "distributed"
+            and self.agent_message_transport != "redis_stream"
+        ):
+            raise ValueError(
+                "AGENT_EXECUTION_MODE=distributed requires AGENT_MESSAGE_TRANSPORT=redis_stream"
             )
         return self
 

@@ -27,6 +27,7 @@ from backend.app.schemas.ai_intent import (
 )
 from backend.app.schemas.common import StrictModel
 from backend.app.services.agent_planning_tools import SearchPoiTool
+from backend.app.services.agent_tool_adapters import AgentToolRuntime
 from backend.app.services.agent_tool_contracts import SearchPoiArgs, ToolResultEnvelope
 from backend.app.services.agent_tool_registry import TOOL_REGISTRY, InvocationMode
 from backend.app.services.agents.base import AgentExecution, canonical_hash
@@ -77,11 +78,18 @@ class SearchAgent:
 
     spec = SEARCH_AGENT_SPEC
 
-    def __init__(self, provider: MapProvider, settings: Settings) -> None:
+    def __init__(
+        self,
+        provider: MapProvider,
+        settings: Settings,
+        external_tool_runtime: AgentToolRuntime | None = None,
+    ) -> None:
         self.provider = provider
         self.settings = settings
         self.search_tool = SearchPoiTool(
-            provider, timeout_seconds=settings.agent_stage_timeout_seconds
+            provider,
+            timeout_seconds=settings.agent_stage_timeout_seconds,
+            external_runtime=external_tool_runtime,
         )
 
     async def run(

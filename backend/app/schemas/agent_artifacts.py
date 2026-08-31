@@ -159,6 +159,13 @@ class AgentWorkflowMode(str, Enum):
     enforce = "enforce"
 
 
+class AgentExecutionMode(str, Enum):
+    """Where an Agent role is executed for this workflow."""
+
+    sync = "sync"
+    distributed = "distributed"
+
+
 class AgentRecoveryDecision(StrictModel):
     stage: str = Field(min_length=1, max_length=80)
     action: Literal["retry", "fallback_cached", "fallback_unavailable", "clarify", "fail"]
@@ -181,8 +188,9 @@ class AgentBudget(StrictModel):
 class AgentPlanStep(StrictModel):
     step_id: str = Field(min_length=1, max_length=80)
     agent_type: AgentType
+    execution_kind: Literal["agent", "stage"] = "agent"
     responsibility: str = Field(min_length=1, max_length=120)
-    status: Literal["pending", "running", "succeeded", "failed", "skipped"] = "pending"
+    status: Literal["pending", "running", "succeeded", "failed", "blocked", "skipped"] = "pending"
     depends_on: list[str] = Field(default_factory=list, max_length=10)
     input_artifact_type: str = Field(min_length=1, max_length=80)
     output_artifact_type: str = Field(min_length=1, max_length=80)
@@ -307,6 +315,7 @@ class ReviewReport(StrictModel):
 
 
 class AgentStepTrace(StrictModel):
+    task_key: str | None = Field(default=None, max_length=80)
     agent_type: AgentType
     status: str
     prompt_version: str
@@ -323,11 +332,32 @@ class AgentStepTrace(StrictModel):
     output_message_id: UUID | None = None
 
 
+class AgentStageTrace(StrictModel):
+    """A deterministic or orchestration stage, intentionally not an Agent run."""
+
+    stage_key: str = Field(min_length=1, max_length=80)
+    stage_type: Literal["orchestration", "deterministic"]
+    owner_agent: AgentType | None = None
+    status: Literal["pending", "running", "succeeded", "failed", "blocked", "skipped"] = "succeeded"
+    depends_on: list[str] = Field(default_factory=list, max_length=10)
+    input_artifact_type: str = Field(min_length=1, max_length=80)
+    output_artifact_type: str = Field(min_length=1, max_length=80)
+    input_hash: str = Field(min_length=16, max_length=128)
+    output_hash: str = Field(min_length=16, max_length=128)
+    summary: dict[str, Any] = Field(default_factory=dict)
+    latency_ms: int = Field(default=0, ge=0)
+    attempt_count: int = Field(default=1, ge=1, le=10)
+    reason: str | None = Field(default=None, max_length=500)
+
+
 class AgentWorkflowTrace(StrictModel):
     mode: AgentWorkflowMode
+    execution_mode: AgentExecutionMode = AgentExecutionMode.sync
     task_id: str = Field(default="unassigned", min_length=8, max_length=128)
     status: str = "running"
     steps: list[AgentStepTrace] = Field(default_factory=list, max_length=20)
+    stages: list[AgentStageTrace] = Field(default_factory=list, max_length=30)
+    execution_plan: AgentExecutionPlan | None = None
     messages: list[AgentMessageAudit] = Field(default_factory=list, max_length=40)
     shared_state: dict[str, Any] | None = None
     handoff_count: int = Field(default=0, ge=0)

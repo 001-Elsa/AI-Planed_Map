@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     Float,
@@ -219,6 +220,7 @@ class TripEvent(Base):
     status: Mapped[str] = mapped_column(String(30), default="received")
     impact_level: Mapped[str] = mapped_column(String(20), default="none")
     decision_json: Mapped[str] = mapped_column(Text, default="{}")
+    worker_fencing_token: Mapped[int] = mapped_column(BigInteger, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -318,6 +320,7 @@ class AgentWorkflowRun(Base):
     )
     trigger_type: Mapped[str] = mapped_column(String(60))
     mode: Mapped[str] = mapped_column(String(20), default="shadow")
+    execution_mode: Mapped[str] = mapped_column(String(20), default="sync")
     status: Mapped[str] = mapped_column(String(30), default="running", index=True)
     trace_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     handoff_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -337,12 +340,14 @@ class AgentWorkflowTask(Base):
     )
     task_key: Mapped[str] = mapped_column(String(80), index=True)
     role: Mapped[str] = mapped_column(String(30), index=True)
+    execution_kind: Mapped[str] = mapped_column(String(20), default="agent", index=True)
     status: Mapped[str] = mapped_column(String(30), default="pending", index=True)
     dependency_keys_json: Mapped[str] = mapped_column(Text, default="[]")
     attempt_count: Mapped[int] = mapped_column(Integer, default=0)
     input_artifact_refs_json: Mapped[str] = mapped_column(Text, default="[]")
     output_artifact_type: Mapped[str] = mapped_column(String(80))
     budget_json: Mapped[str] = mapped_column(Text, default="{}")
+    summary_json: Mapped[str] = mapped_column(Text, default="{}")
     version: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(

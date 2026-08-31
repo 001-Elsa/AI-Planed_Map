@@ -86,7 +86,10 @@ def test_auth_rate_limit_cannot_be_bypassed_with_device_headers():
     settings.auth_device_requests_per_minute = 1
     settings.auth_ip_requests_per_minute = 100
     try:
-        with TestClient(app, client=("rate-limit-test", 50000)) as client:
+        # This test owns a fresh application lifespan/runtime store, so the
+        # default TestClient source is already isolated. Older Starlette
+        # versions do not expose the newer ``client=`` constructor argument.
+        with TestClient(app) as client:
             first = client.post(
                 "/api/login",
                 json={"username": "not-a-user", "password": "not-a-password"},

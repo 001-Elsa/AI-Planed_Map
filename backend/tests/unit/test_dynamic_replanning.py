@@ -4,6 +4,7 @@ import pytest
 
 from backend.app.schemas.agent_artifacts import (
     AgentEndpoint,
+    AgentExecutionPlan,
     AgentMessageType,
     AgentType,
 )
@@ -11,7 +12,10 @@ from backend.app.schemas.ai_intent import Coordinate, PlanPatchOperation
 from backend.app.schemas.dynamic_replanning import PlanPatchArtifact, TripEventArtifact
 from backend.app.services.agent_protocol import AgentMessageRouter, AgentProtocolError
 from backend.app.services.agents.replanner_agent import ReplannerAgent
-from backend.app.services.dynamic_replanning import review_dynamic_patch
+from backend.app.services.dynamic_replanning import (
+    DynamicReplanningOrchestrator,
+    review_dynamic_patch,
+)
 
 
 @pytest.mark.asyncio
@@ -66,6 +70,28 @@ def test_dynamic_critic_blocks_required_stop_removal():
     assert review.risk_level == "critical"
     assert review.requires_confirmation is True
     assert "required_stop_removal_forbidden" in review.findings
+
+
+def test_dynamic_execution_plan_preserves_successful_prefix_when_review_blocks():
+    plan = AgentExecutionPlan.model_validate(
+        DynamicReplanningOrchestrator._execution_plan("blocked")
+    )
+    assert [step.status for step in plan.steps] == [
+        "succeeded",
+        "succeeded",
+        "succeeded",
+        "succeeded",
+        "blocked",
+        "succeeded",
+    ]
+    assert [step.execution_kind for step in plan.steps] == [
+        "stage",
+        "stage",
+        "agent",
+        "stage",
+        "stage",
+        "stage",
+    ]
 
 
 def test_dynamic_protocol_allows_only_supervised_replanning_path():

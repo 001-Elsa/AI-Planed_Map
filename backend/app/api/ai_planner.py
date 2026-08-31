@@ -58,6 +58,7 @@ def _planning_service(request: Request, parser, settings):
         settings,
         critic_agent=build_critic_agent(settings, request.app.state.http_client),
         shared_state=AgentSharedStateManager(request.app.state.runtime_store, settings),
+        external_tool_runtime=request.app.state.external_agent_tool_runtime,
     )
 
 
@@ -337,6 +338,15 @@ async def planning_capabilities(request: Request):
                         AgentType.search, InvocationMode.internal_stage
                     ),
                 },
+                "tool_transport": {
+                    "local": True,
+                    "http_adapter": True,
+                    "mcp_adapter": True,
+                    "external_mcp_configured": bool(settings.mcp_servers_json.strip()),
+                    "mapgo_mcp_server_enabled": settings.mcp_server_enabled,
+                    "remote_schema_pinning": True,
+                    "workflow_mutations_exported": False,
+                },
                 "message_protocol": {
                     "version": "1.0",
                     "structured_content": True,
@@ -364,6 +374,8 @@ async def planning_capabilities(request: Request):
                     "request_override_precedence": True,
                     "per_request_opt_out": True,
                     "agent_database_access": False,
+                    "service_boundary": "UserPreferenceMemory",
+                    "conversation_history_is_memory": False,
                 },
                 "evaluation": {
                     "intent_golden_cases": True,

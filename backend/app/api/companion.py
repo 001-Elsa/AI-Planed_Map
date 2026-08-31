@@ -28,7 +28,6 @@ from backend.app.models import (
     TripSession,
     User,
     UserConsent,
-    UserPreference,
 )
 from backend.app.schemas.agent_artifacts import AgentType, minimize_agent_payload
 from backend.app.schemas.companion import (
@@ -50,6 +49,7 @@ from backend.app.schemas.dynamic_replanning import TripEventArtifact
 from backend.app.services.agent_memory import (
     SUPPORTED_LONG_TERM_KEYS,
     MemoryPreferenceError,
+    UserPreferenceMemory,
     normalize_long_term_preference,
 )
 from backend.app.services.agent_policy import evaluate_tool_policy
@@ -703,52 +703,27 @@ async def save_preference(body: ExplicitPreferenceRequest, user: CurrentUser, db
             "长期偏好字段或值不受支持",
             {"key": body.key, "supported_keys": sorted(SUPPORTED_LONG_TERM_KEYS)},
         ) from exc
-    row = await db.scalar(
-        select(UserPreference).where(
-            UserPreference.user_id == user.id, UserPreference.key == body.key
-        )
-    )
-    now = datetime.now(timezone.utc)
-    if row:
-        row.value_json = json.dumps(normalized_value, ensure_ascii=False)
-        row.confirmed_at = now
-        row.source = "explicit_user_confirmation"
-    else:
-        db.add(
-            UserPreference(
-                user_id=user.id,
-                key=body.key,
-                value_json=json.dumps(normalized_value, ensure_ascii=False),
-                confirmed_at=now,
-            )
-        )
-    await db.commit()
+    saved = await UserPreferenceMemory(db).save_confirmed(user.id, body.key, normalized_value)
     return {
         "ok": True,
         "data": {
             "key": body.key,
             "value": normalized_value,
             "saved": True,
-            "source": "explicit_user_confirmation",
+            "source": saved.source,
         },
     }
 
 
 @router.get("/preferences")
 async def list_preferences(user: CurrentUser, db: Db):
-    rows = (
-        await db.scalars(
-            select(UserPreference)
-            .where(UserPreference.user_id == user.id)
-            .order_by(UserPreference.key)
-        )
-    ).all()
+    rows = await UserPreferenceMemory(db).list(user.id)
     return {
         "ok": True,
         "data": [
             {
                 "key": row.key,
-                "value": json.loads(row.value_json),
+                "value": row.value,
                 "source": row.source,
                 "confirmed_at": row.confirmed_at,
                 "updated_at": row.updated_at,
@@ -760,16 +735,8 @@ async def list_preferences(user: CurrentUser, db: Db):
 
 @router.delete("/preferences/{key}")
 async def delete_preference(key: str, user: CurrentUser, db: Db):
-    row = await db.scalar(
-        select(UserPreference).where(
-            UserPreference.user_id == user.id,
-            UserPreference.key == key,
-        )
-    )
-    if row is None:
+    if not await UserPreferenceMemory(db).delete(user.id, key):
         raise AppError(404, "LONG_TERM_MEMORY_NOT_FOUND", "长期偏好不存在")
-    await db.delete(row)
-    await db.commit()
     return {"ok": True, "data": {"key": key, "deleted": True}}
 
 
@@ -985,7 +952,13 @@ async def replan_remaining_trip(
     try:
         from backend.app.services.dynamic_replanning import DynamicReplanningOrchestrator
 
-        data = await DynamicReplanningOrchestrator(db, request.app.state.map_provider).run(
+        data = await DynamicReplanningOrchestrator(
+            db,
+            request.app.state.map_provider,
+            execution_mode=settings.agent_execution_mode,
+            message_bus=request.app.state.agent_message_bus,
+            distributed_timeout_seconds=settings.agent_stage_timeout_seconds,
+        ).run(
             trip=trip,
             event=TripEventArtifact(
                 trip_id=trip.id,
@@ -1053,9 +1026,7 @@ async def export_private_data(user: CurrentUser, db: Db):
     trips = (await db.scalars(select(TripSession).where(TripSession.user_id == user.id))).all()
     trip_ids = [item.id for item in trips]
     consents = (await db.scalars(select(UserConsent).where(UserConsent.user_id == user.id))).all()
-    preferences = (
-        await db.scalars(select(UserPreference).where(UserPreference.user_id == user.id))
-    ).all()
+    preferences = await UserPreferenceMemory(db).list(user.id, include_invalid=True)
     locations = (
         (
             await db.scalars(
@@ -1079,10 +1050,11 @@ async def export_private_data(user: CurrentUser, db: Db):
             "preferences": [
                 {
                     "key": item.key,
-                    "value": json.loads(item.value_json),
+                    "value": item.value,
                     "source": item.source,
                     "confirmed_at": item.confirmed_at,
                     "updated_at": item.updated_at,
+                    "valid": item.valid,
                 }
                 for item in preferences
             ],
@@ -1118,7 +1090,7 @@ async def purge_private_data(
             delete(LocationSnapshot).where(LocationSnapshot.trip_session_id.in_(trip_ids))
         )
         locations_deleted = result.rowcount
-    await db.execute(delete(UserPreference).where(UserPreference.user_id == user.id))
+    await UserPreferenceMemory(db).purge(user.id, commit=False)
     await db.execute(delete(UserConsent).where(UserConsent.user_id == user.id))
     task_ids = list(
         (
