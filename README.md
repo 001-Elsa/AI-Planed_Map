@@ -35,6 +35,7 @@ MapGo 的定位不是“让模型生成一条看起来合理的路线”。系�
 - Agent Tool Registry：角色授权、调用模式与数据域统一失败关闭校验；Intent/Search/Planner 的解析、地图和 OR-Tools 能力只允许服务器内部阶段调用，不进入 LLM Tool Schema；Companion 只暴露四个行中工具，并继续叠加 Trip State、Consent、确认与预算 Policy；
 - Cost-aware Model Router：Intent 按复杂度选择 Rule/Small/Strong Structured Output，Critic 使用 Rule/Strong Hybrid，Companion 仅使用 Rule/Small；Supervisor、Search、Safety、Planner、Replanner 显式锁定 deterministic。路由按模型档位计算成本，模型不可用时降级 Rule，高风险只会触发 Critic/HITL，不会扩大工具权限；
 - Agent Memory：短期规划上下文保存在 Redis/RuntimeStore，任务终止时主动删除、TTL 仅兜底；长期偏好只接受用户明确确认并写 PostgreSQL，本次请求优先，可单次关闭、逐项撤销、导出或整库清除；Agent 本身没有用户偏好数据库访问权；
+- 可选 MCP Tool Adapter：`ToolRegistry` 仍是唯一权限源，Local/HTTP/MCP Adapter 只负责传输；Search/Planner 配置 MCP 后可调用经过本地 Schema 固定和角色授权的远端只读工具，未配置时保持本地路径。MAPGO 自身的 `/mcp` 默认关闭并要求内部 Bearer Token；求解器和计划补丁不对外暴露；
 - Agent Evaluation：版本化意图与路线 golden cases 进入 CI；路线按距离 40%、时间 30%、偏好 30% 确定性评分，截止时间、重复 POI、硬约束和极端距离一票否决；同一评分器由运行时 Critic 复用并写入 Review Report；
 - `off | shadow | enforce` 灰度模式、工作流总成本/交接上限、角色级 Token/延迟/回退审计与 Prometheus 指标；
 - 伴游 Agent：LLM 在受限 JSON 输出中根据 Trip State、Observation 和工具结果逐步决定下一工具；Policy、调用步数、Token/费用预算与完整 AgentRun/AgentToolCall 审计始终生效；
@@ -86,9 +87,12 @@ python -m venv .venv
 # cmd.exe: .venv\Scripts\activate.bat
 pip install -r backend/requirements.txt
 copy .env.example .env
-alembic upgrade head
-python -m uvicorn backend.app.main:app --reload --port 3000
+npm start
 ```
+
+`npm start` 会先把 `.env` 指向的数据库升级到最新 Alembic revision，再启动
+`http://localhost:3000`；迁移失败时不会带着旧 Schema 强行启动 API。开发时需要热重载可用
+`npm run start:dev`，仅启动 API 而不迁移的底层入口为 `npm run start:app`。
 
 或：
 
@@ -121,6 +125,17 @@ python backend/tests/chaos/run_chaos.py
 python backend/tests/load/planning_load.py --token <token>
 ```
 
+真实 Worker 故障恢复链路使用 PostgreSQL 与 Redis 运行，覆盖数据库提交后 ACK 前崩溃、
+Redis Stream pending reclaim、锁续租失败后的 fencing 拒绝以及并发 retry promotion：
+
+```bash
+python -m pytest -c backend/pytest.ini backend/tests/integration/test_worker_fault_recovery_real.py -vv
+```
+
+没有同时配置 `DATABASE_URL=postgresql+asyncpg://...` 与 `REDIS_URL=redis://...` 时，该组
+测试明确标记为 `SKIPPED`，不会退化成内存实现。设计与故障点见
+[`docs/WORKER_FAULT_RECOVERY.md`](docs/WORKER_FAULT_RECOVERY.md)。
+
 ## 测试与证据
 
 ```bash
@@ -132,6 +147,31 @@ python backend/tests/chaos/run_chaos.py
 AI 离线评测对 RuleBased 解析器施加质量门禁（Schema 合法率等）。压测与混沌脚本输出实测 JSON，不在文档中伪造 QPS。
 
 ModelRouter 另有 12 条离线路由门禁，检查 Rule/Small/Strong 选择准确率、确定性角色零模型调用、高风险 HITL 标记、缺少模型凭证时的 Rule 降级，以及 Small/Strong 独立价格配置。
+
+### Unified Agent Evaluation (offline + live)
+
+The versioned 180-case golden dataset and A-F ablation framework are documented in
+[`docs/AGENT_EVALUATION.md`](docs/AGENT_EVALUATION.md). CI runs the complete deterministic
+offline suite. A live run uses only environment-configured models and writes an explicit
+`SKIPPED` report when `LLM_API_KEY` is absent; it never replaces a missing live run with
+mock numbers.
+
+```bash
+python backend/tests/evaluation/agent_evaluation_framework.py --mode offline --suite full
+python backend/tests/evaluation/agent_evaluation_framework.py --mode live --suite smoke
+python backend/tests/evaluation/agent_evaluation_framework.py --mode live --suite full --profiles A,C,F --case-count 60 --repeats 3 --update-readme --fail-on-skip
+```
+
+Generated JSON and Markdown reports are run artifacts under `artifacts/agent-evaluation/`.
+The command above replaces only the marked comparison block after a completed live run.
+
+<!-- agent-live-eval:start -->
+### Real LLM Comparison
+
+Status: **PENDING CREDENTIALS**. This machine does not currently provide `LLM_API_KEY` or
+`LLM_STRONG_MODEL`, so no real-model measurements have been claimed. A `SKIPPED` run cannot
+replace this block.
+<!-- agent-live-eval:end -->
 
 ### Single-Agent vs Multi-Agent Replay Benchmark
 

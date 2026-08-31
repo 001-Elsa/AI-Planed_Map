@@ -4,8 +4,10 @@
   "private": true,
   "description": "MapGo 智能出行规划平台：大模型意图解析、真实 POI 检索与确定性约束路线优化",
   "scripts": {
-    "start": "python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 3000",
-    "migrate": "alembic upgrade head",
+    "start": "python backend/scripts/start_local.py",
+    "start:dev": "python backend/scripts/start_local.py --reload",
+    "start:app": "python -m uvicorn backend.app.main:app --app-dir . --host 0.0.0.0 --port 3000",
+    "migrate": "python -m alembic upgrade head",
     "test": "python -m pytest -c backend/pytest.ini",
     "test:e2e": "node test/e2e.run.cjs",
     "test:agents": "python backend/tests/evaluation/evaluate_agents.py",
