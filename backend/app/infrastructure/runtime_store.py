@@ -40,6 +40,7 @@ class RuntimeStore(Protocol):
         self, name: str, ttl_seconds: int, token: str | None = None
     ) -> str | None: ...
     async def renew_lock(self, name: str, token: str, ttl_seconds: int) -> bool: ...
+    async def is_lock_owner(self, name: str, token: str) -> bool: ...
     async def release_lock(self, name: str, token: str) -> bool: ...
     async def publish(self, channel: str, value: dict[str, Any]) -> None: ...
     async def close(self) -> None: ...
@@ -47,6 +48,15 @@ class RuntimeStore(Protocol):
 
 def _retry_delay(attempt: int) -> int:
     return min(300, 2**attempt)
+
+
+def lock_fencing_token(token: str) -> int:
+    """Extract the monotonic fence from an opaque lock ownership token."""
+
+    prefix, separator, owner = token.partition(":")
+    if not separator or not owner or not prefix.isdigit() or int(prefix) < 1:
+        raise ValueError("lock token does not contain a valid fencing token")
+    return int(prefix)
 
 
 class InMemoryRuntimeStore:
@@ -70,6 +80,7 @@ class InMemoryRuntimeStore:
         self._queues: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self._processing: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
         self._locks: dict[str, tuple[str, float]] = {}
+        self._lock_fences: dict[str, int] = defaultdict(int)
         self._subscribers: dict[str, list[asyncio.Queue[dict[str, Any]]]] = defaultdict(list)
         self._lock = asyncio.Lock()
 
@@ -228,12 +239,13 @@ class InMemoryRuntimeStore:
     async def acquire_lock(
         self, name: str, ttl_seconds: int, token: str | None = None
     ) -> str | None:
-        lock_token = token or uuid.uuid4().hex
         async with self._lock:
             now = time.monotonic()
             current = self._locks.get(name)
-            if current and current[1] > now and current[0] != lock_token:
+            if current and current[1] > now:
                 return None
+            self._lock_fences[name] += 1
+            lock_token = f"{self._lock_fences[name]}:{token or uuid.uuid4().hex}"
             self._locks[name] = (lock_token, now + ttl_seconds)
             return lock_token
 
@@ -254,6 +266,11 @@ class InMemoryRuntimeStore:
             self._locks[name] = (token, now + ttl_seconds)
             return True
 
+    async def is_lock_owner(self, name: str, token: str) -> bool:
+        async with self._lock:
+            current = self._locks.get(name)
+            return bool(current and current[0] == token and current[1] > time.monotonic())
+
     async def publish(self, channel: str, value: dict[str, Any]) -> None:
         async with self._lock:
             self._values[f"pub:{channel}:latest"] = (value, time.monotonic() + 86_400)
@@ -272,6 +289,30 @@ class InMemoryRuntimeStore:
 
 
 class RedisRuntimeStore:
+    _PROMOTE_RETRIES_SCRIPT = """
+    local items = redis.call(
+        'zrangebyscore', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2]
+    )
+    local moved = 0
+    for _, item in ipairs(items) do
+        if redis.call('zrem', KEYS[1], item) == 1 then
+            redis.call('lpush', KEYS[2], item)
+            moved = moved + 1
+        end
+    end
+    return moved
+    """
+
+    _ACQUIRE_FENCED_LOCK_SCRIPT = """
+    if redis.call('exists', KEYS[1]) == 1 then
+        return false
+    end
+    local fence = redis.call('incr', KEYS[2])
+    local value = tostring(fence) .. ':' .. ARGV[1]
+    redis.call('set', KEYS[1], value, 'EX', ARGV[2])
+    return value
+    """
+
     def __init__(self, client: Any) -> None:
         self.client = client
         self._pubsub = None
@@ -370,24 +411,30 @@ class RedisRuntimeStore:
         return "retry"
 
     async def promote_retries(self, queue: str, limit: int = 50) -> int:
-        """Move due retry jobs back onto the primary queue."""
-        now = time.time()
-        key = f"{queue}:retry"
-        items = await self.client.zrangebyscore(key, min=0, max=now, start=0, num=limit)
-        moved = 0
-        for item in items:
-            removed = await self.client.zrem(key, item)
-            if removed:
-                await self.client.lpush(queue, item)
-                moved += 1
-        return moved
+        """Atomically move due retry jobs back onto the primary queue."""
+
+        moved = await self.client.eval(
+            self._PROMOTE_RETRIES_SCRIPT,
+            2,
+            f"{queue}:retry",
+            queue,
+            time.time(),
+            max(0, limit),
+        )
+        return int(moved)
 
     async def acquire_lock(
         self, name: str, ttl_seconds: int, token: str | None = None
     ) -> str | None:
-        lock_token = token or uuid.uuid4().hex
-        acquired = await self.client.set(f"lock:{name}", lock_token, nx=True, ex=ttl_seconds)
-        return lock_token if acquired else None
+        lock_token = await self.client.eval(
+            self._ACQUIRE_FENCED_LOCK_SCRIPT,
+            2,
+            f"lock:{name}",
+            f"lock-fence:{name}",
+            token or uuid.uuid4().hex,
+            ttl_seconds,
+        )
+        return str(lock_token) if lock_token else None
 
     async def release_lock(self, name: str, token: str) -> bool:
         script = """
@@ -410,6 +457,9 @@ class RedisRuntimeStore:
         """
         result = await self.client.eval(script, 1, f"lock:{name}", token, ttl_seconds)
         return bool(result)
+
+    async def is_lock_owner(self, name: str, token: str) -> bool:
+        return await self.client.get(f"lock:{name}") == token
 
     async def publish(self, channel: str, value: dict[str, Any]) -> None:
         encoded = json.dumps(value, ensure_ascii=False)

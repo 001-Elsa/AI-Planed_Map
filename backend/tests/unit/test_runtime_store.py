@@ -1,6 +1,6 @@
 import asyncio
 
-from backend.app.infrastructure.runtime_store import InMemoryRuntimeStore
+from backend.app.infrastructure.runtime_store import InMemoryRuntimeStore, lock_fencing_token
 from backend.app.services.notifications import NotificationService
 from backend.app.services.trip_stream import publish_trip_stream
 
@@ -25,10 +25,16 @@ def test_runtime_store_counter_json_queue_lock_and_retry():
         assert await store.recover_processing("reliable") == 0
         token = await store.acquire_lock("agent-run:1", 30)
         assert token
+        assert lock_fencing_token(token) == 1
         assert await store.acquire_lock("agent-run:1", 30) is None
+        assert await store.is_lock_owner("agent-run:1", token) is True
         assert await store.renew_lock("agent-run:1", token, 30) is True
         assert await store.renew_lock("agent-run:1", "wrong-token", 30) is False
         assert await store.release_lock("agent-run:1", token) is True
+        next_token = await store.acquire_lock("agent-run:1", 30)
+        assert next_token and lock_fencing_token(next_token) == 2
+        assert await store.is_lock_owner("agent-run:1", token) is False
+        assert await store.release_lock("agent-run:1", next_token) is True
         disposition = await store.enqueue_retry(
             "events", {"event_id": 2}, attempt=1, max_attempts=2, delay_seconds=0
         )
