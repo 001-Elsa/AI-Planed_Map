@@ -32,7 +32,8 @@ def test_replay_executes_every_scenario_and_computes_runtime_metrics():
     assert report["case_count"] == 13
     assert report["single_agent"]["case_count"] == 13
     assert report["multi_agent"]["case_count"] == 13
-    assert report["multi_agent"]["hard_constraint_satisfaction_rate"] == 1
+    assert 0 <= report["multi_agent"]["hard_constraint_satisfaction_rate"] < 1
+    assert report["multi_agent"]["executable_plan_constraint_satisfaction_rate"] == 1
     assert report["multi_agent"]["illegal_tool_execution_rate"] == 0
     assert report["multi_agent"]["agent_handoff_success_rate"] == 1
     assert report["multi_agent"]["critic_bad_plan_recall"] == 1

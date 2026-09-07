@@ -150,7 +150,7 @@ ModelRouter 另有 12 条离线路由门禁，检查 Rule/Small/Strong 选择准
 
 ### Unified Agent Evaluation (offline + live)
 
-The versioned 180-case golden dataset and A-F ablation framework are documented in
+The versioned 60-case independent golden dataset and A-F ablation framework are documented in
 [`docs/AGENT_EVALUATION.md`](docs/AGENT_EVALUATION.md). CI runs the complete deterministic
 offline suite. A live run uses only environment-configured models and writes an explicit
 `SKIPPED` report when `LLM_API_KEY` is absent; it never replaces a missing live run with
@@ -168,34 +168,22 @@ The command above replaces only the marked comparison block after a completed li
 <!-- agent-live-eval:start -->
 ### Real LLM Comparison
 
-Status: **PENDING CREDENTIALS**. This machine does not currently provide `LLM_API_KEY` or
-`LLM_STRONG_MODEL`, so no real-model measurements have been claimed. A `SKIPPED` run cannot
-replace this block.
+Status: **NOT ESTABLISHED (LIVE RUN SKIPPED)**. The formal 60-case x 3-repeat A/C/F command
+was attempted on 2026-09-07 against dataset hash
+`c46968f40d093cc52ac735cf1aae4dc9aa070b5e47dfae408edee1201a177e99`, but this machine did
+not provide `LLM_API_KEY`. The framework exited non-zero and generated no synthetic profile
+scores. `LLM_STRONG_MODEL` is also required before the F profile can run.
 <!-- agent-live-eval:end -->
 
-### Single-Agent vs Multi-Agent Replay Benchmark
+### Single-Agent vs Multi-Agent Evidence Status
 
-以下结果来自 100 条离线确定性回放，数据集哈希为
-`b6ac33236f0ace74fecedb244014cbd74dfeb79e614d99e658556c1adbad6d56`。两组使用相同的
-Intent、Mock Map 数据、搜索工具和确定性路线算法；Single-Agent 基线也允许搜索重试和动态事件回放。
+旧版 100 条确定性回放继续作为运行时回归测试，但不再展示为 Multi-Agent 效果对照。原因有二：
+Single-Agent 与 Multi-Agent 的 Safety、Critic 和动态恢复能力并不相等；旧硬约束指标还会把空结果或非成功结果
+记为满足。当前框架已修正硬约束语义，并为每个 profile 写入能力指纹；只有存在能力匹配的 Single/Multi
+实验对时，报告才会标记为可用于优越性结论。
 
-| 指标 | Single-Agent | Multi-Agent |
-| --- | ---: | ---: |
-| Task Success | 85.00% | 100.00% |
-| Constraint Satisfaction | 100.00% | 100.00% |
-| Tool Selection Accuracy | 92.00% | 100.00% |
-| Recovery Rate | 84.44% | 100.00% |
-| Replanning Success | 100.00% | 100.00% |
-| Critic Bad-plan Recall | 0.00% | 100.00% |
-| Illegal Tool Execution | 0.00% | 0.00% |
-| Average Agent Count | 1.00 | 4.55 |
-| P50 Latency | 20.90 ms | 64.47 ms |
-| P95 Latency | 336.26 ms | 390.69 ms |
-| LLM Calls / Token Cost | 0 / $0 | 0 / $0 |
-
-该结果说明 Multi-Agent 在错误证据拦截和 Worker 故障恢复场景更可靠，但增加了执行角色和延迟。默认基准不调用
-LLM 或外部网络，因此 Token 成本为真实的零，延迟也只代表本机确定性回放，不能当作生产环境性能数据。完整快照见
-[`replay_agent_benchmark_result.json`](backend/tests/evaluation/replay_agent_benchmark_result.json)。
+目前结论是 **NOT ESTABLISHED**：尚无真实 LLM、能力匹配的证据证明 Multi-Agent 优于 Single-Agent。
+这比保留一张好看的离线表更诚实，也为后续实验留下了清晰验收标准。
 
 更多设计见 [架构说明](docs/ARCHITECTURE.md)、[威胁模型](docs/THREAT_MODEL.md)、[版本演进](docs/CHANGELOG.md) 和 [ADR](docs/adr/0001-deterministic-planning-boundary.md)。
 

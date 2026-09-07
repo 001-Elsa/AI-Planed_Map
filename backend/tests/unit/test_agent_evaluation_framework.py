@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from backend.app.core.config import Settings
-from backend.app.schemas.ai_intent import Coordinate
+from backend.app.schemas.agent_artifacts import AgentToolCallAudit
 from backend.tests.evaluation.agent_evaluation_framework import (
     PROFILES,
     README_EVAL_END,
@@ -18,7 +18,6 @@ from backend.tests.evaluation.agent_evaluation_framework import (
     smoke_cases,
     stratified_cases,
 )
-from backend.tests.evaluation.replay_agent_benchmark import FaultInjectingMapProvider
 
 
 def _result(**updates) -> CaseResult:
@@ -52,17 +51,21 @@ def _result(**updates) -> CaseResult:
         "latency_ms": 10,
         "agent_handoffs": 4,
         "terminal_status": "success",
+        "tool_audit_available": True,
     }
     values.update(updates)
     return CaseResult(**values)
 
 
-def test_versioned_golden_dataset_expands_to_180_stable_cases():
+def test_versioned_golden_dataset_contains_sixty_independent_cases():
     metadata, cases, dataset_hash = load_dataset()
 
-    assert metadata["version"] == "1.0.0"
-    assert len(cases) == 180
-    assert len({case.case_id for case in cases}) == 180
+    assert metadata["version"] == "2.0.0"
+    assert metadata["sampling_unit"] == "independent_problem"
+    assert "templates" not in metadata
+    assert len(cases) == 60
+    assert len({case.case_id for case in cases}) == 60
+    assert len({case.text for case in cases}) == 60
     assert len(dataset_hash) == 64
     assert len(smoke_cases(cases)) == 20
     assert len({case.category for case in smoke_cases(cases)}) == 20
@@ -98,17 +101,20 @@ def test_strong_profile_uses_strong_tier_prices():
 
 
 def test_tool_argument_accuracy_can_reject_missing_and_invalid_arguments():
-    provider = FaultInjectingMapProvider("standard")
-
-    assert not _valid_tool_arguments(provider, {"search_poi"}, "Hangzhou")
-    provider.search_arguments.append(("", Coordinate(lng=120, lat=30), "Hangzhou"))
-    assert not _valid_tool_arguments(provider, {"search_poi"}, "Hangzhou")
-    provider.search_arguments[0] = (
-        "museum",
-        Coordinate(lng=120, lat=30),
-        "Hangzhou",
+    valid = AgentToolCallAudit(
+        tool_name="search_poi",
+        input_summary={},
+        output_summary={},
+        status="succeeded",
+        authorized=True,
+        arguments_valid=True,
     )
-    assert not _valid_tool_arguments(provider, {"search_poi", "get_route_matrix"}, "Hangzhou")
+    invalid = valid.model_copy(update={"arguments_valid": False})
+
+    assert not _valid_tool_arguments([], {"search_poi"})
+    assert not _valid_tool_arguments([invalid], {"search_poi"})
+    assert _valid_tool_arguments([valid], {"search_poi"})
+    assert not _valid_tool_arguments([valid], {"search_poi", "get_route_matrix"})
 
 
 def test_aggregate_preserves_metric_denominators_and_null_not_applicable():
@@ -137,6 +143,7 @@ def test_aggregate_preserves_metric_denominators_and_null_not_applicable():
     assert metrics["task_success_rate"] == {"value": 1.0, "numerator": 2, "denominator": 2}
     assert metrics["critic_bad_plan_recall"]["denominator"] == 1
     assert metrics["hard_constraint_satisfaction_rate"]["denominator"] == 1
+    assert metrics["tool_audit_coverage"]["value"] == 1
     assert metrics["replanning_success_rate"]["value"] == 1.0
     assert metrics["hitl_trigger_precision"]["value"] is None
     assert metrics["average_llm_calls"] == 1
@@ -226,6 +233,7 @@ async def test_offline_multi_agent_smoke_executes_production_dynamic_replans(
 
     metrics = report["profiles"][0]["metrics"]
     assert report["status"] == "COMPLETED"
+    assert metrics["tool_audit_coverage"]["value"] == 1
     assert metrics["production_dynamic_replay_rate"]["value"] == 1
     assert metrics["workflow_graph_accuracy"]["value"] == 1
     assert metrics["average_true_agent_tasks_per_dynamic_run"] == 1

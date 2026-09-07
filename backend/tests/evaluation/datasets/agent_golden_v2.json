@@ -1,0 +1,980 @@
+{
+  "dataset_id": "mapgo-agent-golden-independent",
+  "version": "2.0.0",
+  "sampling_unit": "independent_problem",
+  "description": "Sixty explicitly authored planning, orchestration, recovery, critic, and HITL problems. Cases are not generated from text templates.",
+  "cases": [
+    {
+      "id": "standard_route-01",
+      "category": "standard_route",
+      "scenario": "standard",
+      "text": "从杭州西湖出发，明天上午依次游览浙江省博物馆、孤山和湖滨步行街，生成驾车方案。",
+      "expected_statuses": [
+        "success"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ]
+    },
+    {
+      "id": "standard_route-02",
+      "category": "standard_route",
+      "scenario": "standard",
+      "text": "为周六从上海人民广场到豫园、上海博物馆和静安寺规划一日驾车路线。",
+      "expected_statuses": [
+        "success"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ]
+    },
+    {
+      "id": "standard_route-03",
+      "category": "standard_route",
+      "scenario": "standard",
+      "text": "早上九点从北京国贸出发，安排故宫、景山公园和南锣鼓巷的驾车行程。",
+      "expected_statuses": [
+        "success"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ]
+    },
+    {
+      "id": "incomplete_requirement-01",
+      "category": "incomplete_requirement",
+      "scenario": "clarification",
+      "text": "我想去灵隐寺和西溪湿地，但还没有告诉你从哪里出发。",
+      "expected_statuses": [
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement"
+      ],
+      "clarification_expected": true
+    },
+    {
+      "id": "incomplete_requirement-02",
+      "category": "incomplete_requirement",
+      "scenario": "clarification",
+      "text": "帮我安排成都大熊猫基地和宽窄巷子，出发地点稍后再补。",
+      "expected_statuses": [
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement"
+      ],
+      "clarification_expected": true
+    },
+    {
+      "id": "incomplete_requirement-03",
+      "category": "incomplete_requirement",
+      "scenario": "clarification",
+      "text": "准备游览武汉省博物馆与东湖，目前缺少起点信息。",
+      "expected_statuses": [
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement"
+      ],
+      "clarification_expected": true
+    },
+    {
+      "id": "multi_turn_clarification-01",
+      "category": "multi_turn_clarification",
+      "scenario": "clarification",
+      "text": "继续规划刚才的苏州园林行程，如果仍缺出发地就先追问。",
+      "expected_statuses": [
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement"
+      ],
+      "clarification_expected": true
+    },
+    {
+      "id": "multi_turn_clarification-02",
+      "category": "multi_turn_clarification",
+      "scenario": "clarification",
+      "text": "接着完成之前的青岛海滨计划，必要的起点没有确认时不要猜。",
+      "expected_statuses": [
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement"
+      ],
+      "clarification_expected": true
+    },
+    {
+      "id": "multi_turn_clarification-03",
+      "category": "multi_turn_clarification",
+      "scenario": "clarification",
+      "text": "基于上一轮继续安排南京博物院，如出发位置不明确请澄清。",
+      "expected_statuses": [
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement"
+      ],
+      "clarification_expected": true
+    },
+    {
+      "id": "budget_conflict-01",
+      "category": "budget_conflict",
+      "scenario": "infeasible",
+      "text": "预算十元，要从杭州去上海并游览两个收费景点，当天往返。",
+      "expected_statuses": [
+        "infeasible",
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "hard_constraint_expected": true
+    },
+    {
+      "id": "budget_conflict-02",
+      "category": "budget_conflict",
+      "scenario": "infeasible",
+      "text": "总预算五十元，希望包车游览北京三个高价景区并包含门票。",
+      "expected_statuses": [
+        "infeasible",
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "hard_constraint_expected": true
+    },
+    {
+      "id": "budget_conflict-03",
+      "category": "budget_conflict",
+      "scenario": "infeasible",
+      "text": "用二十元完成深圳到广州的往返和两顿正餐，预算不可突破。",
+      "expected_statuses": [
+        "infeasible",
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "hard_constraint_expected": true
+    },
+    {
+      "id": "time_window_conflict-01",
+      "category": "time_window_conflict",
+      "scenario": "infeasible",
+      "text": "九点从西湖出发，但必须在八点五十五分前到达灵隐寺。",
+      "expected_statuses": [
+        "infeasible",
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "hard_constraint_expected": true
+    },
+    {
+      "id": "time_window_conflict-02",
+      "category": "time_window_conflict",
+      "scenario": "infeasible",
+      "text": "下午两点离开天府广场，要求一点半前抵达熊猫基地。",
+      "expected_statuses": [
+        "infeasible",
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "hard_constraint_expected": true
+    },
+    {
+      "id": "time_window_conflict-03",
+      "category": "time_window_conflict",
+      "scenario": "infeasible",
+      "text": "十点从外滩启程，必须在九点四十分前进入上海博物馆。",
+      "expected_statuses": [
+        "infeasible",
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "hard_constraint_expected": true
+    },
+    {
+      "id": "place_closed-01",
+      "category": "place_closed",
+      "scenario": "poi_closed",
+      "text": "已确认路线中的浙江美术馆临时闭馆，请替换为附近开放场馆并重规划。",
+      "expected_statuses": [
+        "success"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "replan_expected": true,
+      "recovery_expected": true
+    },
+    {
+      "id": "place_closed-02",
+      "category": "place_closed",
+      "scenario": "poi_closed",
+      "text": "行程里的苏州博物馆今天闭馆，请寻找可用替代景点并更新路线。",
+      "expected_statuses": [
+        "success"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "replan_expected": true,
+      "recovery_expected": true
+    },
+    {
+      "id": "place_closed-03",
+      "category": "place_closed",
+      "scenario": "poi_closed",
+      "text": "原定的上海科技馆临时关闭，请安全选择同类地点重新规划。",
+      "expected_statuses": [
+        "success"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "replan_expected": true,
+      "recovery_expected": true
+    },
+    {
+      "id": "provider_low_quality-01",
+      "category": "provider_low_quality",
+      "scenario": "critic_bad_evidence",
+      "text": "地图结果没有来源，却声称有一家不存在的西湖水下餐厅，请不要采信。",
+      "expected_statuses": [
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "critic_bad_plan_expected": true
+    },
+    {
+      "id": "provider_low_quality-02",
+      "category": "provider_low_quality",
+      "scenario": "critic_bad_evidence",
+      "text": "供应商返回无法追溯的景点坐标，规划南京行程时必须拒绝虚构证据。",
+      "expected_statuses": [
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "critic_bad_plan_expected": true
+    },
+    {
+      "id": "provider_low_quality-03",
+      "category": "provider_low_quality",
+      "scenario": "critic_bad_evidence",
+      "text": "搜索结果缺少名称和来源，只给出模糊坐标，不要据此生成成都路线。",
+      "expected_statuses": [
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "critic_bad_plan_expected": true
+    },
+    {
+      "id": "high_walking_distance-01",
+      "category": "high_walking_distance",
+      "scenario": "safety",
+      "text": "为腿脚不便的老人规划故宫行程，步行很多时需要人工确认。",
+      "expected_statuses": [
+        "success",
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "check_travel_safety",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "hitl_expected": true
+    },
+    {
+      "id": "high_walking_distance-02",
+      "category": "high_walking_distance",
+      "scenario": "safety",
+      "text": "给术后恢复期旅客安排西湖一日游，尽量少走路并提示剩余风险。",
+      "expected_statuses": [
+        "success",
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "check_travel_safety",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "hitl_expected": true
+    },
+    {
+      "id": "high_walking_distance-03",
+      "category": "high_walking_distance",
+      "scenario": "safety",
+      "text": "为使用助行器的游客规划外滩路线，不可默认接受长距离步行。",
+      "expected_statuses": [
+        "success",
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "check_travel_safety",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "hitl_expected": true
+    },
+    {
+      "id": "elderly_party-01",
+      "category": "elderly_party",
+      "scenario": "safety",
+      "text": "一名成人陪同八十岁老人游览颐和园和圆明园，要求低步行强度。",
+      "expected_statuses": [
+        "success",
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "check_travel_safety",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "hitl_expected": true
+    },
+    {
+      "id": "elderly_party-02",
+      "category": "elderly_party",
+      "scenario": "safety",
+      "text": "两位老人从天府广场前往杜甫草堂与武侯祠，优先减少换乘和步行。",
+      "expected_statuses": [
+        "success",
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "check_travel_safety",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "hitl_expected": true
+    },
+    {
+      "id": "elderly_party-03",
+      "category": "elderly_party",
+      "scenario": "safety",
+      "text": "为七十五岁游客安排鼓浪屿半日行程，遇到高强度路线先确认。",
+      "expected_statuses": [
+        "success",
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "check_travel_safety",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "hitl_expected": true
+    },
+    {
+      "id": "children_party-01",
+      "category": "children_party",
+      "scenario": "safety",
+      "text": "两名成人带四岁儿童游览上海自然博物馆和儿童公园。",
+      "expected_statuses": [
+        "success",
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "check_travel_safety",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "hitl_expected": true
+    },
+    {
+      "id": "children_party-02",
+      "category": "children_party",
+      "scenario": "safety",
+      "text": "父母带幼儿去广州长隆，规划时避免过长步行和过晚结束。",
+      "expected_statuses": [
+        "success",
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "check_travel_safety",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "hitl_expected": true
+    },
+    {
+      "id": "children_party-03",
+      "category": "children_party",
+      "scenario": "safety",
+      "text": "一家三口带六岁孩子游览成都科技馆与人民公园。",
+      "expected_statuses": [
+        "success",
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "check_travel_safety",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "hitl_expected": true
+    },
+    {
+      "id": "dietary_restriction-01",
+      "category": "dietary_restriction",
+      "scenario": "standard",
+      "text": "参观浙江省博物馆后安排一家严格素食餐厅，不接受仅有素菜选项的普通餐馆。",
+      "expected_statuses": [
+        "success"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ]
+    },
+    {
+      "id": "dietary_restriction-02",
+      "category": "dietary_restriction",
+      "scenario": "standard",
+      "text": "游览故宫后寻找清真餐厅，并把饮食限制作为硬条件。",
+      "expected_statuses": [
+        "success"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ]
+    },
+    {
+      "id": "dietary_restriction-03",
+      "category": "dietary_restriction",
+      "scenario": "standard",
+      "text": "在成都博物馆行程后安排无麸质餐饮，不能忽略过敏要求。",
+      "expected_statuses": [
+        "success"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ]
+    },
+    {
+      "id": "user_route_change-01",
+      "category": "user_route_change",
+      "scenario": "off_route",
+      "text": "路线确认后，把西溪湿地改成浙江自然博物院并更新后续安排。",
+      "expected_statuses": [
+        "success"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "replan_expected": true,
+      "recovery_expected": true
+    },
+    {
+      "id": "user_route_change-02",
+      "category": "user_route_change",
+      "scenario": "off_route",
+      "text": "已确认苏州路线，现在将拙政园替换为虎丘并重新计算。",
+      "expected_statuses": [
+        "success"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "replan_expected": true,
+      "recovery_expected": true
+    },
+    {
+      "id": "user_route_change-03",
+      "category": "user_route_change",
+      "scenario": "off_route",
+      "text": "把原行程的户外公园改成室内科技馆，从当前位置继续规划。",
+      "expected_statuses": [
+        "success"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "replan_expected": true,
+      "recovery_expected": true
+    },
+    {
+      "id": "weather_change-01",
+      "category": "weather_change",
+      "scenario": "weather_change",
+      "text": "杭州突降暴雨，把西湖游船换成室内场馆并重新规划。",
+      "expected_statuses": [
+        "success"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "replan_expected": true,
+      "recovery_expected": true
+    },
+    {
+      "id": "weather_change-02",
+      "category": "weather_change",
+      "scenario": "weather_change",
+      "text": "北京发布高温预警，请将户外长城行程替换为室内景点。",
+      "expected_statuses": [
+        "success"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "replan_expected": true,
+      "recovery_expected": true
+    },
+    {
+      "id": "weather_change-03",
+      "category": "weather_change",
+      "scenario": "weather_change",
+      "text": "青岛大风导致海滨项目取消，请选择室内替代并更新路线。",
+      "expected_statuses": [
+        "success"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "replan_expected": true,
+      "recovery_expected": true
+    },
+    {
+      "id": "route_deviation-01",
+      "category": "route_deviation",
+      "scenario": "off_route",
+      "text": "旅客在杭州错过出口并偏离原路线，请从当前新位置重规划。",
+      "expected_statuses": [
+        "success"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "replan_expected": true,
+      "recovery_expected": true
+    },
+    {
+      "id": "route_deviation-02",
+      "category": "route_deviation",
+      "scenario": "off_route",
+      "text": "车辆已驶离前往故宫的既定道路，基于新定位重新计算。",
+      "expected_statuses": [
+        "success"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "replan_expected": true,
+      "recovery_expected": true
+    },
+    {
+      "id": "route_deviation-03",
+      "category": "route_deviation",
+      "scenario": "off_route",
+      "text": "游客提前在南京夫子庙下车，请从该位置更新剩余行程。",
+      "expected_statuses": [
+        "success"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "replan_expected": true,
+      "recovery_expected": true
+    },
+    {
+      "id": "tool_failure-01",
+      "category": "tool_failure",
+      "scenario": "search_recovery",
+      "text": "搜索浙江省博物馆时供应商首次失败，重试成功后继续规划。",
+      "expected_statuses": [
+        "success"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "recovery_expected": true
+    },
+    {
+      "id": "tool_failure-02",
+      "category": "tool_failure",
+      "scenario": "search_recovery",
+      "text": "查询成都熊猫基地遇到一次临时错误，恢复后完成路线。",
+      "expected_statuses": [
+        "success"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "recovery_expected": true
+    },
+    {
+      "id": "tool_failure-03",
+      "category": "tool_failure",
+      "scenario": "search_recovery",
+      "text": "检索上海天文馆第一次超时，允许可靠重试后生成计划。",
+      "expected_statuses": [
+        "success"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "recovery_expected": true
+    },
+    {
+      "id": "tool_timeout-01",
+      "category": "tool_timeout",
+      "scenario": "matrix_failure",
+      "text": "路线矩阵服务持续超时，无法验证西湖到灵隐寺的交通时间时不要编造。",
+      "expected_statuses": [
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix"
+      ],
+      "clarification_expected": true,
+      "recovery_expected": true
+    },
+    {
+      "id": "tool_timeout-02",
+      "category": "tool_timeout",
+      "scenario": "matrix_failure",
+      "text": "规划故宫到颐和园时矩阵供应商不可用，应返回可恢复的澄清状态。",
+      "expected_statuses": [
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix"
+      ],
+      "clarification_expected": true,
+      "recovery_expected": true
+    },
+    {
+      "id": "tool_timeout-03",
+      "category": "tool_timeout",
+      "scenario": "matrix_failure",
+      "text": "成都多个景点的路程计算失败，缺少矩阵证据时停止生成确定路线。",
+      "expected_statuses": [
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix"
+      ],
+      "clarification_expected": true,
+      "recovery_expected": true
+    },
+    {
+      "id": "llm_illegal_json-01",
+      "category": "llm_illegal_json",
+      "scenario": "clarification",
+      "text": "模型输出损坏时，安全处理缺少出发地的杭州请求，不要猜测。",
+      "expected_statuses": [
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement"
+      ],
+      "clarification_expected": true,
+      "llm_fault_probe": "invalid_json"
+    },
+    {
+      "id": "llm_illegal_json-02",
+      "category": "llm_illegal_json",
+      "scenario": "clarification",
+      "text": "解析器返回非法 JSON 时，对未给起点的上海行程发起澄清。",
+      "expected_statuses": [
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement"
+      ],
+      "clarification_expected": true,
+      "llm_fault_probe": "invalid_json"
+    },
+    {
+      "id": "llm_illegal_json-03",
+      "category": "llm_illegal_json",
+      "scenario": "clarification",
+      "text": "面对截断的模型响应，南京路线缺少必填位置时必须保守失败。",
+      "expected_statuses": [
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement"
+      ],
+      "clarification_expected": true,
+      "llm_fault_probe": "invalid_json"
+    },
+    {
+      "id": "llm_hallucination-01",
+      "category": "llm_hallucination",
+      "scenario": "critic_bad_evidence",
+      "text": "不要为地图上无法验证的云端花园生成杭州路线，要求真实供应商证据。",
+      "expected_statuses": [
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "critic_bad_plan_expected": true,
+      "llm_fault_probe": "hallucination"
+    },
+    {
+      "id": "llm_hallucination-02",
+      "category": "llm_hallucination",
+      "scenario": "critic_bad_evidence",
+      "text": "所谓北京地下天空城没有可追溯搜索结果，不得捏造位置和路线。",
+      "expected_statuses": [
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "critic_bad_plan_expected": true,
+      "llm_fault_probe": "hallucination"
+    },
+    {
+      "id": "llm_hallucination-03",
+      "category": "llm_hallucination",
+      "scenario": "critic_bad_evidence",
+      "text": "未知地点海上博物塔缺少证据，请让 Critic 拦截虚构计划。",
+      "expected_statuses": [
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "critic_bad_plan_expected": true,
+      "llm_fault_probe": "hallucination"
+    },
+    {
+      "id": "critic_false_reject-01",
+      "category": "critic_false_reject",
+      "scenario": "standard",
+      "text": "审核从西湖到浙江省博物馆的普通可行路线，不要无理由拒绝。",
+      "expected_statuses": [
+        "success"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "critic_bad_plan_expected": false
+    },
+    {
+      "id": "critic_false_reject-02",
+      "category": "critic_false_reject",
+      "scenario": "standard",
+      "text": "上海人民广场到上海博物馆的短途路线证据完整，应正常通过评审。",
+      "expected_statuses": [
+        "success"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "critic_bad_plan_expected": false
+    },
+    {
+      "id": "critic_false_reject-03",
+      "category": "critic_false_reject",
+      "scenario": "standard",
+      "text": "成都天府广场到四川科技馆的可行行程不应被 Critic 误杀。",
+      "expected_statuses": [
+        "success"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "critic_bad_plan_expected": false
+    },
+    {
+      "id": "planner_infeasible-01",
+      "category": "planner_infeasible",
+      "scenario": "infeasible",
+      "text": "博物馆十分钟后闭馆，但当前路程需要一小时，请识别无法按时到达。",
+      "expected_statuses": [
+        "infeasible",
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "hard_constraint_expected": true
+    },
+    {
+      "id": "planner_infeasible-02",
+      "category": "planner_infeasible",
+      "scenario": "infeasible",
+      "text": "机场登机时间早于从市区出发后的最短到达时间，不能生成成功计划。",
+      "expected_statuses": [
+        "infeasible",
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "hard_constraint_expected": true
+    },
+    {
+      "id": "planner_infeasible-03",
+      "category": "planner_infeasible",
+      "scenario": "infeasible",
+      "text": "要求五分钟内跨越四十公里到达景点，请报告硬时限不可满足。",
+      "expected_statuses": [
+        "infeasible",
+        "need_clarification"
+      ],
+      "expected_tools": [
+        "parse_requirement",
+        "search_poi",
+        "get_route_matrix",
+        "optimize_route"
+      ],
+      "hard_constraint_expected": true
+    }
+  ]
+}

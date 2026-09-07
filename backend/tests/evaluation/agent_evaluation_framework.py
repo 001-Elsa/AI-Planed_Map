@@ -29,8 +29,11 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 
 from backend.app.core.config import Settings  # noqa: E402
-from backend.app.schemas.agent_artifacts import AgentType, AgentWorkflowTrace  # noqa: E402
-from backend.app.schemas.ai_intent import AIPlanResult, TransportMode  # noqa: E402
+from backend.app.schemas.agent_artifacts import (  # noqa: E402
+    AgentToolCallAudit,
+    AgentWorkflowTrace,
+)
+from backend.app.schemas.ai_intent import AIPlanResult  # noqa: E402
 from backend.app.services.agent_evaluation import (  # noqa: E402
     evaluate_route_plan,
     runtime_route_policy,
@@ -58,7 +61,7 @@ from backend.tests.evaluation.replay_agent_benchmark import (  # noqa: E402
 Mode = Literal["offline", "live"]
 Suite = Literal["smoke", "full"]
 
-DATASET_PATH = Path(__file__).parent / "datasets" / "agent_golden_v1.json"
+DATASET_PATH = Path(__file__).parent / "datasets" / "agent_golden_v2.json"
 DEFAULT_OUTPUT_DIR = ROOT / "artifacts" / "agent-evaluation"
 README_EVAL_START = "<!-- agent-live-eval:start -->"
 README_EVAL_END = "<!-- agent-live-eval:end -->"
@@ -71,15 +74,16 @@ class AblationProfile:
     multi_agent: bool
     critic: Literal["off", "rule", "llm"]
     model_tier: Literal["default", "small", "strong"] = "default"
+    capability_fingerprint: str = ""
 
 
 PROFILES: tuple[AblationProfile, ...] = (
-    AblationProfile("A", "Single Agent Baseline", False, "off"),
-    AblationProfile("B", "Multi-Agent without Critic", True, "off"),
-    AblationProfile("C", "Multi-Agent + Rule Critic", True, "rule"),
-    AblationProfile("D", "Multi-Agent + LLM Critic", True, "llm"),
-    AblationProfile("E", "Multi-Agent + Small Model", True, "llm", "small"),
-    AblationProfile("F", "Multi-Agent + Strong Model", True, "llm", "strong"),
+    AblationProfile("A", "Single Agent Baseline", False, "off", "default", "single-core-v1"),
+    AblationProfile("B", "Multi-Agent without Critic", True, "off", "default", "multi-core-v1"),
+    AblationProfile("C", "Multi-Agent + Rule Critic", True, "rule", "default", "multi-rule-v1"),
+    AblationProfile("D", "Multi-Agent + LLM Critic", True, "llm", "default", "multi-llm-v1"),
+    AblationProfile("E", "Multi-Agent + Small Model", True, "llm", "small", "multi-llm-v1"),
+    AblationProfile("F", "Multi-Agent + Strong Model", True, "llm", "strong", "multi-llm-v1"),
 )
 
 
@@ -111,7 +115,7 @@ class CaseResult:
     hard_constraint_expected: bool
     tool_selection_accurate: bool
     tool_argument_accurate: bool
-    illegal_tool_calls: int
+    illegal_tool_calls: int | None
     unnecessary_tool_calls: int
     tool_retries: int
     clarification_expected: bool
@@ -141,6 +145,7 @@ class CaseResult:
     agent_task_count: int = 0
     stage_task_count: int = 0
     trial: int = 1
+    tool_audit_available: bool = False
 
 
 class CountingParser:
@@ -182,26 +187,34 @@ class CountingCritic:
 
 def load_dataset(path: Path = DATASET_PATH) -> tuple[dict[str, Any], list[GoldenCase], str]:
     raw = json.loads(path.read_text(encoding="utf-8"))
+    if raw.get("sampling_unit") != "independent_problem":
+        raise ValueError("evaluation datasets must declare independent_problem sampling")
+    if "templates" in raw:
+        raise ValueError("template-expanded cases are not accepted as independent evidence")
     cases: list[GoldenCase] = []
-    for template in raw["templates"]:
-        for variant in range(1, int(template["variants"]) + 1):
-            cases.append(
-                GoldenCase(
-                    case_id=f"{template['id']}-{variant:02d}",
-                    category=template["id"],
-                    scenario=template["scenario"],
-                    text=template["text"].format(variant=variant),
-                    expected_statuses=tuple(template["expected_statuses"]),
-                    expected_tools=tuple(template["expected_tools"]),
-                    clarification_expected=bool(template.get("clarification_expected")),
-                    critic_bad_plan_expected=bool(template.get("critic_bad_plan_expected")),
-                    hitl_expected=bool(template.get("hitl_expected")),
-                    replan_expected=bool(template.get("replan_expected")),
-                    recovery_expected=bool(template.get("recovery_expected")),
-                    hard_constraint_expected=bool(template.get("hard_constraint_expected")),
-                    llm_fault_probe=template.get("llm_fault_probe"),
-                )
+    for item in raw["cases"]:
+        cases.append(
+            GoldenCase(
+                case_id=item["id"],
+                category=item["category"],
+                scenario=item["scenario"],
+                text=item["text"],
+                expected_statuses=tuple(item["expected_statuses"]),
+                expected_tools=tuple(item["expected_tools"]),
+                clarification_expected=bool(item.get("clarification_expected")),
+                critic_bad_plan_expected=bool(item.get("critic_bad_plan_expected")),
+                hitl_expected=bool(item.get("hitl_expected")),
+                replan_expected=bool(item.get("replan_expected")),
+                recovery_expected=bool(item.get("recovery_expected")),
+                hard_constraint_expected=bool(item.get("hard_constraint_expected")),
+                llm_fault_probe=item.get("llm_fault_probe"),
             )
+        )
+    if len({case.case_id for case in cases}) != len(cases):
+        raise ValueError("evaluation case IDs must be unique")
+    normalized_text = {" ".join(case.text.lower().split()) for case in cases}
+    if len(normalized_text) != len(cases):
+        raise ValueError("independent evaluation case texts must be unique")
     canonical = json.dumps([asdict(case) for case in cases], sort_keys=True, separators=(",", ":"))
     return raw, cases, hashlib.sha256(canonical.encode()).hexdigest()
 
@@ -276,46 +289,24 @@ def _settings(base: Settings, profile: AblationProfile) -> Settings:
     )
 
 
-def _tools(trace: AgentWorkflowTrace | None, provider: FaultInjectingMapProvider) -> set[str]:
-    agents = {step.agent_type for step in trace.steps} if trace else set()
-    tools: set[str] = set()
-    if AgentType.intent in agents:
-        tools.add("parse_requirement")
-    if provider.search_calls:
-        tools.add("search_poi")
-    if AgentType.safety in agents:
-        tools.add("check_travel_safety")
-    if provider.matrix_calls:
-        tools.add("get_route_matrix")
-    if AgentType.planner in agents and provider.successful_matrix_calls:
-        tools.add("optimize_route")
-    return tools
+def _tool_audit(traces: list[AgentWorkflowTrace]) -> tuple[list[AgentToolCallAudit], bool]:
+    steps = [step for trace in traces for step in trace.steps]
+    return [call for step in steps for call in step.tool_calls], bool(steps) and all(
+        step.tool_audit_complete for step in steps
+    )
 
 
 def _valid_tool_arguments(
-    provider: FaultInjectingMapProvider,
+    calls: list[AgentToolCallAudit],
     expected_tools: set[str],
-    expected_city: str | None,
 ) -> bool:
-    if "search_poi" in expected_tools and not provider.search_arguments:
-        return False
-    for keyword, origin, city in provider.search_arguments:
-        if not keyword.strip() or city != expected_city:
-            return False
-        if not (-180 <= origin.lng <= 180 and -90 <= origin.lat <= 90):
-            return False
-    if "get_route_matrix" in expected_tools and not provider.matrix_arguments:
-        return False
-    valid_modes = {item.value for item in TransportMode}
-    return all(
-        point_count >= 2 and getattr(mode, "value", mode) in valid_modes
-        for point_count, mode in provider.matrix_arguments
-    )
+    observed = {call.tool_name for call in calls if call.status != "denied"}
+    return expected_tools.issubset(observed) and all(call.arguments_valid for call in calls)
 
 
 def _constraint_result(result: AIPlanResult | None) -> tuple[bool, int]:
     if result is None or result.status != "success":
-        return True, 0
+        return False, 1
     payload = result.model_dump(mode="json", exclude={"agent_workflow"})
     evaluation = evaluate_route_plan(payload, runtime_route_policy(payload))
     return evaluation.passed, len(evaluation.hard_failures)
@@ -354,10 +345,8 @@ async def _execute_service_case(
     error: str | None = None
     replanned = False
     dynamic_evidence: DynamicReplayEvidence | None = None
-    planning_search_calls = 0
     try:
         result = await service.plan(replay.request)
-        planning_search_calls = provider.search_calls
         if result.agent_workflow:
             traces.append(AgentWorkflowTrace.model_validate(result.agent_workflow))
         if case.replan_expected and result.status == "success":
@@ -373,8 +362,10 @@ async def _execute_service_case(
     except Exception as exc:  # noqa: BLE001 - evaluation must preserve per-case failures
         error = f"{type(exc).__name__}: {exc}"[:500]
 
-    trace = traces[-1] if traces else None
-    actual_tools = _tools(trace, provider)
+    audited_calls, tool_audit_available = _tool_audit(traces)
+    actual_tools = {
+        call.tool_name for call in audited_calls if call.authorized and call.status != "denied"
+    }
     expected_tools = set(case.expected_tools)
     all_steps = [step for item in traces for step in item.steps]
     input_tokens = sum(step.input_tokens for step in all_steps)
@@ -393,7 +384,10 @@ async def _execute_service_case(
     constraint_satisfied, hard_violations = _constraint_result(result)
     unnecessary = len(actual_tools - expected_tools)
     expected_task_calls = len(replay.intent.tasks)
-    tool_retries = max(0, planning_search_calls - expected_task_calls)
+    tool_retries = max(
+        0,
+        sum(call.tool_name == "search_poi" for call in audited_calls) - expected_task_calls,
+    )
     tool_retries += sum(item.retry_count for item in traces)
     clarification_triggered = terminal == "need_clarification"
     task_success = terminal in case.expected_statuses and error is None
@@ -411,8 +405,13 @@ async def _execute_service_case(
         hard_constraint_violations=hard_violations,
         hard_constraint_expected=case.hard_constraint_expected,
         tool_selection_accurate=actual_tools == expected_tools,
-        tool_argument_accurate=_valid_tool_arguments(provider, expected_tools, replay.request.city),
-        illegal_tool_calls=0,
+        tool_argument_accurate=tool_audit_available
+        and _valid_tool_arguments(audited_calls, expected_tools),
+        illegal_tool_calls=(
+            sum(not call.authorized or call.status == "denied" for call in audited_calls)
+            if tool_audit_available
+            else None
+        ),
         unnecessary_tool_calls=unnecessary,
         tool_retries=tool_retries,
         clarification_expected=case.clarification_expected,
@@ -441,6 +440,7 @@ async def _execute_service_case(
         execution_mode=dynamic_evidence.execution_mode if dynamic_evidence else None,
         agent_task_count=dynamic_evidence.agent_task_count if dynamic_evidence else 0,
         stage_task_count=dynamic_evidence.stage_task_count if dynamic_evidence else 0,
+        tool_audit_available=tool_audit_available,
     )
 
 
@@ -520,6 +520,7 @@ def aggregate(results: list[CaseResult]) -> dict[str, Any]:
     clarification = [
         item for item in results if item.clarification_expected or item.clarification_triggered
     ]
+    audited_tools = [item for item in results if item.tool_audit_available]
     return {
         "case_count": count,
         "success_count": sum(item.task_success for item in results),
@@ -536,12 +537,18 @@ def aggregate(results: list[CaseResult]) -> dict[str, Any]:
             sum(bool(item.hard_constraint_violations) for item in results), count
         ),
         "tool_selection_accuracy": _rate(
-            sum(item.tool_selection_accurate for item in results), count
+            sum(item.tool_selection_accurate for item in audited_tools), len(audited_tools)
         ),
         "tool_argument_accuracy": _rate(
-            sum(item.tool_argument_accurate for item in results), count
+            sum(item.tool_argument_accurate for item in audited_tools), len(audited_tools)
         ),
-        "illegal_tool_call_rate": _rate(sum(item.illegal_tool_calls for item in results), count),
+        "tool_audit_coverage": _rate(
+            len(audited_tools), count
+        ),
+        "illegal_tool_call_rate": _rate(
+            sum(item.illegal_tool_calls or 0 for item in audited_tools),
+            len(audited_tools),
+        ),
         "unnecessary_tool_call_rate": _rate(
             sum(bool(item.unnecessary_tool_calls) for item in results), count
         ),
@@ -641,6 +648,7 @@ def _markdown(report: dict[str, Any]) -> str:
         f"Run time: `{report['run_time']}`  ",
         f"Git commit: `{report['git_commit']}`  ",
         f"Dataset: `{report['dataset_id']}@{report['dataset_version']}`  ",
+        f"Sampling unit: `{report['dataset_sampling_unit']}`  ",
         f"Dataset hash: `{report['dataset_hash']}`  ",
         f"Provider: `{report['provider']}`  ",
         f"Model version: `{report['model_version']}`  ",
@@ -673,6 +681,7 @@ def _markdown(report: dict[str, Any]) -> str:
         [
             "",
             "Rates include numerator and denominator in the JSON artifact; `null` means the metric was not applicable, not zero.",
+            f"Superiority claim eligible: `{report['comparison_validity']['superiority_claim_eligible']}`. {report['comparison_validity']['reason']}",
             "Offline D/E/F use deterministic critic fixtures and never claim real model quality. Only `live` results are LLM evidence.",
             "",
         ]
@@ -691,6 +700,8 @@ def _live_readme_block(report: dict[str, Any], json_path: Path) -> str:
     lines = [
         README_EVAL_START,
         "### Real LLM Comparison",
+        "",
+        f"Comparison validity: **{report['comparison_validity']['reason']}**",
         "",
         (
             f"Measured `{report['run_time']}` with {report['selected_case_count']} unique "
@@ -767,7 +778,7 @@ async def run_evaluation(
         raise ValueError("at least one evaluation profile must be selected")
     run_time = datetime.now(timezone.utc).isoformat()
     report: dict[str, Any] = {
-        "schema_version": "1.2.0",
+        "schema_version": "1.3.0",
         "status": "COMPLETED",
         "mode": mode,
         "suite": suite,
@@ -775,6 +786,7 @@ async def run_evaluation(
         "git_commit": _git_commit(),
         "dataset_id": dataset["dataset_id"],
         "dataset_version": dataset["version"],
+        "dataset_sampling_unit": dataset["sampling_unit"],
         "dataset_hash": dataset_hash,
         "dataset_case_count": len(all_cases),
         "selected_case_count": len(cases),
@@ -795,6 +807,22 @@ async def run_evaluation(
             else "deterministic-strong-fixture",
         },
         "profiles": [],
+    }
+    single_fingerprints = {
+        profile.capability_fingerprint for profile in selected if not profile.multi_agent
+    }
+    multi_fingerprints = {
+        profile.capability_fingerprint for profile in selected if profile.multi_agent
+    }
+    matched = sorted(single_fingerprints & multi_fingerprints)
+    report["comparison_validity"] = {
+        "superiority_claim_eligible": bool(matched),
+        "matched_capability_fingerprints": matched,
+        "reason": (
+            "A capability-matched Single/Multi pair is present."
+            if matched
+            else "No capability-matched Single/Multi pair is present; cross-profile results are descriptive and cannot establish Multi-Agent superiority."
+        ),
     }
     await asyncio.to_thread(output_dir.mkdir, parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
