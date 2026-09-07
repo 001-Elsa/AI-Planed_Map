@@ -3,7 +3,6 @@ import json
 import logging
 from datetime import datetime, timezone
 from typing import Any
-from uuid import uuid4
 
 import httpx
 from sqlalchemy import delete, select, update
@@ -29,18 +28,15 @@ from backend.app.models import (
     TripSession,
     UserConsent,
 )
-from backend.app.schemas.agent_artifacts import AgentEndpoint, AgentMessageType
 from backend.app.schemas.companion import ConsentScope
 from backend.app.schemas.dynamic_replanning import TripEventArtifact
 from backend.app.services.agent_controller import AgentController
 from backend.app.services.agent_decider import AgentDecider, build_agent_decider
 from backend.app.services.agent_shared_state import AgentSharedStateManager
 from backend.app.services.agent_transport import (
-    AgentTaskWorker,
     RecoverableAgentMessageBus,
     build_agent_message_bus,
 )
-from backend.app.services.agents.replanner_agent import ReplannerAgent
 from backend.app.services.dynamic_replanning import DynamicReplanningOrchestrator
 from backend.app.services.notifications import NotificationService, render_event_notification
 from backend.app.services.trip_stream import publish_trip_stream
@@ -101,55 +97,6 @@ async def _claim_worker_fence(
     )
     await db.commit()
     return bool(result.rowcount)
-
-
-async def _handle_replanner_message(message, router):
-    event = TripEventArtifact.model_validate(message.content)
-    runtime = (event.payload_summary or {}).get("_runtime") or {}
-    from backend.app.schemas.ai_intent import Coordinate
-
-    current_location = Coordinate.model_validate(runtime.get("current_location"))
-    execution = await ReplannerAgent().run(
-        event,
-        current_location=current_location,
-        completed_stop_ids=[str(item) for item in runtime.get("completed_stop_ids") or []],
-        event_payload=runtime.get("event_payload") or {},
-        weather=runtime.get("weather"),
-    )
-    return router.build(
-        task_id=message.task_id,
-        sender=AgentEndpoint.replanner,
-        receiver=AgentEndpoint.planner,
-        message_type=AgentMessageType.result,
-        artifact_type="replan_directive",
-        content={
-            "directive": execution.output.model_dump(mode="json"),
-            "execution": {
-                "latency_ms": execution.latency_ms,
-                "input_tokens": execution.input_tokens,
-                "output_tokens": execution.output_tokens,
-                "estimated_cost_usd": execution.estimated_cost_usd,
-            },
-        },
-        correlation_id=message.correlation_id,
-        causation_id=message.message_id,
-    )
-
-
-async def run_replanner_agent_worker(bus: RecoverableAgentMessageBus, settings) -> None:
-    """Own the Replanner role in distributed mode; Planner remains a stage owner."""
-    worker = AgentTaskWorker(
-        bus=bus,
-        endpoint=AgentEndpoint.replanner,
-        consumer=f"replanner-{uuid4().hex[:12]}",
-        handler=lambda message: _handle_replanner_message(message, bus.router),
-        max_attempts=settings.agent_message_max_attempts,
-        reclaim_idle_ms=settings.agent_message_reclaim_idle_ms,
-    )
-    while True:
-        result = await worker.run_once(block_ms=1_000)
-        if result == "idle":
-            await asyncio.sleep(0)
 
 
 async def _maintain_lock_lease(
@@ -531,9 +478,6 @@ async def run_worker() -> None:
     map_provider = build_map_provider(settings, client)
     weather_provider = build_weather_provider(client, settings.mock_weather_provider)
     decider = build_agent_decider(settings, client)
-    replanner_task = None
-    if settings.agent_execution_mode == "distributed":
-        replanner_task = asyncio.create_task(run_replanner_agent_worker(agent_bus, settings))
     recovered_trip_events = await store.recover_processing(
         TRIP_EVENTS_QUEUE, settings.worker_recover_processing_limit
     )
@@ -588,12 +532,6 @@ async def run_worker() -> None:
                 metrics.increment("mapgo_worker_location_cleanup_total", value=removed)
             await asyncio.sleep(0)
     finally:
-        if replanner_task is not None:
-            replanner_task.cancel()
-            try:
-                await replanner_task
-            except asyncio.CancelledError:
-                pass
         await client.aclose()
         await store.close()
         await engine.dispose()

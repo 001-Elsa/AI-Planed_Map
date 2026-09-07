@@ -22,8 +22,16 @@ from backend.app.models import (
     TripEvent,
     TripSession,
 )
+from backend.app.schemas.agent_artifacts import (
+    AgentExecutionMode,
+    AgentExecutionPlan,
+    AgentWorkflowMode,
+    AgentWorkflowTrace,
+)
 from backend.app.services.agent_controller import AgentController
 from backend.app.services.agent_decider import AgentDecision, DecisionResult
+from backend.app.services.agent_workflow_state import DurableWorkflowCheckpointStore
+from backend.app.services.dynamic_replanning import DynamicReplanningOrchestrator
 from backend.app.services.plan_versioning import apply_plan_patch_cas
 from backend.app.worker import process_trip_event
 
@@ -189,6 +197,81 @@ async def _exercise_controller(trip_id: int, decider: ScriptedDecider, max_steps
             )
         ).all()
         return result, calls
+
+
+@pytest.mark.asyncio
+async def test_failed_dynamic_workflow_resumes_same_task_graph_node(async_client):
+    _headers, _plan, trip_id = await _active_trip(
+        async_client, "dagresume", "visit museum then shopping mall"
+    )
+    async with SessionLocal() as db:
+        trip = await db.get(TripSession, trip_id)
+        assert trip is not None
+        trigger_type = f"trip_event:resume-{trip_id}"
+        trace = AgentWorkflowTrace(
+            mode=AgentWorkflowMode.enforce,
+            execution_mode=AgentExecutionMode.distributed,
+            task_id=f"trip-{trip_id}-resume-test",
+            execution_plan=AgentExecutionPlan.model_validate(
+                DynamicReplanningOrchestrator._execution_plan("pending")
+            ),
+        )
+        store = await DurableWorkflowCheckpointStore.start(
+            db,
+            trace=trace,
+            user_id=trip.user_id,
+            trigger_type=trigger_type,
+            trace_id="resume-checkpoint-test",
+            planning_run_id=trip.planning_run_id,
+            trip_session_id=trip.id,
+        )
+        assert trace.execution_plan is not None
+        by_key = {step.step_id: step for step in trace.execution_plan.steps}
+        for step_id in ("event_ingest", "supervisor_dispatch", "replanner"):
+            by_key[step_id].status = "succeeded"
+            by_key[step_id].attempt_count = 1
+        by_key["deterministic_replan"].status = "running"
+        by_key["deterministic_replan"].attempt_count = 1
+        await store.checkpoint(trace)
+        await store.fail(trace, reason="UPSTREAM_TIMEOUT")
+        original_workflow_id = trace.workflow_id
+
+        resumed_trace = AgentWorkflowTrace(
+            mode=AgentWorkflowMode.enforce,
+            execution_mode=AgentExecutionMode.distributed,
+            task_id=trace.task_id,
+            execution_plan=AgentExecutionPlan.model_validate(
+                DynamicReplanningOrchestrator._execution_plan("pending")
+            ),
+        )
+        resumed_store, resume_from = await DurableWorkflowCheckpointStore.resume_or_start(
+            db,
+            trace=resumed_trace,
+            user_id=trip.user_id,
+            trigger_type=trigger_type,
+            trace_id="resume-checkpoint-test",
+            planning_run_id=trip.planning_run_id,
+            trip_session_id=trip.id,
+        )
+
+        assert resumed_trace.workflow_id == original_workflow_id
+        assert resume_from == "deterministic_replan"
+        assert resumed_trace.execution_plan is not None
+        resumed = {step.step_id: step for step in resumed_trace.execution_plan.steps}
+        assert resumed["replanner"].status == "succeeded"
+        assert resumed["replanner"].attempt_count == 1
+        assert resumed["deterministic_replan"].status == "retrying"
+        assert resumed["deterministic_replan"].attempt_count == 1
+        assert resumed["deterministic_review"].status == "pending"
+
+        await DynamicReplanningOrchestrator._transition(
+            resumed_trace,
+            resumed_store,
+            "deterministic_replan",
+            "running",
+            begin=True,
+        )
+        assert resumed["deterministic_replan"].attempt_count == 2
 
 
 @pytest.mark.asyncio

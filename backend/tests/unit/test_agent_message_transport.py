@@ -16,6 +16,7 @@ from backend.app.services.agent_transport import (
     RecoverableAgentMessageBus,
     RedisStreamAgentMessageTransport,
     build_agent_message_bus,
+    new_agent_reply_inbox,
 )
 
 
@@ -100,6 +101,9 @@ class _FakePipeline:
     def xadd(self, *args, **kwargs):
         self.operations.append(("xadd", args, kwargs))
 
+    def expire(self, *args, **kwargs):
+        self.operations.append(("expire", args, kwargs))
+
     async def execute(self):
         results = []
         for name, args, kwargs in self.operations:
@@ -117,7 +121,9 @@ class _FakeRedis:
     async def xgroup_create(self, _stream, _group, **_kwargs):
         return True
 
-    async def eval(self, _script, _keys, dedupe_key, stream, _ttl, _maxlen, message):
+    async def eval(
+        self, _script, _keys, dedupe_key, stream, _ttl, _maxlen, message, _targeted
+    ):
         if dedupe_key in self.dedupe:
             return None
         self.dedupe.add(dedupe_key)
@@ -128,6 +134,9 @@ class _FakeRedis:
         entry_id = f"{self.sequence}-0"
         self.streams[stream].append((entry_id, fields))
         return entry_id
+
+    async def expire(self, _stream, _ttl):
+        return True
 
     async def xreadgroup(self, group, _consumer, streams, **_kwargs):
         stream = next(iter(streams))
@@ -264,24 +273,153 @@ def test_replanner_worker_owns_role_and_returns_typed_directive():
             message_type=AgentMessageType.command,
             artifact_type="trip_event_artifact",
             content=event.model_dump(mode="json"),
+            reply_to=new_agent_reply_inbox(),
         )
         await bus.publish(request)
 
-        from backend.app.worker import _handle_replanner_message
+        from backend.app.agent_role_worker import handle_replanner_message
 
         worker = AgentTaskWorker(
             bus=bus,
             endpoint=AgentEndpoint.replanner,
             consumer="replanner-test-worker",
-            handler=lambda message: _handle_replanner_message(message, router),
+            handler=lambda message: handle_replanner_message(message, bus),
         )
         assert await worker.run_once(block_ms=0) == "acked"
 
-        response = await bus.receive(AgentEndpoint.planner, "workflow-test", block_ms=0)
+        response = await bus.receive(
+            AgentEndpoint.planner,
+            "workflow-test",
+            block_ms=0,
+            inbox=request.reply_to,
+        )
         assert response is not None
         assert response.message.sender == AgentEndpoint.replanner
         assert response.message.causation_id == request.message_id
         assert response.message.artifact_type == "replan_directive"
         assert response.message.content["directive"]["strategy"] == "fastest_feasible_route"
+
+    asyncio.run(scenario())
+
+
+def test_redis_reply_inboxes_isolate_concurrent_workflows():
+    async def scenario() -> None:
+        router = AgentMessageRouter()
+        client = _FakeRedis()
+        transport = RedisStreamAgentMessageTransport(client, router=router)
+        bus = RecoverableAgentMessageBus(transport, router)
+        event = TripEventArtifact(
+            trip_id=42,
+            event_id=8,
+            event_type="TrafficChanged",
+            occurred_at=datetime.now(timezone.utc),
+            impact_level="high",
+            reason="traffic incident",
+            payload_summary={
+                "delay_minutes": 25,
+                "_runtime": {
+                    "current_location": Coordinate(lng=120.62, lat=31.32).model_dump(),
+                    "completed_stop_ids": [],
+                    "event_payload": {"delay_minutes": 25},
+                    "weather": None,
+                },
+            },
+            base_plan_version=3,
+        )
+        requests = [
+            router.build(
+                task_id=f"distributed-replanner-{suffix}",
+                sender=AgentEndpoint.supervisor,
+                receiver=AgentEndpoint.replanner,
+                message_type=AgentMessageType.command,
+                artifact_type="trip_event_artifact",
+                content=event.model_dump(mode="json"),
+                reply_to=new_agent_reply_inbox(),
+            )
+            for suffix in ("workflow-a", "workflow-b")
+        ]
+        for request in requests:
+            await bus.publish(request)
+
+        from backend.app.agent_role_worker import handle_replanner_message
+
+        worker = AgentTaskWorker(
+            bus=bus,
+            endpoint=AgentEndpoint.replanner,
+            consumer="replanner-concurrent-worker",
+            handler=lambda message: handle_replanner_message(message, bus),
+        )
+        assert await worker.run_once(block_ms=0) == "acked"
+        assert await worker.run_once(block_ms=0) == "acked"
+
+        response_b = await bus.receive(
+            AgentEndpoint.planner,
+            "workflow-b",
+            block_ms=0,
+            inbox=requests[1].reply_to,
+        )
+        response_a = await bus.receive(
+            AgentEndpoint.planner,
+            "workflow-a",
+            block_ms=0,
+            inbox=requests[0].reply_to,
+        )
+        shared = await bus.receive(AgentEndpoint.planner, "wrong-shared-consumer", block_ms=0)
+
+        assert response_a is not None and response_b is not None
+        assert response_a.message.task_id == requests[0].task_id
+        assert response_b.message.task_id == requests[1].task_id
+        assert response_a.message.causation_id == requests[0].message_id
+        assert response_b.message.causation_id == requests[1].message_id
+        assert shared is None
+        assert await transport.acknowledge(response_a) is True
+        assert await transport.acknowledge(response_b) is True
+
+    asyncio.run(scenario())
+
+
+def test_worker_rejects_response_that_omits_requested_reply_inbox():
+    async def scenario() -> None:
+        router = AgentMessageRouter()
+        transport = InMemoryAgentMessageTransport(router)
+        bus = RecoverableAgentMessageBus(transport, router)
+        request = _planning_message(router).model_copy(
+            update={"reply_to": new_agent_reply_inbox()}
+        )
+        # Rebuild through the router so reply_to is covered by the idempotency key.
+        request = router.build(
+            task_id=request.task_id,
+            sender=request.sender,
+            receiver=request.receiver,
+            message_type=request.message_type,
+            artifact_type=request.artifact_type,
+            content=request.content,
+            reply_to=request.reply_to,
+        )
+        await bus.publish(request)
+
+        async def bad_handler(message):
+            return router.build(
+                task_id=message.task_id,
+                sender=AgentEndpoint.supervisor,
+                receiver=AgentEndpoint.final_answer,
+                message_type=AgentMessageType.result,
+                artifact_type="final_answer",
+                content={"status": "success"},
+                correlation_id=message.correlation_id,
+                causation_id=message.message_id,
+            )
+
+        worker = AgentTaskWorker(
+            bus=bus,
+            endpoint=AgentEndpoint.supervisor,
+            consumer="bad-reply-worker",
+            handler=bad_handler,
+            max_attempts=1,
+        )
+        assert await worker.run_once(block_ms=0) == "dlq"
+        assert await bus.receive(AgentEndpoint.final_answer, "shared-reader", block_ms=0) is None
+        letters = await transport.dead_letters(AgentEndpoint.supervisor)
+        assert letters[0]["error_code"] == "UPSTREAM_ERROR"
 
     asyncio.run(scenario())

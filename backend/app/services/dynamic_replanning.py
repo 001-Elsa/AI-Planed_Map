@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from sqlalchemy import select
@@ -34,6 +34,9 @@ from backend.app.schemas.dynamic_replanning import (
 )
 from backend.app.services.agent_orchestrator import persist_agent_workflow
 from backend.app.services.agent_protocol import AgentMessageRouter
+from backend.app.services.agent_tool_contracts import stable_tool_error
+from backend.app.services.agent_transport import new_agent_reply_inbox
+from backend.app.services.agent_workflow_state import DurableWorkflowCheckpointStore
 from backend.app.services.agents.base import AgentExecution, canonical_hash
 from backend.app.services.agents.replanner_agent import REPLANNER_AGENT_SPEC, ReplannerAgent
 from backend.app.services.plan_versioning import apply_plan_patch_cas
@@ -136,6 +139,8 @@ class DynamicReplanningOrchestrator:
         content,
         prior=None,
         durable=False,
+        reply_to=None,
+        inbox=None,
     ):
         message = self.router.build(
             task_id=trace.task_id,
@@ -146,6 +151,8 @@ class DynamicReplanningOrchestrator:
             content=content,
             correlation_id=prior.correlation_id if prior else None,
             causation_id=prior.message_id if prior else None,
+            reply_to=reply_to,
+            inbox=inbox,
         )
         if durable:
             if self.message_bus is None:
@@ -221,6 +228,8 @@ class DynamicReplanningOrchestrator:
             "deterministic_review": "blocked" if status == "blocked" else "succeeded",
             "final_answer": "succeeded",
         }
+        if status == "pending":
+            step_status = {key: "pending" for key in step_status}
         return {
             "plan_kind": "safety_sensitive_trip",
             "steps": [
@@ -318,6 +327,9 @@ class DynamicReplanningOrchestrator:
         if self.message_bus is None:
             raise RuntimeError("distributed Agent execution requires a message bus")
         consumer = f"workflow-{trace.task_id}"
+        inbox = request_message.reply_to
+        if inbox is None:
+            raise RuntimeError("distributed replanner request is missing its reply inbox")
         deadline = time.monotonic() + self.distributed_timeout_seconds
         delivery = None
         while time.monotonic() < deadline:
@@ -325,12 +337,19 @@ class DynamicReplanningOrchestrator:
                 AgentEndpoint.planner,
                 consumer,
                 block_ms=min(1_000, max(1, int((deadline - time.monotonic()) * 1000))),
+                inbox=inbox,
             )
             if delivery is not None:
                 break
         if delivery is None:
             raise TimeoutError("distributed replanner did not return before workflow timeout")
         try:
+            if delivery.message.inbox != inbox:
+                raise ValueError("distributed replanner response targeted the wrong inbox")
+            if delivery.message.task_id != request_message.task_id:
+                raise ValueError("distributed replanner response has the wrong task id")
+            if delivery.message.correlation_id != request_message.correlation_id:
+                raise ValueError("distributed replanner response has the wrong correlation id")
             if delivery.message.causation_id != request_message.message_id:
                 raise ValueError("distributed replanner response has the wrong causation id")
             content = delivery.message.content
@@ -367,9 +386,37 @@ class DynamicReplanningOrchestrator:
                 delivery.message,
                 task_key="replanner",
             )
+            if not await self.message_bus.transport.acknowledge(delivery):
+                raise RuntimeError("distributed replanner response ACK failed")
             return delivery.message, directive, execution
-        finally:
-            await self.message_bus.transport.acknowledge(delivery)
+        except Exception as exc:
+            await self.message_bus.transport.retry(
+                delivery,
+                error_code=stable_tool_error(exc),
+                max_attempts=1,
+            )
+            raise
+
+    @staticmethod
+    async def _transition(
+        trace: AgentWorkflowTrace,
+        checkpoint_store: DurableWorkflowCheckpointStore,
+        step_id: str,
+        status: Literal[
+            "pending", "running", "retrying", "succeeded", "failed", "blocked", "skipped"
+        ],
+        *,
+        begin: bool = False,
+    ) -> None:
+        if trace.execution_plan is None:
+            raise RuntimeError("dynamic workflow DAG is missing")
+        step = next(item for item in trace.execution_plan.steps if item.step_id == step_id)
+        if step.status == "succeeded":
+            return
+        step.status = status
+        if begin:
+            step.attempt_count += 1
+        await checkpoint_store.checkpoint(trace)
 
     async def run(
         self,
@@ -382,12 +429,59 @@ class DynamicReplanningOrchestrator:
         weather: dict[str, Any] | None,
         trace_id: str | None,
     ) -> dict[str, Any]:
-        started = time.perf_counter()
         trace = AgentWorkflowTrace(
             mode=AgentWorkflowMode.enforce,
             execution_mode=self.execution_mode,
             task_id=f"trip-{trip.id}-event-{event.event_id or uuid4()}",
         )
+        trace.execution_plan = AgentExecutionPlan.model_validate(self._execution_plan("pending"))
+        trigger_type = f"trip_event:{event.event_id or event.event_type[:40]}"
+        checkpoint_store, resume_from_task = (
+            await DurableWorkflowCheckpointStore.resume_or_start(
+                self.db,
+                trace=trace,
+                user_id=trip.user_id,
+                trigger_type=trigger_type,
+                trace_id=trace_id,
+                planning_run_id=trip.planning_run_id,
+                trip_session_id=trip.id,
+            )
+        )
+        try:
+            return await self._execute(
+                trace=trace,
+                checkpoint_store=checkpoint_store,
+                trip=trip,
+                event=event,
+                current_location=current_location,
+                completed_stop_ids=completed_stop_ids,
+                event_payload=event_payload,
+                weather=weather,
+                trace_id=trace_id,
+                trigger_type=trigger_type,
+                resume_from_task=resume_from_task,
+            )
+        except Exception as exc:
+            await checkpoint_store.fail(trace, reason=stable_tool_error(exc))
+            raise
+
+    async def _execute(
+        self,
+        *,
+        trace: AgentWorkflowTrace,
+        checkpoint_store: DurableWorkflowCheckpointStore,
+        trip: TripSession,
+        event: TripEventArtifact,
+        current_location,
+        completed_stop_ids: list[str],
+        event_payload: dict[str, Any],
+        weather: dict[str, Any] | None,
+        trace_id: str | None,
+        trigger_type: str,
+        resume_from_task: str | None,
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        await self._transition(trace, checkpoint_store, "event_ingest", "running", begin=True)
         event_payload_typed = event.model_dump(mode="json")
         m1 = await self._message(
             trace,
@@ -408,6 +502,7 @@ class DynamicReplanningOrchestrator:
             input_payload=event_payload_typed,
             output_payload={"event_type": event.event_type, "event_id": event.event_id},
         )
+        await self._transition(trace, checkpoint_store, "event_ingest", "succeeded")
 
         runtime_summary = {
             "current_location": current_location.model_dump(mode="json"),
@@ -418,6 +513,14 @@ class DynamicReplanningOrchestrator:
         dispatch_event = event.model_copy(
             update={"payload_summary": {**event.payload_summary, "_runtime": runtime_summary}}
         )
+        reply_inbox = (
+            new_agent_reply_inbox()
+            if self.execution_mode == AgentExecutionMode.distributed
+            else None
+        )
+        await self._transition(
+            trace, checkpoint_store, "supervisor_dispatch", "running", begin=True
+        )
         m2 = await self._message(
             trace,
             sender=AgentEndpoint.supervisor,
@@ -427,6 +530,7 @@ class DynamicReplanningOrchestrator:
             content=dispatch_event.model_dump(mode="json"),
             prior=m1,
             durable=self.execution_mode == AgentExecutionMode.distributed,
+            reply_to=reply_inbox,
         )
         self._stage(
             trace,
@@ -443,7 +547,9 @@ class DynamicReplanningOrchestrator:
                 "execution_mode": self.execution_mode.value,
             },
         )
+        await self._transition(trace, checkpoint_store, "supervisor_dispatch", "succeeded")
 
+        await self._transition(trace, checkpoint_store, "replanner", "running", begin=True)
         if self.execution_mode == AgentExecutionMode.distributed:
             m3, directive, replanner_execution = await self._run_distributed_replanner(trace, m2)
         else:
@@ -472,8 +578,12 @@ class DynamicReplanningOrchestrator:
                 m3,
                 task_key="replanner",
             )
+        await self._transition(trace, checkpoint_store, "replanner", "succeeded")
         if directive.base_plan_version != trip.current_plan_version:
             raise ValueError("dynamic replan directive references a stale plan version")
+        await self._transition(
+            trace, checkpoint_store, "deterministic_replan", "running", begin=True
+        )
         result = await create_pending_replan(
             db=self.db,
             trip=trip,
@@ -525,8 +635,14 @@ class DynamicReplanningOrchestrator:
                 "impact": patch_artifact.impact,
             },
         )
+        await self._transition(
+            trace, checkpoint_store, "deterministic_replan", "succeeded"
+        )
 
         # The current formal version remains the only Critic baseline.
+        await self._transition(
+            trace, checkpoint_store, "deterministic_review", "running", begin=True
+        )
         version = await self.db.scalar(
             select(PlanVersion).where(
                 PlanVersion.planning_run_id == trip.planning_run_id,
@@ -560,6 +676,12 @@ class DynamicReplanningOrchestrator:
             status="blocked" if review.verdict == "blocked" else "succeeded",
             reason="critic_blocked_patch" if review.verdict == "blocked" else None,
         )
+        await self._transition(
+            trace,
+            checkpoint_store,
+            "deterministic_review",
+            "blocked" if review.verdict == "blocked" else "succeeded",
+        )
 
         patch_artifact.review = review
         trip_context = json.loads(trip.context_json or "{}")
@@ -589,6 +711,7 @@ class DynamicReplanningOrchestrator:
             "patch_blocked_by_critic" if review.verdict == "blocked" else result["status"]
         )
 
+        await self._transition(trace, checkpoint_store, "final_answer", "running", begin=True)
         await self._message(
             trace,
             sender=AgentEndpoint.supervisor,
@@ -613,20 +736,22 @@ class DynamicReplanningOrchestrator:
                 "patch_id": patch_artifact.patch_id,
             },
         )
+        await self._transition(trace, checkpoint_store, "final_answer", "succeeded")
         trace.status = "blocked" if review.verdict == "blocked" else "succeeded"
-        trace.execution_plan = AgentExecutionPlan.model_validate(self._execution_plan(trace.status))
+        await checkpoint_store.checkpoint(trace)
         workflow = await persist_agent_workflow(
             self.db,
             user_id=trip.user_id,
             trace_id=trace_id,
             trace=trace,
-            trigger_type=f"trip_event:{event.event_type}",
+            trigger_type=trigger_type,
             planning_run_id=trip.planning_run_id,
             trip_session_id=trip.id,
         )
         await self.db.commit()
         result["workflow_id"] = workflow.id
         result["workflow_task_id"] = trace.task_id
+        result["resumed_from_task"] = resume_from_task
         if (
             result["auto_apply_eligible"]
             and auto_apply_opt_in

@@ -30,7 +30,7 @@ from backend.app.services.agent_planning_tools import SearchPoiTool
 from backend.app.services.agent_tool_adapters import AgentToolRuntime
 from backend.app.services.agent_tool_contracts import SearchPoiArgs, ToolResultEnvelope
 from backend.app.services.agent_tool_registry import TOOL_REGISTRY, InvocationMode
-from backend.app.services.agents.base import AgentExecution, canonical_hash
+from backend.app.services.agents.base import AgentExecution, audited_tool_call, canonical_hash
 
 POI_RECOVERY_CACHE_LIMIT = 128
 _POI_RECOVERY_CACHE: OrderedDict[str, list[PoiCandidate]] = OrderedDict()
@@ -100,16 +100,26 @@ class SearchAgent:
     ) -> AgentExecution[SearchArtifact]:
         started = time.perf_counter()
         keywords = [self._recall_keyword(task, context.intent) for task in context.intent.tasks]
+        initial_arguments = [
+            SearchPoiArgs(keyword=keyword, origin=context.origin, city=context.city)
+            for keyword in keywords
+        ]
         calls = await asyncio.gather(
-            *(
-                self.search_tool.execute(
-                    SearchPoiArgs(keyword=keyword, origin=context.origin, city=context.city)
-                )
-                for keyword in keywords
-            )
+            *(self.search_tool.execute(arguments) for arguments in initial_arguments)
         )
         results: list[list[PoiCandidate] | None] = [None] * len(keywords)
         tool_results: list[ToolResultEnvelope] = []
+        tool_calls = [
+            audited_tool_call(
+                "search_poi",
+                arguments.model_dump(mode="json"),
+                success=call.result.success,
+                output=call.result.data,
+                provider=call.result.source,
+                error_type=call.result.error_code,
+            )
+            for arguments, call in zip(initial_arguments, calls, strict=True)
+        ]
         failures: list[tuple[int, str]] = []
         for index, call in enumerate(calls):
             tool_results.append(call.result)
@@ -160,6 +170,20 @@ class SearchAgent:
                         )
                     )
                     tool_results.append(retry.result)
+                    tool_calls.append(
+                        audited_tool_call(
+                            "search_poi",
+                            SearchPoiArgs(
+                                keyword=keywords[index],
+                                origin=context.origin,
+                                city=context.city,
+                            ).model_dump(mode="json"),
+                            success=retry.result.success,
+                            output=retry.result.data,
+                            provider=retry.result.source,
+                            error_type=retry.result.error_code,
+                        )
+                    )
                     if retry.data is None:
                         error_code = retry.result.error_code or "UPSTREAM_ERROR"
                         continue
@@ -224,6 +248,7 @@ class SearchAgent:
             latency_ms=int((time.perf_counter() - started) * 1000),
             fallback_used=bool(recovery_actions),
             reason="search_retry_or_cache_recovery" if recovery_actions else None,
+            tool_calls=tuple(tool_calls),
         )
 
     @staticmethod

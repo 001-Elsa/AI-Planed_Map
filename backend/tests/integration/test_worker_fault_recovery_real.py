@@ -7,6 +7,7 @@ import pytest
 from sqlalchemy import delete
 from sqlalchemy import event as sqlalchemy_event
 
+from backend.app.agent_role_worker import handle_replanner_message
 from backend.app.core.config import get_settings
 from backend.app.db.session import SessionLocal, engine
 from backend.app.infrastructure.runtime_store import (
@@ -19,9 +20,14 @@ from backend.app.schemas.agent_artifacts import (
     AgentEndpoint,
     AgentMessageType,
 )
-from backend.app.schemas.ai_intent import AIPlanRequest
+from backend.app.schemas.ai_intent import AIPlanRequest, Coordinate
+from backend.app.schemas.dynamic_replanning import TripEventArtifact
 from backend.app.services.agent_protocol import AgentMessageRouter
-from backend.app.services.agent_transport import RedisStreamAgentMessageTransport
+from backend.app.services.agent_transport import (
+    RecoverableAgentMessageBus,
+    RedisStreamAgentMessageTransport,
+    new_agent_reply_inbox,
+)
 from backend.app.worker import (
     TRIP_EVENTS_QUEUE,
     WorkerFenceRejectedError,
@@ -200,6 +206,88 @@ async def test_real_redis_stream_pending_entry_is_reclaimed() -> None:
             f"{stream_prefix}:supervisor:dlq",
             f"{stream_prefix}:dedupe:{message.idempotency_key}",
         )
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_real_redis_reply_inboxes_isolate_concurrent_workflows() -> None:
+    suffix = uuid4().hex
+    store = await _redis_store()
+    stream_prefix = f"reply-isolation:agent:{suffix}"
+    group_prefix = f"reply-isolation:group:{suffix}"
+    router = AgentMessageRouter()
+    transport = RedisStreamAgentMessageTransport(
+        store.client,
+        router=router,
+        stream_prefix=stream_prefix,
+        group_prefix=group_prefix,
+        idempotency_ttl_seconds=60,
+    )
+    bus = RecoverableAgentMessageBus(transport, router)
+    event = TripEventArtifact(
+        trip_id=42,
+        event_id=9,
+        event_type="TrafficChanged",
+        occurred_at=datetime.now(timezone.utc),
+        impact_level="high",
+        reason="traffic incident",
+        payload_summary={
+            "_runtime": {
+                "current_location": Coordinate(lng=120.62, lat=31.32).model_dump(),
+                "completed_stop_ids": [],
+                "event_payload": {"delay_minutes": 25},
+                "weather": None,
+            }
+        },
+        base_plan_version=3,
+    )
+    requests = [
+        router.build(
+            task_id=f"redis-reply-{suffix}-{index}",
+            sender=AgentEndpoint.supervisor,
+            receiver=AgentEndpoint.replanner,
+            message_type=AgentMessageType.command,
+            artifact_type="trip_event_artifact",
+            content=event.model_dump(mode="json"),
+            reply_to=new_agent_reply_inbox(),
+        )
+        for index in range(2)
+    ]
+    responses = [await handle_replanner_message(request, bus) for request in requests]
+    try:
+        assert (await transport.publish(responses[1])).status == "published"
+        assert (await transport.publish(responses[0])).status == "published"
+        deliveries = [
+            await transport.receive(
+                AgentEndpoint.planner,
+                f"workflow-{index}",
+                block_ms=100,
+                inbox=request.reply_to,
+            )
+            for index, request in enumerate(requests)
+        ]
+        assert all(delivery is not None for delivery in deliveries)
+        assert [delivery.message.task_id for delivery in deliveries if delivery] == [
+            request.task_id for request in requests
+        ]
+        assert (
+            await transport.receive(AgentEndpoint.planner, "shared-reader", block_ms=10)
+            is None
+        )
+        for delivery in deliveries:
+            assert delivery is not None and await transport.acknowledge(delivery)
+    finally:
+        keys = []
+        for request, response in zip(requests, responses, strict=True):
+            keys.extend(
+                [
+                    f"{stream_prefix}:planner:inbox:{request.reply_to}",
+                    f"{stream_prefix}:planner:inbox:{request.reply_to}:dlq",
+                    f"{stream_prefix}:dedupe:{response.idempotency_key}",
+                ]
+            )
+        keys.append(f"{stream_prefix}:planner")
+        await store.client.delete(*keys)
         await store.close()
 
 

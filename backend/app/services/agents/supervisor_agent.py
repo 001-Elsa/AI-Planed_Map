@@ -215,6 +215,7 @@ class SupervisorAgent:
                 AgentPlanStep(
                     step_id="weather",
                     agent_type=AgentType.safety,
+                    execution_kind="stage",
                     responsibility="query_weather_risk_for_time_windows",
                     status="pending",
                     depends_on=["intent"],

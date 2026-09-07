@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 
+from backend.app.clients.weather_client import WeatherSnapshot
 from backend.app.schemas.agent_artifacts import (
     AgentBudget,
     AgentSpec,
@@ -14,7 +15,7 @@ from backend.app.schemas.agent_artifacts import (
 )
 from backend.app.schemas.ai_intent import PlanningIntent, PoiCandidate
 from backend.app.services.agent_tool_registry import TOOL_REGISTRY, DataScope, InvocationMode
-from backend.app.services.agents.base import AgentExecution, canonical_hash
+from backend.app.services.agents.base import AgentExecution, audited_tool_call, canonical_hash
 
 SAFETY_AGENT_SPEC = AgentSpec(
     agent_type=AgentType.safety,
@@ -33,7 +34,11 @@ class SafetyAgent:
     spec = SAFETY_AGENT_SPEC
 
     async def run(
-        self, *, intent: PlanningIntent, candidates: list[list[PoiCandidate]]
+        self,
+        *,
+        intent: PlanningIntent,
+        candidates: list[list[PoiCandidate]],
+        weather: WeatherSnapshot | None = None,
     ) -> AgentExecution[SafetyCheckReport]:
         started = time.perf_counter()
         TOOL_REGISTRY.authorize(
@@ -77,6 +82,15 @@ class SafetyAgent:
                         evidence_refs=[f"candidate_group:{index}" for index in unknown_groups[:5]],
                     )
                 )
+        if weather is not None and weather.precipitation_probability >= 60:
+            findings.append(
+                ReviewFinding(
+                    code="high_precipitation_risk",
+                    severity="warning",
+                    message="降水概率较高，路线应预留室内等候和步行缓冲时间。",
+                    evidence_refs=["weather:precipitation_probability"],
+                )
+            )
         verdict = "passed_with_warnings" if findings else "passed"
         report = SafetyCheckReport(
             verdict=verdict,
@@ -93,13 +107,18 @@ class SafetyAgent:
             producer_agent=AgentType.safety,
             payload=report.model_dump(mode="json"),
             confidence=report.confidence,
-            evidence_refs=["intent:user_requirement", "search:poi_candidates"],
+            evidence_refs=[
+                "intent:user_requirement",
+                "search:poi_candidates",
+                *(["weather:current"] if weather is not None else []),
+            ],
             input_hash=canonical_hash(
                 {
                     "intent": intent.model_dump(mode="json"),
                     "candidates": [
                         [item.model_dump(mode="json") for item in group] for group in candidates
                     ],
+                    "weather": weather.model_dump(mode="json") if weather else None,
                 }
             ),
         )
@@ -108,4 +127,17 @@ class SafetyAgent:
             output=report,
             artifact=artifact,
             latency_ms=int((time.perf_counter() - started) * 1000),
+            tool_calls=(
+                audited_tool_call(
+                    "check_travel_safety",
+                    {
+                        "party": party.model_dump(mode="json"),
+                        "route_constraints": intent.constraints.model_dump(mode="json"),
+                    },
+                    success=True,
+                    output={"verdict": report.verdict, "finding_count": len(report.findings)},
+                    provider="mapgo-rule-safety",
+                    latency_ms=int((time.perf_counter() - started) * 1000),
+                ),
+            ),
         )

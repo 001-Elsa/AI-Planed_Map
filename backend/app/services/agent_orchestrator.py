@@ -2,34 +2,44 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from collections import deque
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.app.clients.weather_client import WeatherProvider, WeatherSnapshot
 from backend.app.core.config import Settings
 from backend.app.models import (
     AgentArtifact,
     AgentHandoff,
     AgentRun,
     AgentSharedStateSnapshot,
+    AgentToolCall,
     AgentWorkflowRun,
     AgentWorkflowTask,
 )
 from backend.app.models import AgentMessage as AgentMessageRecord
 from backend.app.schemas.agent_artifacts import (
     AgentEndpoint,
+    AgentExecutionMode,
     AgentExecutionPlan,
     AgentMessage,
     AgentMessageType,
+    AgentPlanStep,
     AgentRecoveryDecision,
+    AgentStageTrace,
     AgentStepTrace,
+    AgentToolCallAudit,
     AgentType,
     AgentWorkflowMode,
     AgentWorkflowTrace,
+    ArtifactEnvelope,
     ReviewReport,
     SafetyCheckReport,
     minimize_agent_payload,
@@ -40,6 +50,11 @@ from backend.app.services.agent_context import build_critic_context, build_plann
 from backend.app.services.agent_protocol import AgentMessageRouter, AgentProtocolError
 from backend.app.services.agent_shared_state import AgentSharedStateManager
 from backend.app.services.agent_tool_contracts import stable_tool_error
+from backend.app.services.agent_transport import (
+    RecoverableAgentMessageBus,
+    new_agent_reply_inbox,
+)
+from backend.app.services.agent_workflow_state import DurableWorkflowCheckpointStore
 from backend.app.services.agents.base import AgentExecution, canonical_hash
 from backend.app.services.agents.critic_agent import CriticAgent
 from backend.app.services.agents.intent_agent import IntentAgent
@@ -63,6 +78,9 @@ class PlanningAgentOrchestrator:
         planner_agent: PlannerAgent,
         critic_agent: CriticAgent,
         shared_state: AgentSharedStateManager,
+        weather_provider: WeatherProvider,
+        checkpoint_store: DurableWorkflowCheckpointStore | None = None,
+        message_bus: RecoverableAgentMessageBus | None = None,
     ) -> None:
         self.settings = settings
         self.supervisor_agent = supervisor_agent
@@ -72,13 +90,23 @@ class PlanningAgentOrchestrator:
         self.planner_agent = planner_agent
         self.critic_agent = critic_agent
         self.shared_state = shared_state
+        self.weather_provider = weather_provider
+        self.checkpoint_store = checkpoint_store
+        self.message_bus = message_bus
         try:
             configured_mode = AgentWorkflowMode(settings.plan_critic_mode.lower())
         except ValueError:
             configured_mode = AgentWorkflowMode.shadow
         self.mode = configured_mode if settings.multi_agent_enabled else AgentWorkflowMode.off
         self.router = AgentMessageRouter()
-        self.trace = AgentWorkflowTrace(mode=self.mode, task_id=f"plan-{uuid4()}")
+        execution_mode = AgentExecutionMode(settings.agent_execution_mode)
+        if execution_mode == AgentExecutionMode.distributed and message_bus is None:
+            raise ValueError("distributed planning requires an Agent message bus")
+        self.trace = AgentWorkflowTrace(
+            mode=self.mode,
+            execution_mode=execution_mode,
+            task_id=f"plan-{uuid4()}",
+        )
         self._pending: dict[AgentEndpoint, deque[AgentMessage]] = {}
         self._active_inputs: dict[AgentEndpoint, AgentMessage] = {}
         self.execution_plan: AgentExecutionPlan | None = None
@@ -128,6 +156,86 @@ class PlanningAgentOrchestrator:
         self._active_inputs[receiver] = message
         return message
 
+    async def _run_remote_agent(
+        self,
+        *,
+        endpoint: AgentEndpoint,
+        request_artifact_type: str,
+        response_artifact_type: str,
+        context: dict[str, Any],
+        spec,
+        output_model,
+    ) -> AgentExecution[Any]:
+        if self.message_bus is None:
+            raise RuntimeError("distributed Agent execution requires a message bus")
+        inbox = new_agent_reply_inbox()
+        request = self.message_bus.router.build(
+            task_id=self.trace.task_id,
+            sender=AgentEndpoint.supervisor,
+            receiver=endpoint,
+            message_type=AgentMessageType.command,
+            artifact_type=request_artifact_type,
+            content={"context": context},
+            reply_to=inbox,
+        )
+        published = await self.message_bus.publish(request)
+        self.trace.messages.append(self.message_bus.router.audit(request, published.status))
+        consumer = f"workflow-{self.trace.task_id}-{endpoint.value}"
+        deadline = time.monotonic() + self.settings.agent_stage_timeout_seconds
+        delivery = None
+        while time.monotonic() < deadline:
+            delivery = await self.message_bus.receive(
+                AgentEndpoint.supervisor,
+                consumer,
+                block_ms=min(1_000, max(1, int((deadline - time.monotonic()) * 1_000))),
+                inbox=inbox,
+            )
+            if delivery is not None:
+                break
+        if delivery is None:
+            raise TimeoutError(f"distributed {endpoint.value} did not return before timeout")
+        try:
+            response = delivery.message
+            if response.inbox != inbox:
+                raise ValueError("distributed Agent response targeted the wrong inbox")
+            if response.task_id != request.task_id:
+                raise ValueError("distributed Agent response has the wrong task id")
+            if response.correlation_id != request.correlation_id:
+                raise ValueError("distributed Agent response has the wrong correlation id")
+            if response.causation_id != request.message_id:
+                raise ValueError("distributed Agent response has the wrong causation id")
+            if response.sender != endpoint or response.artifact_type != response_artifact_type:
+                raise ValueError("distributed Agent response has the wrong role or artifact type")
+            payload = response.content
+            metrics_payload = payload["metrics"]
+            execution = AgentExecution(
+                spec=spec,
+                output=output_model.model_validate(payload["output"]),
+                artifact=ArtifactEnvelope.model_validate(payload["artifact"]),
+                latency_ms=int(metrics_payload["latency_ms"]),
+                input_tokens=int(metrics_payload["input_tokens"]),
+                output_tokens=int(metrics_payload["output_tokens"]),
+                estimated_cost_usd=float(metrics_payload["estimated_cost_usd"]),
+                fallback_used=bool(metrics_payload["fallback_used"]),
+                reason=metrics_payload["reason"],
+                tool_calls=tuple(
+                    AgentToolCallAudit.model_validate(item)
+                    for item in payload.get("tool_calls", [])
+                ),
+                tool_audit_complete=bool(payload.get("tool_audit_complete")),
+            )
+            if not await self.message_bus.transport.acknowledge(delivery):
+                raise RuntimeError("distributed Agent response ACK failed")
+            self.trace.messages.append(self.message_bus.router.audit(response, "acked"))
+            return execution
+        except Exception as exc:
+            await self.message_bus.transport.retry(
+                delivery,
+                error_code=stable_tool_error(exc),
+                max_attempts=1,
+            )
+            raise
+
     def _record(
         self,
         execution: AgentExecution[Any],
@@ -135,6 +243,7 @@ class PlanningAgentOrchestrator:
         *,
         input_message: AgentMessage | None = None,
         output_message: AgentMessage | None = None,
+        task_key: str | None = None,
     ) -> None:
         cost = execution.estimated_cost_usd
         if not cost and (execution.input_tokens or execution.output_tokens):
@@ -144,6 +253,7 @@ class PlanningAgentOrchestrator:
             ) / 1_000_000
         self.trace.steps.append(
             AgentStepTrace(
+                task_key=task_key,
                 agent_type=execution.spec.agent_type,
                 status="fallback" if execution.fallback_used else "succeeded",
                 prompt_version=execution.spec.prompt_version,
@@ -158,10 +268,69 @@ class PlanningAgentOrchestrator:
                 reason=execution.reason,
                 input_message_id=input_message.message_id if input_message else None,
                 output_message_id=output_message.message_id if output_message else None,
+                tool_calls=list(execution.tool_calls),
+                tool_audit_complete=execution.tool_audit_complete,
             )
         )
         self.trace.handoff_count += 1
         self.trace.total_cost_usd += cost
+
+    def _plan_step(self, step_id: str) -> AgentPlanStep | None:
+        if self.execution_plan is None:
+            raise AgentProtocolError("Supervisor task graph has not been created")
+        return next(
+            (step for step in self.execution_plan.steps if step.step_id == step_id),
+            None,
+        )
+
+    def _set_plan_status(
+        self,
+        step_id: str,
+        status: Literal[
+            "pending", "running", "retrying", "succeeded", "failed", "blocked", "skipped"
+        ],
+        *,
+        begin: bool = False,
+    ) -> None:
+        if self.execution_plan is None:
+            return
+        step = self._plan_step(step_id)
+        if step is None:
+            return
+        step.status = status
+        if begin:
+            step.attempt_count += 1
+
+    async def checkpoint(self) -> None:
+        if self.checkpoint_store is None:
+            return
+        if self.state_revision >= 0:
+            self.trace.shared_state = (
+                await self.shared_state.audit(self.trace.task_id)
+            ).model_dump(mode="json")
+        await self.checkpoint_store.checkpoint(self.trace)
+
+    async def fail(self, exc: Exception) -> None:
+        if self.checkpoint_store is None:
+            return
+        if self.state_revision >= 0:
+            state = await self.shared_state.update(
+                self.trace.task_id,
+                actor=AgentType.supervisor,
+                expected_revision=self.state_revision,
+                action="workflow_failed",
+                changes={
+                    "execution_context": {
+                        "status": "failed",
+                        "error_code": stable_tool_error(exc),
+                    }
+                },
+            )
+            self.state_revision = state.revision
+            self.trace.shared_state = (
+                await self.shared_state.audit(self.trace.task_id)
+            ).model_dump(mode="json")
+        await self.checkpoint_store.fail(self.trace, reason=stable_tool_error(exc))
 
     async def start(self, request: AIPlanRequest) -> None:
         state = await self.shared_state.initialize(self.trace.task_id)
@@ -191,6 +360,7 @@ class PlanningAgentOrchestrator:
             input_message=inbound,
             output_message=outbound,
         )
+        await self.checkpoint()
 
     async def understand(self, request: AIPlanRequest):
         inbound = self._consume(AgentEndpoint.intent, frozenset({"planning_request"}))
@@ -233,7 +403,9 @@ class PlanningAgentOrchestrator:
             "planning_request",
             input_message=inbound,
             output_message=outbound,
+            task_key="intent",
         )
+        await self.checkpoint()
         return execution.output
 
     async def plan_next(self, fallback_intent: PlanningIntent) -> AgentExecutionPlan:
@@ -252,6 +424,8 @@ class PlanningAgentOrchestrator:
         execution = await self.supervisor_agent.plan(view.user_requirement, mode=self.mode)
         plan = AgentExecutionPlan.model_validate(execution.output)
         self.execution_plan = plan
+        self.trace.execution_plan = plan
+        self._set_plan_status("intent", "succeeded", begin=True)
         outbound = self._dispatch(
             sender=AgentEndpoint.supervisor,
             receiver=AgentEndpoint.search,
@@ -273,6 +447,7 @@ class PlanningAgentOrchestrator:
             input_message=inbound,
             output_message=outbound,
         )
+        await self.checkpoint()
         return plan
 
     async def run_search(
@@ -337,6 +512,7 @@ class PlanningAgentOrchestrator:
             "intent_artifact",
             input_message=inbound,
             output_message=outbound,
+            task_key="search",
         )
         return execution.output
 
@@ -356,12 +532,148 @@ class PlanningAgentOrchestrator:
         executable_steps = {step.step_id for step in self.execution_plan.steps}
         if not {"search", "planner"}.issubset(executable_steps):
             raise AgentProtocolError("Supervisor task graph is missing required planning stages")
-        search = await self.run_search(request, intent)
-        if "safety_check" in executable_steps:
-            await self.check_safety()
-        return await self.run_planner(request, intent, search)
 
-    async def check_safety(self) -> SafetyCheckReport:
+        subgraph = [
+            step
+            for step in self.execution_plan.steps
+            if step.step_id not in {"intent", "critic", "final_answer"}
+        ]
+        for step in subgraph:
+            step.status = "retrying" if step.attempt_count else "pending"
+        await self.checkpoint()
+        completed = {"intent"}
+        outputs: dict[str, Any] = {"intent": intent}
+        pending = {step.step_id for step in subgraph}
+
+        while pending:
+            ready = [
+                step
+                for step in subgraph
+                if step.step_id in pending and set(step.depends_on).issubset(completed)
+            ]
+            if not ready:
+                blocked = sorted(pending)
+                for step_id in blocked:
+                    self._set_plan_status(step_id, "blocked")
+                raise AgentProtocolError(
+                    f"Supervisor task graph cannot make progress; blocked tasks: {blocked}"
+                )
+            for step in ready:
+                self._set_plan_status(step.step_id, "running", begin=True)
+            await self.checkpoint()
+            results = await asyncio.gather(
+                *(
+                    self._execute_plan_step(step.step_id, request, intent, outputs)
+                    for step in ready
+                ),
+                return_exceptions=True,
+            )
+            failure: BaseException | None = None
+            for step, result in zip(ready, results, strict=True):
+                pending.remove(step.step_id)
+                if isinstance(result, BaseException):
+                    self._set_plan_status(step.step_id, "failed")
+                    failure = failure or result
+                else:
+                    outputs[step.step_id] = result
+                    completed.add(step.step_id)
+                    self._set_plan_status(step.step_id, "succeeded")
+            if failure is not None:
+                for step_id in pending:
+                    self._set_plan_status(step_id, "blocked")
+                await self.checkpoint()
+                raise failure
+            await self.checkpoint()
+
+        result = outputs.get("planner")
+        if not isinstance(result, AIPlanResult):
+            raise AgentProtocolError("Supervisor task graph did not produce a planner result")
+        return result
+
+    async def _execute_plan_step(
+        self,
+        step_id: str,
+        request: AIPlanRequest,
+        intent: PlanningIntent,
+        outputs: dict[str, Any],
+    ) -> Any:
+        if step_id == "search":
+            return await self.run_search(request, intent)
+        if step_id == "weather":
+            return await self.run_weather(request, intent)
+        if step_id == "safety_check":
+            return await self.check_safety(weather=outputs.get("weather"))
+        if step_id == "planner":
+            search = outputs.get("search")
+            if not isinstance(search, SearchArtifact):
+                raise AgentProtocolError("planner dependency search did not produce an artifact")
+            return await self.run_planner(
+                request,
+                intent,
+                search,
+                weather=outputs.get("weather"),
+            )
+        raise AgentProtocolError(f"unsupported Supervisor task graph node: {step_id}")
+
+    async def run_weather(self, request: AIPlanRequest, intent: PlanningIntent) -> WeatherSnapshot:
+        if request.origin is None:
+            raise AgentProtocolError("weather context is missing the confirmed origin")
+        started = time.perf_counter()
+        weather_step = self._plan_step("weather")
+        if weather_step is None:
+            raise AgentProtocolError("weather task is not present in the Supervisor graph")
+        attempt = weather_step.attempt_count
+        input_payload = {
+            "origin": request.origin.model_dump(mode="json"),
+            "uncertain_constraints": [
+                item.model_dump(mode="json") for item in intent.constraints.uncertain
+            ],
+        }
+        try:
+            snapshot = await asyncio.wait_for(
+                self.weather_provider.current(request.origin),
+                timeout=self.settings.agent_stage_timeout_seconds,
+            )
+        except Exception as exc:
+            error = stable_tool_error(exc)
+            self.trace.stages.append(
+                AgentStageTrace(
+                    stage_key="weather",
+                    stage_type="deterministic",
+                    owner_agent=AgentType.safety,
+                    status="failed",
+                    depends_on=weather_step.depends_on,
+                    input_artifact_type="intent_artifact",
+                    output_artifact_type="weather_evidence",
+                    input_hash=canonical_hash(input_payload),
+                    output_hash=canonical_hash({"error": error}),
+                    summary={"error_code": error},
+                    latency_ms=int((time.perf_counter() - started) * 1000),
+                    attempt_count=attempt,
+                    reason=error,
+                )
+            )
+            raise
+        payload = snapshot.model_dump(mode="json")
+        self.trace.stages.append(
+            AgentStageTrace(
+                stage_key="weather",
+                stage_type="deterministic",
+                owner_agent=AgentType.safety,
+                status="succeeded",
+                depends_on=weather_step.depends_on,
+                input_artifact_type="intent_artifact",
+                output_artifact_type="weather_evidence",
+                input_hash=canonical_hash(input_payload),
+                output_hash=canonical_hash(payload),
+                summary=payload,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                attempt_count=attempt,
+            )
+        )
+        return snapshot
+
+    async def check_safety(self, *, weather: WeatherSnapshot | None = None) -> SafetyCheckReport:
         inbound = self._consume(AgentEndpoint.safety, frozenset({"search_artifact"}))
         view = await self.shared_state.read_for_agent(self.trace.task_id, AgentType.safety)
         if view.revision != int(inbound.content.get("state_revision", -1)):
@@ -374,6 +686,7 @@ class PlanningAgentOrchestrator:
         execution = await self.safety_agent.run(
             intent=view.user_requirement,
             candidates=candidates,
+            weather=weather,
         )
         state = await self.shared_state.update(
             self.trace.task_id,
@@ -407,6 +720,7 @@ class PlanningAgentOrchestrator:
             "search_artifact",
             input_message=inbound,
             output_message=outbound,
+            task_key="safety_check",
         )
         return execution.output
 
@@ -415,6 +729,8 @@ class PlanningAgentOrchestrator:
         request: AIPlanRequest,
         fallback_intent: PlanningIntent,
         search: SearchArtifact,
+        *,
+        weather: WeatherSnapshot | None = None,
     ) -> AIPlanResult:
         inbound = self._consume(
             AgentEndpoint.planner, frozenset({"search_artifact", "safety_report"})
@@ -430,8 +746,19 @@ class PlanningAgentOrchestrator:
             city=request.city,
             max_candidates_per_task=request.max_candidates_per_task,
             fallback_intent=fallback_intent,
+            weather=weather,
         )
-        execution = await self.planner_agent.run(context)
+        if self.trace.execution_mode == AgentExecutionMode.distributed:
+            execution = await self._run_remote_agent(
+                endpoint=AgentEndpoint.planner,
+                request_artifact_type="planner_context",
+                response_artifact_type="planner_execution",
+                context=context.model_dump(mode="json"),
+                spec=self.planner_agent.spec,
+                output_model=AIPlanResult,
+            )
+        else:
+            execution = await self.planner_agent.run(context)
         result = execution.output
         formal_plan = result.model_dump(mode="json", exclude={"critic_review", "agent_workflow"})
         state = await self.shared_state.update(
@@ -465,6 +792,7 @@ class PlanningAgentOrchestrator:
             inbound.artifact_type,
             input_message=inbound,
             output_message=outbound,
+            task_key="planner",
         )
         return result
 
@@ -477,14 +805,35 @@ class PlanningAgentOrchestrator:
 
     async def review(self, plan: dict[str, Any]) -> ReviewReport | None:
         if not self.may_run_critic():
+            self._set_plan_status("critic", "skipped")
+            await self.checkpoint()
             return None
+        self._set_plan_status("critic", "running", begin=True)
+        await self.checkpoint()
         inbound = self._consume(AgentEndpoint.critic, frozenset({"plan_candidate"}))
         view = await self.shared_state.read_for_agent(self.trace.task_id, AgentType.critic)
         context = build_critic_context(view=view, message=inbound, plan=plan)
-        execution = await self.critic_agent.run(context)
+        try:
+            if self.trace.execution_mode == AgentExecutionMode.distributed:
+                execution = await self._run_remote_agent(
+                    endpoint=AgentEndpoint.critic,
+                    request_artifact_type="critic_context",
+                    response_artifact_type="critic_execution",
+                    context=context.model_dump(mode="json"),
+                    spec=self.critic_agent.spec,
+                    output_model=ReviewReport,
+                )
+            else:
+                execution = await self.critic_agent.run(context)
+        except Exception:
+            self._set_plan_status("critic", "failed")
+            await self.checkpoint()
+            raise
         projected = self.trace.total_cost_usd + execution.estimated_cost_usd
         if projected > self.settings.max_agent_workflow_cost_usd:
             self.trace.status = "budget_exceeded"
+            self._set_plan_status("critic", "failed")
+            await self.checkpoint()
             return None
         state = await self.shared_state.update(
             self.trace.task_id,
@@ -516,7 +865,10 @@ class PlanningAgentOrchestrator:
             "plan_candidate",
             input_message=inbound,
             output_message=outbound,
+            task_key="critic",
         )
+        self._set_plan_status("critic", "succeeded")
+        await self.checkpoint()
         return execution.output
 
     async def apply_soft_adjustments(
@@ -528,6 +880,10 @@ class PlanningAgentOrchestrator:
         for key, value in review.suggested_adjustments.updates().items():
             setattr(adjusted.preferences.weights, key, value)
         self.trace.retry_count += 1
+        for step_id in ("search", "weather", "safety_check", "planner", "critic"):
+            step = self._plan_step(step_id)
+            if step is not None and step.status == "succeeded":
+                step.status = "retrying"
         inbound = self._consume(AgentEndpoint.supervisor, frozenset({"review_report"}))
         supervisor_view = await self.shared_state.read_for_agent(
             self.trace.task_id, AgentType.supervisor
@@ -561,6 +917,7 @@ class PlanningAgentOrchestrator:
             correlation_id=inbound.correlation_id,
             causation_id=inbound.message_id,
         )
+        await self.checkpoint()
         return adjusted
 
     def retry_allowed(self) -> bool:
@@ -631,9 +988,12 @@ class PlanningAgentOrchestrator:
         )
         self.state_revision = state.revision
         self._record(execution, "recovery_event", input_message=inbound)
+        await self.checkpoint()
         return decision
 
     async def finalize(self, result: dict[str, Any]) -> None:
+        self._set_plan_status("final_answer", "running", begin=True)
+        await self.checkpoint()
         queue = self._pending.get(AgentEndpoint.supervisor)
         inbound = queue.popleft() if queue else None
         if queue is not None and not queue:
@@ -673,10 +1033,13 @@ class PlanningAgentOrchestrator:
             "plan_candidate",
             input_message=inbound,
             output_message=outbound,
+            task_key="final_answer",
         )
+        self._set_plan_status("final_answer", "succeeded")
         self.trace.shared_state = (await self.shared_state.audit(self.trace.task_id)).model_dump(
             mode="json"
         )
+        await self.checkpoint()
 
     def finish(self, status: str) -> AgentWorkflowTrace:
         if self.trace.status == "running":
@@ -699,46 +1062,66 @@ async def persist_agent_workflow(
     trip_session_id: int | None = None,
 ) -> AgentWorkflowRun:
     now = datetime.now(timezone.utc)
-    workflow = AgentWorkflowRun(
-        user_id=user_id,
-        planning_conversation_id=planning_conversation_id,
-        planning_run_id=planning_run_id,
-        trip_session_id=trip_session_id,
-        trigger_type=trigger_type,
-        mode=trace.mode.value,
-        execution_mode=trace.execution_mode.value,
-        status=trace.status,
-        trace_id=trace_id,
-        handoff_count=trace.handoff_count,
-        retry_count=trace.retry_count,
-        estimated_cost_usd=trace.total_cost_usd,
-        completed_at=now,
-    )
-    db.add(workflow)
-    await db.flush()
+    workflow = await db.get(AgentWorkflowRun, trace.workflow_id) if trace.workflow_id else None
+    if workflow is None:
+        workflow = AgentWorkflowRun(
+            user_id=user_id,
+            planning_conversation_id=planning_conversation_id,
+            planning_run_id=planning_run_id,
+            trip_session_id=trip_session_id,
+            trigger_type=trigger_type,
+            mode=trace.mode.value,
+            execution_mode=trace.execution_mode.value,
+            status=trace.status,
+            trace_id=trace_id,
+            handoff_count=trace.handoff_count,
+            retry_count=trace.retry_count,
+            estimated_cost_usd=trace.total_cost_usd,
+            completed_at=now,
+        )
+        db.add(workflow)
+        await db.flush()
+    else:
+        workflow.status = trace.status
+        workflow.handoff_count = trace.handoff_count
+        workflow.retry_count = trace.retry_count
+        workflow.estimated_cost_usd = trace.total_cost_usd
+        workflow.completed_at = now
+        workflow.planning_conversation_id = planning_conversation_id
+        workflow.planning_run_id = planning_run_id
+        workflow.trip_session_id = trip_session_id
     task_keys_by_role: dict[str, str] = {}
+    existing_tasks = {
+        task.task_key: task
+        for task in (
+            await db.scalars(
+                select(AgentWorkflowTask).where(
+                    AgentWorkflowTask.workflow_run_id == workflow.id
+                )
+            )
+        ).all()
+    }
     planned_steps = list(trace.execution_plan.steps) if trace.execution_plan else []
-    # Dynamic workflows carry an explicit Supervisor graph. Retry traces from
-    # the synchronous planner can contain repeated role executions, so retain
-    # their historical per-execution rows until retry edges are persisted too.
-    use_explicit_graph = bool(planned_steps and not trace.retry_count)
+    use_explicit_graph = bool(planned_steps)
     if use_explicit_graph:
         stage_by_key = {stage.stage_key: stage for stage in trace.stages}
+        steps_by_key: dict[str, list[AgentStepTrace]] = {}
         steps_by_role: dict[str, list[AgentStepTrace]] = {}
         for step in trace.steps:
+            if step.task_key:
+                steps_by_key.setdefault(step.task_key, []).append(step)
             steps_by_role.setdefault(step.agent_type.value, []).append(step)
         for plan_step in planned_steps:
-            task_keys_by_role.setdefault(plan_step.agent_type.value, plan_step.step_id)
+            if plan_step.execution_kind == "agent":
+                task_keys_by_role.setdefault(plan_step.agent_type.value, plan_step.step_id)
             stage = stage_by_key.get(plan_step.step_id)
-            role_steps = steps_by_role.get(plan_step.agent_type.value, [])
+            role_steps = steps_by_key.get(plan_step.step_id, [])
+            if not role_steps:
+                role_steps = steps_by_role.get(plan_step.agent_type.value, [])
             agent_step = (
-                role_steps[0] if plan_step.execution_kind == "agent" and role_steps else None
+                role_steps[-1] if plan_step.execution_kind == "agent" and role_steps else None
             )
-            status = (
-                stage.status
-                if stage is not None
-                else (agent_step.status if agent_step is not None else plan_step.status)
-            )
+            status = plan_step.status
             summary = (
                 minimize_agent_payload(stage.summary)
                 if stage is not None
@@ -758,36 +1141,31 @@ async def persist_agent_workflow(
             input_refs = []
             if agent_step is not None and agent_step.input_message_id:
                 input_refs = [str(agent_step.input_message_id)]
-            db.add(
-                AgentWorkflowTask(
+            task = existing_tasks.get(plan_step.step_id)
+            if task is None:
+                task = AgentWorkflowTask(
                     workflow_run_id=workflow.id,
                     task_key=plan_step.step_id,
                     role=plan_step.agent_type.value,
-                    execution_kind=plan_step.execution_kind,
-                    status=status,
-                    dependency_keys_json=json.dumps(plan_step.depends_on, ensure_ascii=False),
-                    attempt_count=(
-                        stage.attempt_count
-                        if stage is not None
-                        else (
-                            1 + int(agent_step.fallback_used)
-                            if agent_step
-                            else plan_step.attempt_count
-                        )
-                    ),
-                    input_artifact_refs_json=json.dumps(input_refs, ensure_ascii=False),
                     output_artifact_type=output_type,
-                    budget_json=(
-                        agent_step.budget.model_dump_json()
-                        if agent_step
-                        else (plan_step.budget.model_dump_json() if plan_step.budget else "{}")
-                    ),
-                    summary_json=json.dumps(summary, ensure_ascii=False, default=str)[:4000],
-                    version=plan_step.version,
-                    created_at=now,
-                    updated_at=now,
                 )
+                db.add(task)
+            task.role = plan_step.agent_type.value
+            task.execution_kind = plan_step.execution_kind
+            task.status = status
+            task.dependency_keys_json = json.dumps(plan_step.depends_on, ensure_ascii=False)
+            task.attempt_count = plan_step.attempt_count
+            task.input_artifact_refs_json = json.dumps(input_refs, ensure_ascii=False)
+            task.output_artifact_type = output_type
+            task.budget_json = (
+                agent_step.budget.model_dump_json()
+                if agent_step
+                else (plan_step.budget.model_dump_json() if plan_step.budget else "{}")
             )
+            if summary or not task.summary_json:
+                task.summary_json = json.dumps(summary, ensure_ascii=False, default=str)[:4000]
+            task.version = plan_step.version
+            task.updated_at = now
     else:
         previous_task_key: str | None = None
         for index, step in enumerate(trace.steps, start=1):
@@ -844,6 +1222,24 @@ async def persist_agent_workflow(
         )
         db.add(run)
         await db.flush()
+        for call in step.tool_calls:
+            db.add(
+                AgentToolCall(
+                    agent_run_id=run.id,
+                    tool_name=call.tool_name,
+                    input_json=json.dumps(call.input_summary, ensure_ascii=False, default=str),
+                    output_summary_json=json.dumps(
+                        call.output_summary, ensure_ascii=False, default=str
+                    )[:4000],
+                    upstream_provider=call.upstream_provider,
+                    status=call.status,
+                    authorized=call.authorized,
+                    arguments_valid=call.arguments_valid,
+                    error_type=call.error_type,
+                    latency_ms=call.latency_ms,
+                    trace_id=trace_id,
+                )
+            )
         parent_run_id = run.id
         artifact = step.output_artifact
         artifact_plan_version = None
@@ -917,8 +1313,13 @@ async def persist_agent_workflow(
         )
     if trace.shared_state is not None:
         shared_state = AgentSharedStateAudit.model_validate(trace.shared_state)
-        db.add(
-            AgentSharedStateSnapshot(
+        snapshot = await db.scalar(
+            select(AgentSharedStateSnapshot).where(
+                AgentSharedStateSnapshot.workflow_run_id == workflow.id
+            )
+        )
+        if snapshot is None:
+            snapshot = AgentSharedStateSnapshot(
                 workflow_run_id=workflow.id,
                 task_id=shared_state.task_id,
                 revision=shared_state.revision,
@@ -926,7 +1327,12 @@ async def persist_agent_workflow(
                 state_hash=shared_state.state_hash,
                 payload_json=shared_state.model_dump_json(),
             )
-        )
+            db.add(snapshot)
+        else:
+            snapshot.revision = shared_state.revision
+            snapshot.phase = shared_state.phase.value
+            snapshot.state_hash = shared_state.state_hash
+            snapshot.payload_json = shared_state.model_dump_json()
     await db.flush()
     trace.workflow_id = workflow.id
     return workflow

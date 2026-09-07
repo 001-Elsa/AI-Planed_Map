@@ -1,9 +1,79 @@
+import asyncio
+import json
+from datetime import datetime, timezone
+from typing import Any
+
+import pytest
 from fastapi.testclient import TestClient  # noqa: E402
 from sqlalchemy import select
 
+from backend.app.api import ai_planner as ai_planner_api
+from backend.app.clients.weather_client import WeatherSnapshot
 from backend.app.db.session import SessionLocal
 from backend.app.main import app  # noqa: E402
-from backend.app.models import AgentArtifact, AgentHandoff, AgentWorkflowTask
+from backend.app.models import (
+    AgentArtifact,
+    AgentHandoff,
+    AgentRun,
+    AgentSharedStateSnapshot,
+    AgentToolCall,
+    AgentWorkflowRun,
+    AgentWorkflowTask,
+    PlanningRun,
+)
+from backend.app.schemas.ai_intent import (
+    PlanningIntent,
+    PlanningTask,
+    TripConstraintSet,
+    UncertainConstraint,
+)
+
+
+class InitialWeatherParser:
+    name = "initial-weather-parser"
+    input_tokens = 0
+    output_tokens = 0
+
+    async def parse(self, _text: str) -> PlanningIntent:
+        return PlanningIntent(
+            tasks=[PlanningTask(description="museum", location_name="museum")],
+            constraints=TripConstraintSet(
+                uncertain=[
+                    UncertainConstraint(
+                        field="weather",
+                        reason="avoid rain windows",
+                        confidence=0.7,
+                    )
+                ]
+            ),
+        )
+
+
+class FailingInitialWeatherProvider:
+    name = "failing-initial-weather"
+
+    async def current(self, _location):
+        raise TimeoutError("weather checkpoint failure")
+
+
+class BlockingInitialWeatherProvider:
+    name = "blocking-initial-weather"
+
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def current(self, _location):
+        self.entered.set()
+        await self.release.wait()
+        return WeatherSnapshot(
+            temperature_c=20,
+            precipitation_probability=70,
+            weather_code=61,
+            observed_at=datetime.now(timezone.utc),
+            source=self.name,
+            confidence=0.9,
+        )
 
 
 def test_auth_plan_and_ai_pipeline():
@@ -110,9 +180,19 @@ def test_auth_plan_and_ai_pipeline():
         graph_counts = client.portal.call(
             _agent_graph_counts, payload["agent_workflow"]["workflow_id"]
         )
-        assert graph_counts["tasks"] == len(payload["agent_workflow"]["steps"])
+        assert graph_counts["tasks"] == len(
+            payload["agent_workflow"]["execution_plan"]["steps"]
+        )
         assert graph_counts["handoffs"] == len(payload["agent_workflow"]["messages"])
         assert graph_counts["active_artifacts"] == len(payload["agent_workflow"]["steps"])
+        assert graph_counts["tool_calls"] >= 6
+        assert set(graph_counts["tool_names"]) >= {
+            "parse_requirement",
+            "search_poi",
+            "get_route_matrix",
+            "optimize_route",
+        }
+        assert all(step["tool_audit_complete"] for step in payload["agent_workflow"]["steps"])
         assert payload["critic_review"]["verdict"] in {
             "approved",
             "approved_with_warnings",
@@ -339,7 +419,7 @@ def test_auth_plan_and_ai_pipeline():
         assert implicit_preference.status_code == 409
 
 
-async def _agent_graph_counts(workflow_id: int) -> dict[str, int]:
+async def _agent_graph_counts(workflow_id: int) -> dict[str, Any]:
     async with SessionLocal() as db:
         tasks = (
             await db.scalars(
@@ -356,12 +436,252 @@ async def _agent_graph_counts(workflow_id: int) -> dict[str, int]:
                 select(AgentArtifact).where(AgentArtifact.workflow_run_id == workflow_id)
             )
         ).all()
+        tool_calls = (
+            await db.scalars(
+                select(AgentToolCall)
+                .join(AgentRun, AgentRun.id == AgentToolCall.agent_run_id)
+                .where(AgentRun.workflow_run_id == workflow_id)
+                .order_by(AgentToolCall.id)
+            )
+        ).all()
+        assert all(call.status in {"succeeded", "failed", "denied"} for call in tool_calls)
+        assert all(call.authorized for call in tool_calls)
+        assert all(call.arguments_valid for call in tool_calls)
+        assert all(json.loads(call.input_json) is not None for call in tool_calls)
         return {
             "tasks": len(tasks),
             "handoffs": len(handoffs),
             "active_artifacts": sum(1 for item in artifacts if item.status == "active"),
             "stale_artifacts": sum(1 for item in artifacts if item.status == "stale"),
+            "tool_calls": len(tool_calls),
+            "tool_names": [call.tool_name for call in tool_calls],
         }
+
+
+async def _agent_graph_rows(workflow_id: int) -> list[dict]:
+    async with SessionLocal() as db:
+        tasks = (
+            await db.scalars(
+                select(AgentWorkflowTask)
+                .where(AgentWorkflowTask.workflow_run_id == workflow_id)
+                .order_by(AgentWorkflowTask.id)
+            )
+        ).all()
+        return [
+            {
+                "task_key": task.task_key,
+                "execution_kind": task.execution_kind,
+                "status": task.status,
+                "depends_on": json.loads(task.dependency_keys_json),
+                "attempt_count": task.attempt_count,
+            }
+            for task in tasks
+        ]
+
+
+def test_initial_planning_persists_supervisor_dag_and_stage_kinds(monkeypatch):
+    monkeypatch.setattr(
+        ai_planner_api,
+        "build_intent_parser",
+        lambda *_args, **_kwargs: InitialWeatherParser(),
+    )
+    with TestClient(app) as client:
+        registered = client.post(
+            "/api/register",
+            json={
+                "username": "initialdaguser",
+                "password": "secret12",
+                "nickname": "Initial DAG",
+            },
+        )
+        token = registered.json()["data"]["token"]
+        response = client.post(
+            "/api/ai/plans",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "text": "visit a museum and avoid rain",
+                "origin": {"lng": 116.397, "lat": 39.908},
+            },
+        )
+
+        assert response.status_code == 200, response.text
+        workflow = response.json()["data"]["agent_workflow"]
+        trace_graph = {
+            step["step_id"]: step for step in workflow["execution_plan"]["steps"]
+        }
+        assert trace_graph["weather"]["execution_kind"] == "stage"
+        assert trace_graph["weather"]["depends_on"] == ["intent"]
+        assert trace_graph["planner"]["depends_on"] == ["search", "weather"]
+
+        rows = client.portal.call(_agent_graph_rows, workflow["workflow_id"])
+        persisted_graph = {row["task_key"]: row for row in rows}
+        assert set(persisted_graph) == set(trace_graph)
+        assert persisted_graph["weather"] == {
+            "task_key": "weather",
+            "execution_kind": "stage",
+            "status": "succeeded",
+            "depends_on": ["intent"],
+            "attempt_count": 1,
+        }
+        assert persisted_graph["planner"]["depends_on"] == ["search", "weather"]
+        assert all(row["status"] == "succeeded" for row in rows)
+
+
+async def _failed_workflow_checkpoint(input_text: str) -> dict:
+    async with SessionLocal() as db:
+        run = await db.scalar(
+            select(PlanningRun)
+            .where(PlanningRun.input_text == input_text)
+            .order_by(PlanningRun.id.desc())
+        )
+        assert run is not None
+        workflow = await db.scalar(
+            select(AgentWorkflowRun).where(AgentWorkflowRun.planning_run_id == run.id)
+        )
+        assert workflow is not None
+        tasks = (
+            await db.scalars(
+                select(AgentWorkflowTask)
+                .where(AgentWorkflowTask.workflow_run_id == workflow.id)
+                .order_by(AgentWorkflowTask.id)
+            )
+        ).all()
+        snapshot = await db.scalar(
+            select(AgentSharedStateSnapshot).where(
+                AgentSharedStateSnapshot.workflow_run_id == workflow.id
+            )
+        )
+        return {
+            "run_status": run.status,
+            "workflow_status": workflow.status,
+            "completed": workflow.completed_at is not None,
+            "task_id": snapshot.task_id if snapshot else None,
+            "phase": snapshot.phase if snapshot else None,
+            "tasks": {
+                task.task_key: {
+                    "status": task.status,
+                    "attempt_count": task.attempt_count,
+                    "summary": json.loads(task.summary_json),
+                }
+                for task in tasks
+            },
+        }
+
+
+def test_failed_initial_workflow_keeps_incremental_dag_and_shared_state(monkeypatch):
+    monkeypatch.setattr(
+        ai_planner_api,
+        "build_intent_parser",
+        lambda *_args, **_kwargs: InitialWeatherParser(),
+    )
+    input_text = "durable weather failure checkpoint"
+    with TestClient(app, raise_server_exceptions=False) as client:
+        monkeypatch.setattr(app.state, "weather_provider", FailingInitialWeatherProvider())
+        registered = client.post(
+            "/api/register",
+            json={
+                "username": "durablefailure",
+                "password": "secret12",
+                "nickname": "Durable Failure",
+            },
+        )
+        token = registered.json()["data"]["token"]
+        response = client.post(
+            "/api/ai/plans",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "text": input_text,
+                "origin": {"lng": 116.397, "lat": 39.908},
+            },
+        )
+
+        assert response.status_code == 500
+        checkpoint = client.portal.call(_failed_workflow_checkpoint, input_text)
+        assert checkpoint["run_status"] == "failed"
+        assert checkpoint["workflow_status"] == "failed"
+        assert checkpoint["completed"] is True
+        assert checkpoint["phase"] == "failed"
+        assert checkpoint["tasks"]["intent"]["status"] == "succeeded"
+        assert checkpoint["tasks"]["search"]["status"] == "succeeded"
+        assert checkpoint["tasks"]["weather"]["status"] == "failed"
+        assert checkpoint["tasks"]["weather"]["attempt_count"] == 1
+        assert checkpoint["tasks"]["weather"]["summary"]["error_code"]
+        assert checkpoint["tasks"]["planner"]["status"] == "blocked"
+        retained = client.portal.call(
+            app.state.runtime_store.get_json,
+            f"agent-shared-state:v1:{checkpoint['task_id']}",
+        )
+        assert retained is not None and retained["phase"] == "failed"
+
+
+async def _workflow_statuses(input_text: str) -> tuple[str, dict[str, str]]:
+    async with SessionLocal() as db:
+        run = await db.scalar(
+            select(PlanningRun)
+            .where(PlanningRun.input_text == input_text)
+            .order_by(PlanningRun.id.desc())
+        )
+        assert run is not None
+        workflow = await db.scalar(
+            select(AgentWorkflowRun).where(AgentWorkflowRun.planning_run_id == run.id)
+        )
+        assert workflow is not None
+        tasks = (
+            await db.scalars(
+                select(AgentWorkflowTask).where(
+                    AgentWorkflowTask.workflow_run_id == workflow.id
+                )
+            )
+        ).all()
+        return workflow.status, {task.task_key: task.status for task in tasks}
+
+
+@pytest.mark.asyncio
+async def test_running_initial_dag_is_visible_before_workflow_finishes(
+    async_client, monkeypatch
+):
+    monkeypatch.setattr(
+        ai_planner_api,
+        "build_intent_parser",
+        lambda *_args, **_kwargs: InitialWeatherParser(),
+    )
+    weather = BlockingInitialWeatherProvider()
+    monkeypatch.setattr(app.state, "weather_provider", weather)
+    registered = await async_client.post(
+        "/api/register",
+        json={
+            "username": "durablerunning",
+            "password": "secret12",
+            "nickname": "Durable Running",
+        },
+    )
+    token = registered.json()["data"]["token"]
+    input_text = "observable running weather checkpoint"
+    request_task = asyncio.create_task(
+        async_client.post(
+            "/api/ai/plans",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "text": input_text,
+                "origin": {"lng": 116.397, "lat": 39.908},
+            },
+        )
+    )
+    await asyncio.wait_for(weather.entered.wait(), timeout=2)
+
+    workflow_status, task_statuses = await _workflow_statuses(input_text)
+    assert workflow_status == "running"
+    assert task_statuses["intent"] == "succeeded"
+    assert task_statuses["search"] == "running"
+    assert task_statuses["weather"] == "running"
+    assert task_statuses["planner"] == "pending"
+
+    weather.release.set()
+    response = await asyncio.wait_for(request_task, timeout=5)
+    assert response.status_code == 200, response.text
+    workflow_status, task_statuses = await _workflow_statuses(input_text)
+    assert workflow_status == "success"
+    assert all(status == "succeeded" for status in task_statuses.values())
 
 
 def test_confirmed_long_term_memory_is_applied_listed_and_revocable():

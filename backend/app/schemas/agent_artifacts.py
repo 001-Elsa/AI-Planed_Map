@@ -120,6 +120,8 @@ class AgentMessage(StrictModel):
     idempotency_key: str = Field(min_length=16, max_length=128)
     correlation_id: UUID
     causation_id: UUID | None = None
+    reply_to: str | None = Field(default=None, pattern=r"^[A-Za-z0-9._-]{16,80}$")
+    inbox: str | None = Field(default=None, pattern=r"^[A-Za-z0-9._-]{16,80}$")
     attempt: int = Field(default=1, ge=1, le=5)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     expires_at: datetime | None = None
@@ -128,6 +130,10 @@ class AgentMessage(StrictModel):
     def validate_envelope(self) -> AgentMessage:
         if self.sender == self.receiver:
             raise ValueError("sender and receiver must differ")
+        if self.reply_to is not None and self.inbox is not None:
+            raise ValueError("a message cannot request and target a reply inbox simultaneously")
+        if self.inbox is not None and self.causation_id is None:
+            raise ValueError("inbox messages must identify the request they answer")
         if self.expires_at is not None and self.expires_at <= self.created_at:
             raise ValueError("expires_at must be later than created_at")
         return self
@@ -149,7 +155,9 @@ class AgentMessageAudit(StrictModel):
     correlation_id: UUID
     causation_id: UUID | None = None
     attempt: int = 1
-    delivery_status: Literal["delivered", "duplicate", "rejected"] = "delivered"
+    delivery_status: Literal[
+        "published", "acked", "delivered", "duplicate", "rejected"
+    ] = "delivered"
     created_at: datetime
 
 
@@ -190,7 +198,9 @@ class AgentPlanStep(StrictModel):
     agent_type: AgentType
     execution_kind: Literal["agent", "stage"] = "agent"
     responsibility: str = Field(min_length=1, max_length=120)
-    status: Literal["pending", "running", "succeeded", "failed", "blocked", "skipped"] = "pending"
+    status: Literal[
+        "pending", "running", "retrying", "succeeded", "failed", "blocked", "skipped"
+    ] = "pending"
     depends_on: list[str] = Field(default_factory=list, max_length=10)
     input_artifact_type: str = Field(min_length=1, max_length=80)
     output_artifact_type: str = Field(min_length=1, max_length=80)
@@ -248,6 +258,18 @@ class ArtifactEnvelope(StrictModel):
     input_hash: str = Field(min_length=16, max_length=128)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     expires_at: datetime | None = None
+
+
+class AgentToolCallAudit(StrictModel):
+    tool_name: str = Field(min_length=1, max_length=100)
+    input_summary: dict[str, Any] = Field(default_factory=dict)
+    output_summary: dict[str, Any] = Field(default_factory=dict)
+    upstream_provider: str | None = Field(default=None, max_length=80)
+    status: Literal["succeeded", "failed", "denied"]
+    authorized: bool
+    arguments_valid: bool
+    error_type: str | None = Field(default=None, max_length=80)
+    latency_ms: int | None = Field(default=None, ge=0)
 
 
 class CriticSoftAdjustments(StrictModel):
@@ -330,6 +352,8 @@ class AgentStepTrace(StrictModel):
     reason: str | None = Field(default=None, max_length=500)
     input_message_id: UUID | None = None
     output_message_id: UUID | None = None
+    tool_calls: list[AgentToolCallAudit] = Field(default_factory=list, max_length=20)
+    tool_audit_complete: bool = False
 
 
 class AgentStageTrace(StrictModel):
@@ -338,7 +362,9 @@ class AgentStageTrace(StrictModel):
     stage_key: str = Field(min_length=1, max_length=80)
     stage_type: Literal["orchestration", "deterministic"]
     owner_agent: AgentType | None = None
-    status: Literal["pending", "running", "succeeded", "failed", "blocked", "skipped"] = "succeeded"
+    status: Literal[
+        "pending", "running", "retrying", "succeeded", "failed", "blocked", "skipped"
+    ] = "succeeded"
     depends_on: list[str] = Field(default_factory=list, max_length=10)
     input_artifact_type: str = Field(min_length=1, max_length=80)
     output_artifact_type: str = Field(min_length=1, max_length=80)

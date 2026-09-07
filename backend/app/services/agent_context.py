@@ -13,6 +13,7 @@ from typing import Any
 
 from pydantic import Field
 
+from backend.app.clients.weather_client import WeatherSnapshot
 from backend.app.models import TripSession
 from backend.app.schemas.agent_artifacts import (
     AgentMessage,
@@ -78,6 +79,7 @@ class PlanningContext(StrictModel):
     intent_artifact: PlanningIntent
     search_artifact: SearchArtifactView
     safety_artifact: SafetyCheckReport | None = None
+    weather_artifact: WeatherSnapshot | None = None
     user_hard_constraints: HardConstraints
     user_soft_preferences: PlanningPreferences
     origin: Coordinate
@@ -147,6 +149,7 @@ def build_planning_context(
     city: str | None,
     max_candidates_per_task: int,
     fallback_intent: PlanningIntent,
+    weather: WeatherSnapshot | None = None,
 ) -> PlanningContext:
     state_ref = _validate_view(
         view=view,
@@ -192,6 +195,7 @@ def build_planning_context(
         intent_artifact=intent,
         search_artifact=search_view,
         safety_artifact=safety,
+        weather_artifact=weather,
         user_hard_constraints=intent.constraints.hard,
         user_soft_preferences=intent.preferences,
         origin=origin,

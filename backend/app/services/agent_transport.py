@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable
@@ -20,6 +21,8 @@ from backend.app.core.observability import metrics
 from backend.app.schemas.agent_artifacts import AgentEndpoint, AgentMessage
 from backend.app.services.agent_protocol import AgentMessageRouter
 from backend.app.services.agent_tool_contracts import stable_tool_error
+
+logger = logging.getLogger("mapgo.agent-transport")
 
 
 @dataclass(frozen=True)
@@ -37,6 +40,12 @@ class AgentPublishResult:
     stream_id: str | None = None
 
 
+def new_agent_reply_inbox() -> str:
+    """Return an opaque inbox token suitable for one request/response exchange."""
+
+    return f"reply-{uuid4().hex}"
+
+
 class AgentMessageTransport(Protocol):
     async def publish(self, message: AgentMessage) -> AgentPublishResult: ...
 
@@ -46,6 +55,7 @@ class AgentMessageTransport(Protocol):
         consumer: str,
         *,
         block_ms: int = 1_000,
+        inbox: str | None = None,
     ) -> AgentMessageDelivery | None: ...
 
     async def acknowledge(self, delivery: AgentMessageDelivery) -> bool: ...
@@ -65,12 +75,15 @@ class AgentMessageTransport(Protocol):
         *,
         min_idle_ms: int,
         count: int = 10,
+        inbox: str | None = None,
     ) -> list[AgentMessageDelivery]: ...
 
-    async def pending_count(self, receiver: AgentEndpoint) -> int: ...
+    async def pending_count(
+        self, receiver: AgentEndpoint, *, inbox: str | None = None
+    ) -> int: ...
 
     async def dead_letters(
-        self, receiver: AgentEndpoint, *, count: int = 20
+        self, receiver: AgentEndpoint, *, count: int = 20, inbox: str | None = None
     ) -> list[dict[str, Any]]: ...
 
 
@@ -93,9 +106,15 @@ class InMemoryAgentMessageTransport:
         self.router = router or AgentMessageRouter()
         self.idempotency_ttl_seconds = max(60, idempotency_ttl_seconds)
         self.max_messages_per_role = max(100, max_messages_per_role)
-        self._queues: dict[AgentEndpoint, deque[AgentMessage]] = defaultdict(deque)
-        self._pending: dict[AgentEndpoint, dict[str, _MemoryClaim]] = defaultdict(dict)
-        self._dead_letters: dict[AgentEndpoint, list[dict[str, Any]]] = defaultdict(list)
+        self._queues: dict[tuple[AgentEndpoint, str | None], deque[AgentMessage]] = defaultdict(
+            deque
+        )
+        self._pending: dict[
+            tuple[AgentEndpoint, str | None], dict[str, _MemoryClaim]
+        ] = defaultdict(dict)
+        self._dead_letters: dict[
+            tuple[AgentEndpoint, str | None], list[dict[str, Any]]
+        ] = defaultdict(list)
         self._published: dict[str, float] = {}
         self._condition = asyncio.Condition()
 
@@ -108,12 +127,13 @@ class InMemoryAgentMessageTransport:
                     self._published.pop(key, None)
             if message.idempotency_key in self._published:
                 return AgentPublishResult(status="duplicate")
-            if len(self._queues[message.receiver]) >= self.max_messages_per_role:
+            channel = (message.receiver, message.inbox)
+            if len(self._queues[channel]) >= self.max_messages_per_role:
                 raise RuntimeError("agent_message_queue_capacity_exceeded")
             while len(self._published) >= self.max_messages_per_role:
                 self._published.pop(next(iter(self._published)))
             self._published[message.idempotency_key] = now + self.idempotency_ttl_seconds
-            self._queues[message.receiver].append(message)
+            self._queues[channel].append(message)
             self._condition.notify_all()
         metrics.increment(
             "mapgo_agent_messages_published_total",
@@ -127,18 +147,20 @@ class InMemoryAgentMessageTransport:
         consumer: str,
         *,
         block_ms: int = 1_000,
+        inbox: str | None = None,
     ) -> AgentMessageDelivery | None:
         deadline = time.monotonic() + max(0, block_ms) / 1_000
+        channel = (receiver, inbox)
         async with self._condition:
-            while not self._queues[receiver]:
+            while not self._queues[channel]:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return None
                 try:
                     await asyncio.wait_for(self._condition.wait(), remaining)
-                except TimeoutError:
+                except asyncio.TimeoutError:  # noqa: UP041 - distinct from built-in on Python 3.10
                     return None
-            message = self._queues[receiver].popleft()
+            message = self._queues[channel].popleft()
             self.router.validate(message)
             receipt = uuid4().hex
             delivery = AgentMessageDelivery(
@@ -147,14 +169,15 @@ class InMemoryAgentMessageTransport:
                 consumer=consumer,
                 delivery_count=message.attempt,
             )
-            self._pending[receiver][receipt] = _MemoryClaim(
+            self._pending[channel][receipt] = _MemoryClaim(
                 delivery=delivery, claimed_at=time.monotonic()
             )
             return delivery
 
     async def acknowledge(self, delivery: AgentMessageDelivery) -> bool:
+        channel = (delivery.message.receiver, delivery.message.inbox)
         async with self._condition:
-            removed = self._pending[delivery.message.receiver].pop(delivery.receipt, None)
+            removed = self._pending[channel].pop(delivery.receipt, None)
         if removed:
             metrics.increment(
                 "mapgo_agent_messages_acked_total",
@@ -171,23 +194,22 @@ class InMemoryAgentMessageTransport:
     ) -> Literal["retry", "dlq"]:
         if not 1 <= max_attempts <= 5:
             raise ValueError("max_attempts must be between one and five")
+        channel = (delivery.message.receiver, delivery.message.inbox)
         async with self._condition:
-            claim = self._pending[delivery.message.receiver].pop(delivery.receipt, None)
+            claim = self._pending[channel].pop(delivery.receipt, None)
             if claim is None:
                 raise ValueError("delivery is no longer pending")
             if max(delivery.message.attempt, delivery.delivery_count) >= max_attempts:
-                self._dead_letters[delivery.message.receiver].append(
-                    _dead_letter_payload(delivery, error_code)
-                )
-                self._dead_letters[delivery.message.receiver] = self._dead_letters[
-                    delivery.message.receiver
-                ][-self.max_messages_per_role :]
+                self._dead_letters[channel].append(_dead_letter_payload(delivery, error_code))
+                self._dead_letters[channel] = self._dead_letters[channel][
+                    -self.max_messages_per_role :
+                ]
                 disposition: Literal["retry", "dlq"] = "dlq"
             else:
                 retry_message = delivery.message.model_copy(
                     update={"attempt": delivery.message.attempt + 1}
                 )
-                self._queues[retry_message.receiver].append(retry_message)
+                self._queues[channel].append(retry_message)
                 self._condition.notify_all()
                 disposition = "retry"
         metrics.increment(
@@ -203,12 +225,14 @@ class InMemoryAgentMessageTransport:
         *,
         min_idle_ms: int,
         count: int = 10,
+        inbox: str | None = None,
     ) -> list[AgentMessageDelivery]:
         threshold = max(0, min_idle_ms) / 1_000
         now = time.monotonic()
+        channel = (receiver, inbox)
         reclaimed: list[AgentMessageDelivery] = []
         async with self._condition:
-            for receipt, claim in list(self._pending[receiver].items()):
+            for receipt, claim in list(self._pending[channel].items()):
                 if len(reclaimed) >= max(0, count) or now - claim.claimed_at < threshold:
                     continue
                 delivery = AgentMessageDelivery(
@@ -218,7 +242,9 @@ class InMemoryAgentMessageTransport:
                     delivery_count=claim.delivery.delivery_count + 1,
                     reclaimed=True,
                 )
-                self._pending[receiver][receipt] = _MemoryClaim(delivery=delivery, claimed_at=now)
+                self._pending[channel][receipt] = _MemoryClaim(
+                    delivery=delivery, claimed_at=now
+                )
                 reclaimed.append(delivery)
         if reclaimed:
             metrics.increment(
@@ -228,15 +254,17 @@ class InMemoryAgentMessageTransport:
             )
         return reclaimed
 
-    async def pending_count(self, receiver: AgentEndpoint) -> int:
+    async def pending_count(
+        self, receiver: AgentEndpoint, *, inbox: str | None = None
+    ) -> int:
         async with self._condition:
-            return len(self._pending[receiver])
+            return len(self._pending[(receiver, inbox)])
 
     async def dead_letters(
-        self, receiver: AgentEndpoint, *, count: int = 20
+        self, receiver: AgentEndpoint, *, count: int = 20, inbox: str | None = None
     ) -> list[dict[str, Any]]:
         async with self._condition:
-            return list(self._dead_letters[receiver][-max(0, count) :])
+            return list(self._dead_letters[(receiver, inbox)][-max(0, count) :])
 
 
 class RedisStreamAgentMessageTransport:
@@ -244,7 +272,11 @@ class RedisStreamAgentMessageTransport:
 
     _PUBLISH_SCRIPT = """
     if redis.call('set', KEYS[1], '1', 'NX', 'EX', ARGV[1]) then
-        return redis.call('xadd', KEYS[2], 'MAXLEN', '~', ARGV[2], '*', 'message', ARGV[3])
+        local entry_id = redis.call('xadd', KEYS[2], 'MAXLEN', '~', ARGV[2], '*', 'message', ARGV[3])
+        if ARGV[4] == '1' then
+            redis.call('expire', KEYS[2], ARGV[1])
+        end
+        return entry_id
     end
     return false
     """
@@ -265,32 +297,42 @@ class RedisStreamAgentMessageTransport:
         self.group_prefix = group_prefix.rstrip(":")
         self.idempotency_ttl_seconds = max(60, idempotency_ttl_seconds)
         self.max_stream_length = max(100, max_stream_length)
-        self._initialized: set[AgentEndpoint] = set()
+        self._initialized: set[tuple[AgentEndpoint, str | None]] = set()
         self._group_lock = asyncio.Lock()
 
-    def _stream(self, receiver: AgentEndpoint) -> str:
-        return f"{self.stream_prefix}:{receiver.value}"
+    def _stream(self, receiver: AgentEndpoint, inbox: str | None = None) -> str:
+        suffix = f":inbox:{inbox}" if inbox else ""
+        return f"{self.stream_prefix}:{receiver.value}{suffix}"
 
-    def _group(self, receiver: AgentEndpoint) -> str:
-        return f"{self.group_prefix}:{receiver.value}"
+    def _group(self, receiver: AgentEndpoint, inbox: str | None = None) -> str:
+        suffix = f":inbox:{inbox}" if inbox else ""
+        return f"{self.group_prefix}:{receiver.value}{suffix}"
 
-    def _dlq(self, receiver: AgentEndpoint) -> str:
-        return f"{self._stream(receiver)}:dlq"
+    def _dlq(self, receiver: AgentEndpoint, inbox: str | None = None) -> str:
+        return f"{self._stream(receiver, inbox)}:dlq"
 
-    async def _ensure_group(self, receiver: AgentEndpoint) -> None:
-        if receiver in self._initialized:
+    async def _ensure_group(self, receiver: AgentEndpoint, inbox: str | None = None) -> None:
+        channel = (receiver, inbox)
+        if channel in self._initialized:
             return
         async with self._group_lock:
-            if receiver in self._initialized:
+            if channel in self._initialized:
                 return
             try:
                 await self.client.xgroup_create(
-                    self._stream(receiver), self._group(receiver), id="0-0", mkstream=True
+                    self._stream(receiver, inbox),
+                    self._group(receiver, inbox),
+                    id="0-0",
+                    mkstream=True,
                 )
             except Exception as exc:
                 if "BUSYGROUP" not in str(exc):
                     raise
-            self._initialized.add(receiver)
+            if inbox:
+                await self.client.expire(
+                    self._stream(receiver, inbox), self.idempotency_ttl_seconds
+                )
+            self._initialized.add(channel)
 
     async def publish(self, message: AgentMessage) -> AgentPublishResult:
         self.router.validate(message)
@@ -299,10 +341,11 @@ class RedisStreamAgentMessageTransport:
             self._PUBLISH_SCRIPT,
             2,
             idempotency_key,
-            self._stream(message.receiver),
+            self._stream(message.receiver, message.inbox),
             self.idempotency_ttl_seconds,
             self.max_stream_length,
             message.model_dump_json(),
+            1 if message.inbox else 0,
         )
         if not result:
             return AgentPublishResult(status="duplicate")
@@ -318,12 +361,13 @@ class RedisStreamAgentMessageTransport:
         consumer: str,
         *,
         block_ms: int = 1_000,
+        inbox: str | None = None,
     ) -> AgentMessageDelivery | None:
-        await self._ensure_group(receiver)
+        await self._ensure_group(receiver, inbox)
         rows = await self.client.xreadgroup(
-            self._group(receiver),
+            self._group(receiver, inbox),
             consumer,
-            {self._stream(receiver): ">"},
+            {self._stream(receiver, inbox): ">"},
             count=1,
             block=max(0, block_ms),
         )
@@ -342,8 +386,9 @@ class RedisStreamAgentMessageTransport:
 
     async def acknowledge(self, delivery: AgentMessageDelivery) -> bool:
         receiver = delivery.message.receiver
+        inbox = delivery.message.inbox
         acknowledged = await self.client.xack(
-            self._stream(receiver), self._group(receiver), delivery.receipt
+            self._stream(receiver, inbox), self._group(receiver, inbox), delivery.receipt
         )
         if acknowledged:
             metrics.increment(
@@ -362,22 +407,29 @@ class RedisStreamAgentMessageTransport:
         if not 1 <= max_attempts <= 5:
             raise ValueError("max_attempts must be between one and five")
         receiver = delivery.message.receiver
+        inbox = delivery.message.inbox
         async with self.client.pipeline(transaction=True) as pipe:
-            pipe.xack(self._stream(receiver), self._group(receiver), delivery.receipt)
+            pipe.xack(
+                self._stream(receiver, inbox),
+                self._group(receiver, inbox),
+                delivery.receipt,
+            )
             if max(delivery.message.attempt, delivery.delivery_count) >= max_attempts:
                 pipe.xadd(
-                    self._dlq(receiver),
+                    self._dlq(receiver, inbox),
                     {"dead_letter": json.dumps(_dead_letter_payload(delivery, error_code))},
                     maxlen=self.max_stream_length,
                     approximate=True,
                 )
+                if inbox:
+                    pipe.expire(self._dlq(receiver, inbox), self.idempotency_ttl_seconds)
                 disposition: Literal["retry", "dlq"] = "dlq"
             else:
                 retry_message = delivery.message.model_copy(
                     update={"attempt": delivery.message.attempt + 1}
                 )
                 pipe.xadd(
-                    self._stream(receiver),
+                    self._stream(receiver, inbox),
                     {"message": retry_message.model_dump_json()},
                     maxlen=self.max_stream_length,
                     approximate=True,
@@ -397,11 +449,12 @@ class RedisStreamAgentMessageTransport:
         *,
         min_idle_ms: int,
         count: int = 10,
+        inbox: str | None = None,
     ) -> list[AgentMessageDelivery]:
-        await self._ensure_group(receiver)
+        await self._ensure_group(receiver, inbox)
         result = await self.client.xautoclaim(
-            self._stream(receiver),
-            self._group(receiver),
+            self._stream(receiver, inbox),
+            self._group(receiver, inbox),
             consumer,
             min_idle_time=max(0, min_idle_ms),
             start_id="0-0",
@@ -414,8 +467,8 @@ class RedisStreamAgentMessageTransport:
             self.router.validate(message)
             delivery_count = message.attempt
             pending_rows = await self.client.xpending_range(
-                self._stream(receiver),
-                self._group(receiver),
+                self._stream(receiver, inbox),
+                self._group(receiver, inbox),
                 min=receipt,
                 max=receipt,
                 count=1,
@@ -442,17 +495,23 @@ class RedisStreamAgentMessageTransport:
             )
         return deliveries
 
-    async def pending_count(self, receiver: AgentEndpoint) -> int:
-        await self._ensure_group(receiver)
-        summary = await self.client.xpending(self._stream(receiver), self._group(receiver))
+    async def pending_count(
+        self, receiver: AgentEndpoint, *, inbox: str | None = None
+    ) -> int:
+        await self._ensure_group(receiver, inbox)
+        summary = await self.client.xpending(
+            self._stream(receiver, inbox), self._group(receiver, inbox)
+        )
         if isinstance(summary, dict):
             return int(summary.get("pending") or 0)
         return int(summary[0]) if summary else 0
 
     async def dead_letters(
-        self, receiver: AgentEndpoint, *, count: int = 20
+        self, receiver: AgentEndpoint, *, count: int = 20, inbox: str | None = None
     ) -> list[dict[str, Any]]:
-        rows = await self.client.xrevrange(self._dlq(receiver), count=max(0, count))
+        rows = await self.client.xrevrange(
+            self._dlq(receiver, inbox), count=max(0, count)
+        )
         result: list[dict[str, Any]] = []
         for _entry_id, fields in rows:
             raw = fields.get("dead_letter") or fields.get(b"dead_letter")
@@ -473,9 +532,16 @@ class RecoverableAgentMessageBus:
         return await self.transport.publish(message)
 
     async def receive(
-        self, receiver: AgentEndpoint, consumer: str, *, block_ms: int = 1_000
+        self,
+        receiver: AgentEndpoint,
+        consumer: str,
+        *,
+        block_ms: int = 1_000,
+        inbox: str | None = None,
     ) -> AgentMessageDelivery | None:
-        delivery = await self.transport.receive(receiver, consumer, block_ms=block_ms)
+        delivery = await self.transport.receive(
+            receiver, consumer, block_ms=block_ms, inbox=inbox
+        )
         if delivery is not None:
             self.router.validate(delivery.message)
         return delivery
@@ -531,6 +597,8 @@ class AgentTaskWorker:
             if outputs is not None:
                 messages = outputs if isinstance(outputs, list) else [outputs]
                 for message in messages:
+                    if delivery.message.reply_to and message.inbox != delivery.message.reply_to:
+                        raise ValueError("agent response did not target the request reply inbox")
                     await self.bus.publish(message)
             if not await self.bus.transport.acknowledge(delivery):
                 metrics.increment(
@@ -542,6 +610,11 @@ class AgentTaskWorker:
                 return "retry"
             return "acked"
         except Exception as exc:
+            logger.exception(
+                "Agent role handler failed endpoint=%s consumer=%s",
+                self.endpoint.value,
+                self.consumer,
+            )
             return await self.bus.transport.retry(
                 delivery,
                 error_code=stable_tool_error(exc),

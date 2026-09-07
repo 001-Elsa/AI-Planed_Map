@@ -18,7 +18,7 @@ from backend.app.schemas.ai_intent import (
     PlanningIntent,
 )
 from backend.app.services.agent_tool_registry import TOOL_REGISTRY, DataScope, InvocationMode
-from backend.app.services.agents.base import AgentExecution, canonical_hash
+from backend.app.services.agents.base import AgentExecution, audited_tool_call, canonical_hash
 from backend.app.services.clarification import select_clarification_questions
 from backend.app.services.intent_parser import IntentParser
 
@@ -182,5 +182,15 @@ class IntentAgent:
                 f"{route_reason};fallback={fallback_reason}"
                 if route_reason and fallback_reason
                 else fallback_reason or route_reason
+            ),
+            tool_calls=(
+                audited_tool_call(
+                    "parse_requirement",
+                    {"text": request.text},
+                    success=True,
+                    output={"task_count": len(intent.tasks), "question_count": len(required_questions)},
+                    provider=getattr(self.parser, "name", type(self.parser).__name__),
+                    latency_ms=int((time.perf_counter() - started) * 1000),
+                ),
             ),
         )

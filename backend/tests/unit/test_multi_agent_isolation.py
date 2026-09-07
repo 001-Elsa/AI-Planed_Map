@@ -1,9 +1,14 @@
+import asyncio
+from datetime import datetime, timezone
 from typing import Any
 
+import httpx
 import pytest
 from pydantic import ValidationError
 
+from backend.app.agent_role_worker import build_role_handler
 from backend.app.clients.amap_client import MockMapProvider
+from backend.app.clients.weather_client import WeatherSnapshot
 from backend.app.core.config import Settings
 from backend.app.models import AgentArtifact, AgentRun, AgentWorkflowRun
 from backend.app.schemas.agent_artifacts import (
@@ -29,6 +34,11 @@ from backend.app.schemas.ai_intent import (
 from backend.app.services.agent_protocol import AgentMessageRouter, AgentProtocolError
 from backend.app.services.agent_readiness import build_critic_readiness_report
 from backend.app.services.agent_role_contracts import ROLE_CONTRACTS
+from backend.app.services.agent_transport import (
+    AgentTaskWorker,
+    InMemoryAgentMessageTransport,
+    RecoverableAgentMessageBus,
+)
 from backend.app.services.agents.base import AgentExecution, canonical_hash
 from backend.app.services.agents.companion_agent import COMPANION_AGENT_SPEC
 from backend.app.services.agents.critic_agent import CRITIC_AGENT_SPEC
@@ -47,6 +57,20 @@ class StableParser:
 
     async def parse(self, _text: str) -> PlanningIntent:
         return PlanningIntent(tasks=[PlanningTask(description="博物馆", location_name="博物馆")])
+
+
+class MustNotRunPlanner:
+    spec = PLANNER_AGENT_SPEC
+
+    async def run(self, _context):
+        raise AssertionError("Planner must execute in its role worker")
+
+
+class MustNotRunCritic:
+    spec = CRITIC_AGENT_SPEC
+
+    async def run(self, _context):
+        raise AssertionError("Critic must execute in its role worker")
 
 
 class RetryOnceCritic:
@@ -103,6 +127,68 @@ class ElderlyParser:
                 )
             ),
         )
+
+
+class WeatherParser:
+    name = "weather-parser"
+    input_tokens = 5
+    output_tokens = 3
+
+    async def parse(self, _text: str) -> PlanningIntent:
+        return PlanningIntent(
+            tasks=[PlanningTask(description="museum", location_name="museum")],
+            constraints=TripConstraintSet(
+                uncertain=[
+                    UncertainConstraint(
+                        field="weather",
+                        reason="avoid rain windows",
+                        confidence=0.6,
+                    )
+                ]
+            ),
+        )
+
+
+class CoordinatedMapProvider(MockMapProvider):
+    name = "coordinated-map"
+
+    def __init__(self, search_started: asyncio.Event, weather_started: asyncio.Event) -> None:
+        self.search_started = search_started
+        self.weather_started = weather_started
+
+    async def search_poi(self, keyword, origin, city):
+        self.search_started.set()
+        await asyncio.wait_for(self.weather_started.wait(), timeout=0.5)
+        return await super().search_poi(keyword, origin, city)
+
+
+class CoordinatedWeatherProvider:
+    name = "coordinated-weather"
+
+    def __init__(self, search_started: asyncio.Event, weather_started: asyncio.Event) -> None:
+        self.search_started = search_started
+        self.weather_started = weather_started
+        self.calls = 0
+
+    async def current(self, _location: Coordinate) -> WeatherSnapshot:
+        self.calls += 1
+        self.weather_started.set()
+        await asyncio.wait_for(self.search_started.wait(), timeout=0.5)
+        return WeatherSnapshot(
+            temperature_c=19,
+            precipitation_probability=80,
+            weather_code=82,
+            observed_at=datetime.now(timezone.utc),
+            source=self.name,
+            confidence=0.9,
+        )
+
+
+class FailingWeatherProvider:
+    name = "failing-weather"
+
+    async def current(self, _location: Coordinate) -> WeatherSnapshot:
+        raise TimeoutError("weather unavailable")
 
 
 class ToggleFailSearchProvider(MockMapProvider):
@@ -253,6 +339,67 @@ async def test_supervisor_dynamic_plan_is_explicit_acyclic_task_graph_with_weath
         assert step["budget"]
         seen.add(step["step_id"])
     assert "weather" in [item["step_id"] for item in steps]
+    weather = next(item for item in steps if item["step_id"] == "weather")
+    assert weather["execution_kind"] == "stage"
+
+
+@pytest.mark.asyncio
+async def test_supervisor_dag_executes_weather_in_parallel_and_gates_planner():
+    search_started = asyncio.Event()
+    weather_started = asyncio.Event()
+    weather_provider = CoordinatedWeatherProvider(search_started, weather_started)
+    result = await PlanningService(
+        WeatherParser(),
+        CoordinatedMapProvider(search_started, weather_started),
+        Settings(mock_map_provider=True, agent_stage_timeout_seconds=1),
+        weather_provider=weather_provider,
+    ).plan(
+        AIPlanRequest(
+            text="visit museum and avoid rain",
+            origin=Coordinate(lng=120.62, lat=31.32),
+        )
+    )
+
+    assert result.status == "success"
+    assert weather_provider.calls == 1
+    assert any("80%" in warning for warning in result.warnings)
+    trace = result.agent_workflow
+    assert trace is not None and trace.execution_plan is not None
+    graph = {step.step_id: step for step in trace.execution_plan.steps}
+    assert graph["search"].status == "succeeded"
+    assert graph["weather"].status == "succeeded"
+    assert graph["weather"].execution_kind == "stage"
+    assert graph["planner"].depends_on == ["search", "weather"]
+    assert graph["planner"].status == "succeeded"
+    assert graph["final_answer"].status == "succeeded"
+    assert trace.stages[0].stage_key == "weather"
+    assert trace.stages[0].depends_on == ["intent"]
+
+
+@pytest.mark.asyncio
+async def test_supervisor_dag_blocks_descendants_when_weather_fails():
+    service = PlanningService(
+        WeatherParser(),
+        MockMapProvider(),
+        Settings(mock_map_provider=True, agent_stage_timeout_seconds=1),
+        weather_provider=FailingWeatherProvider(),
+    )
+
+    with pytest.raises(TimeoutError, match="weather unavailable"):
+        await service.plan(
+            AIPlanRequest(
+                text="visit museum and avoid rain",
+                origin=Coordinate(lng=120.62, lat=31.32),
+            )
+        )
+
+    graph = {
+        step.step_id: step for step in service.orchestrator.trace.execution_plan.steps
+    }
+    assert graph["search"].status == "succeeded"
+    assert graph["weather"].status == "failed"
+    assert graph["planner"].status == "blocked"
+    assert service.orchestrator.trace.stages[-1].status == "failed"
 
 
 def test_critic_retry_report_rejects_hard_constraint_adjustments():
@@ -511,6 +658,70 @@ async def test_enforced_critic_can_trigger_only_one_bounded_soft_retry():
         "critic",
         "supervisor",
     ]
+
+
+@pytest.mark.asyncio
+async def test_distributed_mode_executes_planner_and_critic_in_role_workers():
+    settings = Settings(
+        mock_map_provider=True,
+        agent_execution_mode="distributed",
+        agent_message_transport="redis_stream",
+        plan_critic_mode="enforce",
+        agent_stage_timeout_seconds=2,
+    )
+    router = AgentMessageRouter()
+    bus = RecoverableAgentMessageBus(InMemoryAgentMessageTransport(router), router)
+    client = httpx.AsyncClient()
+    planner_worker = AgentTaskWorker(
+        bus=bus,
+        endpoint=AgentEndpoint.planner,
+        consumer="planner-role-worker",
+        handler=build_role_handler("planner", bus=bus, settings=settings, client=client),
+    )
+    critic_worker = AgentTaskWorker(
+        bus=bus,
+        endpoint=AgentEndpoint.critic,
+        consumer="critic-role-worker",
+        handler=build_role_handler("critic", bus=bus, settings=settings, client=client),
+    )
+
+    async def pump(worker: AgentTaskWorker) -> None:
+        while True:
+            await worker.run_once(block_ms=20)
+
+    pumps = [asyncio.create_task(pump(planner_worker)), asyncio.create_task(pump(critic_worker))]
+    try:
+        service = PlanningService(
+            StableParser(),
+            MockMapProvider(),
+            settings,
+            critic_agent=MustNotRunCritic(),
+            message_bus=bus,
+        )
+        service.orchestrator.planner_agent = MustNotRunPlanner()
+        result = await asyncio.wait_for(
+            service.plan(
+                AIPlanRequest(
+                    text="distributed museum plan",
+                    origin=Coordinate(lng=120.62, lat=31.32),
+                )
+            ),
+            timeout=5,
+        )
+    finally:
+        for task in pumps:
+            task.cancel()
+        await asyncio.gather(*pumps, return_exceptions=True)
+        await client.aclose()
+
+    assert result.status == "success"
+    assert result.agent_workflow is not None
+    assert result.agent_workflow.execution_mode.value == "distributed"
+    artifact_types = [message.artifact_type for message in result.agent_workflow.messages]
+    assert "planner_context" in artifact_types
+    assert "planner_execution" in artifact_types
+    assert "critic_context" in artifact_types
+    assert "critic_execution" in artifact_types
 
 
 @pytest.mark.asyncio

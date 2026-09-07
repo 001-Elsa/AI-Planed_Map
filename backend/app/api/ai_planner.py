@@ -39,6 +39,7 @@ from backend.app.services.agent_orchestrator import persist_agent_workflow
 from backend.app.services.agent_role_contracts import public_role_contracts
 from backend.app.services.agent_shared_state import AgentSharedStateManager
 from backend.app.services.agent_tool_registry import TOOL_REGISTRY, InvocationMode
+from backend.app.services.agent_workflow_state import DurableWorkflowCheckpointStore
 from backend.app.services.agents.critic_agent import build_critic_agent
 from backend.app.services.intent_parser import build_intent_parser
 from backend.app.services.model_router import ModelRouter
@@ -51,7 +52,7 @@ from backend.app.services.planning_service import PlanningService, request_finge
 router = APIRouter(prefix="/ai", tags=["ai-planner"])
 
 
-def _planning_service(request: Request, parser, settings):
+def _planning_service(request: Request, parser, settings, checkpoint_store=None):
     return PlanningService(
         parser,
         request.app.state.map_provider,
@@ -59,6 +60,9 @@ def _planning_service(request: Request, parser, settings):
         critic_agent=build_critic_agent(settings, request.app.state.http_client),
         shared_state=AgentSharedStateManager(request.app.state.runtime_store, settings),
         external_tool_runtime=request.app.state.external_agent_tool_runtime,
+        weather_provider=request.app.state.weather_provider,
+        checkpoint_store=checkpoint_store,
+        message_bus=request.app.state.agent_message_bus,
     )
 
 
@@ -502,6 +506,7 @@ async def _execute_conversation_plan(
     conversation: PlanningConversation | None = None,
 ) -> dict:
     settings = get_settings()
+    is_new_conversation = conversation is None
     await _enforce_ai_budget(request, user.id, body.text)
     if conversation is None:
         body, memory = await _request_with_long_term_memory(db, user.id, body)
@@ -514,9 +519,38 @@ async def _execute_conversation_plan(
             skipped_explicit_keys=tuple(previous.get("skipped_explicit_keys") or ()),
             ignored_invalid_count=int(previous.get("ignored_invalid_count") or 0),
         )
+    if conversation is None:
+        conversation = PlanningConversation(
+            user_id=user.id,
+            state="running",
+            revision=1,
+            request_json=body.model_dump_json(),
+            questions_json="[]",
+        )
+        db.add(conversation)
+        await db.flush()
+    else:
+        conversation.state = "running"
+        conversation.request_json = body.model_dump_json()
+    await db.commit()
     parser = build_intent_parser(settings, request.app.state.http_client)
     started = time.perf_counter()
-    result = await _planning_service(request, parser, settings).plan(body)
+    service = _planning_service(request, parser, settings)
+    checkpoint_store = await DurableWorkflowCheckpointStore.start(
+        db,
+        trace=service.orchestrator.trace,
+        user_id=user.id,
+        trigger_type="planning_conversation",
+        trace_id=request.state.trace_id,
+        planning_conversation_id=conversation.id,
+    )
+    service.orchestrator.checkpoint_store = checkpoint_store
+    try:
+        result = await service.plan(body)
+    except Exception:
+        conversation.state = "failed"
+        await db.commit()
+        raise
     if getattr(parser, "fallback_used", False):
         metrics.increment(
             "mapgo_llm_fallback_total", {"parser": getattr(parser, "last_parser", "unknown")}
@@ -540,24 +574,13 @@ async def _execute_conversation_plan(
     data["execution"]["stages"].insert(1, _memory_execution_stage(memory))
     input_tokens, output_tokens, workflow_cost = _workflow_usage(result)
     await _record_ai_usage(request, user.id, input_tokens, output_tokens)
-    if conversation is None:
-        conversation = PlanningConversation(
-            user_id=user.id,
-            state=result.planning_state.value,
-            revision=1,
-            request_json=body.model_dump_json(),
-            intent_json=json.dumps(data["intent"], ensure_ascii=False),
-            questions_json=json.dumps(data["questions"], ensure_ascii=False),
-            result_json=json.dumps(data, ensure_ascii=False),
-        )
-        db.add(conversation)
-    else:
-        conversation.state = result.planning_state.value
+    conversation.state = result.planning_state.value
+    if not is_new_conversation:
         conversation.revision += 1
-        conversation.request_json = body.model_dump_json()
-        conversation.intent_json = json.dumps(data["intent"], ensure_ascii=False)
-        conversation.questions_json = json.dumps(data["questions"], ensure_ascii=False)
-        conversation.result_json = json.dumps(data, ensure_ascii=False)
+    conversation.request_json = body.model_dump_json()
+    conversation.intent_json = json.dumps(data["intent"], ensure_ascii=False)
+    conversation.questions_json = json.dumps(data["questions"], ensure_ascii=False)
+    conversation.result_json = json.dumps(data, ensure_ascii=False)
     await db.flush()
     data["conversation_id"] = conversation.id
     data["conversation_revision"] = conversation.revision
@@ -831,15 +854,40 @@ async def create_ai_plan(
 
     if not budget_checked:
         await _enforce_ai_budget(request, user.id, body.text)
+    run = None
     try:
         body, memory = await _request_with_long_term_memory(db, user.id, body)
         started = time.perf_counter()
         service = _planning_service(request, parser, settings)
+        run = PlanningRun(
+            user_id=user.id,
+            input_text=body.text,
+            intent_json="{}",
+            status="running",
+            model_name=getattr(parser, "last_parser", parser.name),
+            prompt_version=settings.prompt_version,
+            map_provider=request.app.state.map_provider.name,
+            trace_id=request.state.trace_id,
+        )
+        db.add(run)
+        await db.flush()
+        checkpoint_store = await DurableWorkflowCheckpointStore.start(
+            db,
+            trace=service.orchestrator.trace,
+            user_id=user.id,
+            trigger_type="planning_request",
+            trace_id=request.state.trace_id,
+            planning_run_id=run.id,
+        )
+        service.orchestrator.checkpoint_store = checkpoint_store
         result = await service.plan(body)
     except Exception as exc:
+        if run is not None:
+            run.status = "failed"
         if record:
             record.status = "failed"
             record.error_code = exc.code if isinstance(exc, AppError) else "UNEXPECTED_ERROR"
+        if run is not None or record:
             await db.commit()
         raise
     if getattr(parser, "fallback_used", False):
@@ -881,23 +929,15 @@ async def create_ai_plan(
     input_tokens, output_tokens, workflow_cost = _workflow_usage(result)
     await _record_ai_usage(request, user.id, input_tokens, output_tokens)
     estimated_cost = workflow_cost
-    run = PlanningRun(
-        user_id=user.id,
-        input_text=body.text,
-        intent_json=json.dumps(response_data["intent"], ensure_ascii=False),
-        result_json=json.dumps(response_data, ensure_ascii=False),
-        status=result.status,
-        model_name=getattr(parser, "last_parser", parser.name),
-        prompt_version=settings.prompt_version,
-        map_provider=request.app.state.map_provider.name,
-        trace_id=request.state.trace_id,
-        latency_ms=round(planning_seconds * 1000),
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        estimated_cost_usd=estimated_cost,
-    )
-    db.add(run)
-    await db.flush()
+    assert run is not None
+    run.intent_json = json.dumps(response_data["intent"], ensure_ascii=False)
+    run.result_json = json.dumps(response_data, ensure_ascii=False)
+    run.status = result.status
+    run.model_name = getattr(parser, "last_parser", parser.name)
+    run.latency_ms = round(planning_seconds * 1000)
+    run.input_tokens = input_tokens
+    run.output_tokens = output_tokens
+    run.estimated_cost_usd = estimated_cost
     response_data["planning_run_id"] = run.id
     trace = AgentWorkflowTrace.model_validate(response_data["agent_workflow"])
     workflow = await persist_agent_workflow(

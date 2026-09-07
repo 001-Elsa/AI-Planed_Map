@@ -428,6 +428,8 @@ class AgentToolCall(Base):
     output_summary_json: Mapped[str] = mapped_column(Text, default="{}")
     upstream_provider: Mapped[str | None] = mapped_column(String(80), nullable=True)
     status: Mapped[str] = mapped_column(String(30))
+    authorized: Mapped[bool] = mapped_column(Boolean, default=True)
+    arguments_valid: Mapped[bool] = mapped_column(Boolean, default=True)
     error_type: Mapped[str | None] = mapped_column(String(80), nullable=True)
     latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     trace_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)

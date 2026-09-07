@@ -11,6 +11,7 @@ import hashlib
 import json
 
 from backend.app.clients.amap_client import MapProvider
+from backend.app.clients.weather_client import MockWeatherProvider, WeatherProvider
 from backend.app.core.config import Settings
 from backend.app.infrastructure.runtime_store import InMemoryRuntimeStore
 from backend.app.schemas.agent_artifacts import AgentWorkflowMode, ReviewReport
@@ -24,6 +25,8 @@ from backend.app.schemas.ai_intent import (
 from backend.app.services.agent_orchestrator import PlanningAgentOrchestrator
 from backend.app.services.agent_shared_state import AgentSharedStateManager
 from backend.app.services.agent_tool_adapters import AgentToolRuntime
+from backend.app.services.agent_transport import RecoverableAgentMessageBus
+from backend.app.services.agent_workflow_state import DurableWorkflowCheckpointStore
 from backend.app.services.agents.critic_agent import CriticAgent, RuleBasedCriticAgent
 from backend.app.services.agents.intent_agent import IntentAgent
 from backend.app.services.agents.planner_agent import PlannerAgent
@@ -53,6 +56,9 @@ class PlanningService:
         critic_agent: CriticAgent | None = None,
         shared_state: AgentSharedStateManager | None = None,
         external_tool_runtime: AgentToolRuntime | None = None,
+        weather_provider: WeatherProvider | None = None,
+        checkpoint_store: DurableWorkflowCheckpointStore | None = None,
+        message_bus: RecoverableAgentMessageBus | None = None,
     ) -> None:
         self.parser = parser
         self.map_provider = map_provider
@@ -66,13 +72,21 @@ class PlanningService:
             planner_agent=PlannerAgent(map_provider, settings, external_tool_runtime),
             critic_agent=critic_agent or RuleBasedCriticAgent(),
             shared_state=shared_state or AgentSharedStateManager(InMemoryRuntimeStore(), settings),
+            weather_provider=weather_provider or MockWeatherProvider(),
+            checkpoint_store=checkpoint_store,
+            message_bus=message_bus,
         )
 
     async def plan(self, request: AIPlanRequest) -> AIPlanResult:
         try:
-            return await self._plan(request)
-        finally:
+            result = await self._plan(request)
+            await self.orchestrator.checkpoint()
+        except Exception as exc:
+            await asyncio.shield(self.orchestrator.fail(exc))
+            raise
+        else:
             await asyncio.shield(self.orchestrator.clear_short_term_memory())
+            return result
 
     async def _plan(self, request: AIPlanRequest) -> AIPlanResult:
         await self.orchestrator.start(request)

@@ -9,10 +9,12 @@ from zoneinfo import ZoneInfo
 from pydantic import Field
 
 from backend.app.clients.amap_client import MapProvider
+from backend.app.clients.weather_client import WeatherSnapshot
 from backend.app.core.config import Settings
 from backend.app.schemas.agent_artifacts import (
     AgentBudget,
     AgentSpec,
+    AgentToolCallAudit,
     AgentType,
     ArtifactEnvelope,
 )
@@ -36,9 +38,13 @@ from backend.app.services.agent_planning_tools import (
     reevaluate_selected_route,
 )
 from backend.app.services.agent_tool_adapters import AgentToolRuntime
-from backend.app.services.agent_tool_contracts import ToolResultEnvelope
+from backend.app.services.agent_tool_contracts import (
+    OptimizeRouteArgs,
+    RouteMatrixArgs,
+    ToolResultEnvelope,
+)
 from backend.app.services.agent_tool_registry import TOOL_REGISTRY, InvocationMode
-from backend.app.services.agents.base import AgentExecution, canonical_hash
+from backend.app.services.agents.base import AgentExecution, audited_tool_call, canonical_hash
 from backend.app.services.agents.search_agent import SearchArtifact
 from backend.app.services.route_optimizer import CandidateNode
 from backend.app.services.uncertainty import heuristic_envelope
@@ -54,6 +60,7 @@ class PlannerAgentInput(StrictModel):
     city: str | None = Field(default=None, max_length=50)
     max_candidates_per_task: int = Field(default=3, ge=1, le=5)
     search: SearchArtifact
+    weather_artifact: WeatherSnapshot | None = None
 
 
 PlannerRunContext = PlanningContext | PlannerAgentInput
@@ -114,13 +121,27 @@ class PlannerAgent:
         points = [context.origin, *(candidate.location for candidate in flattened)]
         matrix_call = await self.matrix_tool.execute(points, context.intent.transport_mode)
         tool_results = [matrix_call.result]
+        tool_calls = [
+            audited_tool_call(
+                "get_route_matrix",
+                RouteMatrixArgs(
+                    points=points, transport_mode=context.intent.transport_mode
+                ).model_dump(mode="json"),
+                success=matrix_call.result.success,
+                output=matrix_call.result.data,
+                provider=matrix_call.result.source,
+                error_type=matrix_call.result.error_code,
+            )
+        ]
         if matrix_call.data is None:
             result = self._tool_unavailable_result(
                 context,
                 field="route_matrix",
                 error_code=matrix_call.result.error_code or "UPSTREAM_ERROR",
             )
-            return self._execution(result, context, started, tool_results=tool_results)
+            return self._execution(
+                result, context, started, tool_results=tool_results, tool_calls=tool_calls
+            )
         matrix = matrix_call.data
 
         candidate_groups: list[list[CandidateNode]] = []
@@ -164,13 +185,29 @@ class PlannerAgent:
             safety_buffer_minutes=safety_buffer,
         )
         tool_results.append(optimize_call.result)
+        tool_calls.append(
+            audited_tool_call(
+                "optimize_route",
+                OptimizeRouteArgs(
+                    candidate_group_count=len(candidate_groups),
+                    transport_mode=context.intent.transport_mode,
+                    hard_constraints=context.intent.constraints.hard.model_dump(mode="json"),
+                ).model_dump(mode="json"),
+                success=optimize_call.result.success,
+                output=optimize_call.result.data,
+                provider=optimize_call.result.source,
+                error_type=optimize_call.result.error_code,
+            )
+        )
         if optimize_call.data is None:
             result = self._tool_unavailable_result(
                 context,
                 field="route_optimizer",
                 error_code=optimize_call.result.error_code or "UPSTREAM_ERROR",
             )
-            return self._execution(result, context, started, tool_results=tool_results)
+            return self._execution(
+                result, context, started, tool_results=tool_results, tool_calls=tool_calls
+            )
         evaluation, algorithm = optimize_call.data
 
         transit_warning: str | None = None
@@ -186,6 +223,19 @@ class PlannerAgent:
                 sequence_points.append(context.origin)
             transit_call = await self.transit_tool.execute(sequence_points, context.city)
             tool_results.append(transit_call.result)
+            tool_calls.append(
+                audited_tool_call(
+                    "verify_transit_edges",
+                    RouteMatrixArgs(
+                        points=sequence_points,
+                        transport_mode=TransportMode.transit,
+                    ).model_dump(mode="json"),
+                    success=transit_call.result.success,
+                    output=transit_call.result.data,
+                    provider=transit_call.result.source,
+                    error_type=transit_call.result.error_code,
+                )
+            )
             if transit_call.data is None:
                 transit_warning = (
                     "公共交通精修暂不可用，保留路线矩阵中的可审计估算结果"
@@ -286,6 +336,12 @@ class PlannerAgent:
             method=envelope.method,
         )
         warnings = list(envelope.warnings)
+        if context.weather_artifact is not None:
+            weather = context.weather_artifact
+            warnings.append(
+                "天气证据：未来时段降水概率 "
+                f"{weather.precipitation_probability:.0f}%（{weather.source}）。"
+            )
         if estimated_edges:
             warnings.append(
                 f"{estimated_edges} 段路线使用估算数据，时间仅供参考，前端应显示估算标记。"
@@ -331,7 +387,9 @@ class PlannerAgent:
                 ),
                 **common,
             )
-        return self._execution(result, context, started, tool_results=tool_results)
+        return self._execution(
+            result, context, started, tool_results=tool_results, tool_calls=tool_calls
+        )
 
     @staticmethod
     def _tool_unavailable_result(
@@ -359,6 +417,7 @@ class PlannerAgent:
         started: float,
         *,
         tool_results: list[ToolResultEnvelope],
+        tool_calls: list[AgentToolCallAudit] | None = None,
     ) -> AgentExecution[AIPlanResult]:
         payload = {
             "workflow_state": "plan_candidate_ready",
@@ -395,4 +454,5 @@ class PlannerAgent:
                 if any(not item.success for item in tool_results)
                 else None
             ),
+            tool_calls=tuple(tool_calls or ()),
         )

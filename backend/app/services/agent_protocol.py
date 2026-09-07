@@ -16,6 +16,8 @@ from backend.app.schemas.agent_artifacts import (
     AgentMessage,
     AgentMessageAudit,
     AgentMessageType,
+    AgentToolCallAudit,
+    ArtifactEnvelope,
     CriticSoftAdjustments,
     ReviewReport,
     minimize_agent_payload,
@@ -103,13 +105,25 @@ ROUTES = (
         AgentEndpoint.planner,
         AgentEndpoint.supervisor,
         AgentMessageType.result,
-        frozenset({"plan_candidate"}),
+        frozenset({"plan_candidate", "planner_execution"}),
+    ),
+    AgentRoute(
+        AgentEndpoint.supervisor,
+        AgentEndpoint.planner,
+        AgentMessageType.command,
+        frozenset({"planner_context"}),
     ),
     AgentRoute(
         AgentEndpoint.critic,
         AgentEndpoint.supervisor,
         AgentMessageType.result,
-        frozenset({"review_report"}),
+        frozenset({"review_report", "critic_execution"}),
+    ),
+    AgentRoute(
+        AgentEndpoint.supervisor,
+        AgentEndpoint.critic,
+        AgentMessageType.command,
+        frozenset({"critic_context"}),
     ),
     AgentRoute(
         AgentEndpoint.system,
@@ -227,6 +241,8 @@ class AgentMessageRouter:
         content: dict[str, Any],
         correlation_id: UUID | None = None,
         causation_id: UUID | None = None,
+        reply_to: str | None = None,
+        inbox: str | None = None,
         attempt: int = 1,
     ) -> AgentMessage:
         serialized = _canonical_json(content).encode("utf-8")
@@ -245,6 +261,8 @@ class AgentMessageRouter:
                 "content_hash": content_hash,
                 "correlation_id": str(correlation),
                 "causation_id": str(causation_id) if causation_id else None,
+                "reply_to": reply_to,
+                "inbox": inbox,
             }
         )
         return AgentMessage(
@@ -259,6 +277,8 @@ class AgentMessageRouter:
             idempotency_key=idempotency_key,
             correlation_id=correlation,
             causation_id=causation_id,
+            reply_to=reply_to,
+            inbox=inbox,
             attempt=attempt,
         )
 
@@ -295,6 +315,8 @@ class AgentMessageRouter:
                 "content_hash": message.content_hash,
                 "correlation_id": str(message.correlation_id),
                 "causation_id": str(message.causation_id) if message.causation_id else None,
+                "reply_to": message.reply_to,
+                "inbox": message.inbox,
             }
         )
         if expected_idempotency_key != message.idempotency_key:
@@ -428,8 +450,30 @@ class AgentMessageRouter:
                         PoiCandidate.model_validate(candidate)
             elif message.artifact_type == "plan_candidate":
                 AIPlanResult.model_validate(payload)
+            elif message.artifact_type == "planner_context":
+                from backend.app.services.agent_context import PlanningContext
+
+                PlanningContext.model_validate(payload.get("context"))
+            elif message.artifact_type == "planner_execution":
+                AIPlanResult.model_validate(payload.get("output"))
+                _validate_execution_payload(
+                    payload,
+                    expected_agent="planner",
+                    expected_artifact_type="plan_candidate",
+                )
             elif message.artifact_type == "review_report":
                 ReviewReport.model_validate(payload)
+            elif message.artifact_type == "critic_context":
+                from backend.app.services.agent_context import CriticContext
+
+                CriticContext.model_validate(payload.get("context"))
+            elif message.artifact_type == "critic_execution":
+                ReviewReport.model_validate(payload.get("output"))
+                _validate_execution_payload(
+                    payload,
+                    expected_agent="critic",
+                    expected_artifact_type="review_report",
+                )
             elif message.artifact_type == "retry_directive":
                 if set(payload) != {"intent", "soft_adjustments"}:
                     raise ValueError("retry directive may contain only intent and soft adjustments")
@@ -449,3 +493,34 @@ class AgentMessageRouter:
             raise AgentProtocolError(
                 f"invalid {message.artifact_type} payload: {type(exc).__name__}"
             ) from exc
+
+
+def _validate_execution_payload(
+    payload: dict[str, Any], *, expected_agent: str, expected_artifact_type: str
+) -> None:
+    artifact = ArtifactEnvelope.model_validate(payload.get("artifact"))
+    metrics_payload = payload.get("metrics")
+    if artifact.producer_agent.value != expected_agent:
+        raise ValueError(f"execution artifact must be produced by {expected_agent}")
+    if artifact.artifact_type != expected_artifact_type:
+        raise ValueError(f"execution artifact must have type {expected_artifact_type}")
+    if payload.get("tool_audit_complete") is not True:
+        raise ValueError("execution response requires a complete tool audit")
+    for item in payload.get("tool_calls", []):
+        AgentToolCallAudit.model_validate(item)
+    if not isinstance(metrics_payload, dict):
+        raise ValueError("execution response requires metrics")
+    allowed_metrics = {
+        "latency_ms",
+        "input_tokens",
+        "output_tokens",
+        "estimated_cost_usd",
+        "fallback_used",
+        "reason",
+    }
+    if set(metrics_payload) != allowed_metrics:
+        raise ValueError("execution response contains unexpected metrics")
+    if any(int(metrics_payload[key]) < 0 for key in ("latency_ms", "input_tokens", "output_tokens")):
+        raise ValueError("execution metrics cannot be negative")
+    if float(metrics_payload["estimated_cost_usd"]) < 0:
+        raise ValueError("execution cost cannot be negative")
