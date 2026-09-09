@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import yaml
@@ -44,5 +45,52 @@ def test_compose_declares_independently_scalable_agent_role_services():
             role,
         ]
         assert service["restart"] == "unless-stopped"
+        assert service["expose"] == ["9100"]
 
     assert services["worker"]["command"] == ["python", "-m", "backend.app.worker"]
+    assert services["worker"]["expose"] == ["9100"]
+
+
+def test_prometheus_scrapes_workers_and_provisions_agent_alerts_and_dashboard():
+    root = Path(__file__).resolve().parents[3]
+    prometheus = yaml.safe_load(
+        (root / "infrastructure/prometheus.yml").read_text(encoding="utf-8")
+    )
+    targets = {
+        target
+        for job in prometheus["scrape_configs"]
+        for config in job["static_configs"]
+        for target in config["targets"]
+    }
+    assert {
+        "api:3000",
+        "worker:9100",
+        "agent-planner:9100",
+        "agent-critic:9100",
+        "agent-replanner:9100",
+    }.issubset(targets)
+    assert "/etc/prometheus/agent-alerts.yml" in prometheus["rule_files"]
+
+    alerts = yaml.safe_load(
+        (root / "infrastructure/agent-alerts.yml").read_text(encoding="utf-8")
+    )
+    alert_names = {rule["alert"] for group in alerts["groups"] for rule in group["rules"]}
+    assert {
+        "AgentPendingBacklog",
+        "AgentPendingMessageStale",
+        "AgentDeadLetterQueueNotEmpty",
+        "AgentReclaimRateHigh",
+    } <= alert_names
+
+    dashboard = json.loads(
+        (root / "infrastructure/grafana/dashboards/mapgo-ai-planned.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    expressions = " ".join(
+        target["expr"] for panel in dashboard["panels"] for target in panel["targets"]
+    )
+    assert "mapgo_agent_task_duration_ms" in expressions
+    assert "mapgo_agent_task_queue_delay_ms" in expressions
+    assert "mapgo_agent_dlq_messages" in expressions
+    assert "mapgo_agent_workflow_node_transitions_total" in expressions

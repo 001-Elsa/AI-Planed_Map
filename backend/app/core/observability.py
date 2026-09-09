@@ -1,3 +1,4 @@
+import os
 from collections import defaultdict
 from threading import Lock
 
@@ -10,6 +11,8 @@ class MetricsRegistry:
         self._counters: dict[tuple[str, tuple[tuple[str, str], ...]], float] = defaultdict(float)
         self._observations: dict[tuple[str, tuple[tuple[str, str], ...]], tuple[int, float]] = {}
         self._histograms: dict[tuple[str, tuple[tuple[str, str], ...]], dict[str, float]] = {}
+        self._gauges: dict[tuple[str, tuple[tuple[str, str], ...]], float] = {}
+        self._service_name = os.getenv("MAPGO_SERVICE_NAME", "mapgo-api")
         self._histogram_buckets = (5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000)
 
     @staticmethod
@@ -36,6 +39,16 @@ class MetricsRegistry:
                     buckets[f"{bucket}"] += 1
             buckets["+Inf"] += 1
 
+    def set_gauge(
+        self, name: str, value: float, labels: dict[str, str] | None = None
+    ) -> None:
+        with self._lock:
+            self._gauges[self._key(name, labels or {})] = value
+
+    def set_service_name(self, service_name: str) -> None:
+        with self._lock:
+            self._service_name = service_name
+
     @staticmethod
     def _labels(labels: tuple[tuple[str, str], ...]) -> str:
         if not labels:
@@ -50,12 +63,16 @@ class MetricsRegistry:
         lines = [
             "# HELP mapgo_build_info Static service build information.",
             "# TYPE mapgo_build_info gauge",
-            'mapgo_build_info{service="mapgo"} 1',
+            f'mapgo_build_info{{service="{self._service_name}"}} 1',
         ]
         with self._lock:
             counters = list(self._counters.items())
             observations = list(self._observations.items())
             histograms = list(self._histograms.items())
+            gauges = list(self._gauges.items())
+        for (name, labels), value in sorted(gauges):
+            lines.append(f"# TYPE {name} gauge")
+            lines.append(f"{name}{self._labels(labels)} {value:g}")
         for (name, labels), value in sorted(counters):
             lines.append(f"# TYPE {name} counter")
             lines.append(f"{name}{self._labels(labels)} {value:g}")
@@ -66,9 +83,8 @@ class MetricsRegistry:
         for (name, labels), buckets in sorted(histograms):
             hist_name = f"{name}_histogram"
             lines.append(f"# TYPE {hist_name} histogram")
-            cumulative = 0.0
             for bucket in self._histogram_buckets:
-                cumulative += buckets[f"{bucket}"]
+                cumulative = buckets[f"{bucket}"]
                 label_set = labels + (("le", str(bucket)),)
                 lines.append(f"{hist_name}_bucket{self._labels(label_set)} {cumulative:g}")
             label_inf = labels + (("le", "+Inf"),)

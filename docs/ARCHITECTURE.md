@@ -292,4 +292,8 @@ distributed:
   workflow owner -> deterministic Planner/Critic stages
 ```
 
-Distributed mode is enabled with `AGENT_EXECUTION_MODE=distributed` and `AGENT_MESSAGE_TRANSPORT=redis_stream`. The worker owns the Replanner role and uses the existing validated protocol, ACK, reclaim, retry and DLQ contract. Planner and Critic remain stages in this workflow until they have independent model-backed role owners.
+Distributed mode is enabled with `AGENT_EXECUTION_MODE=distributed` and `AGENT_MESSAGE_TRANSPORT=redis_stream`. Independently scalable Planner, Critic, and Replanner role workers share the validated protocol, ACK, reclaim, retry and DLQ contract. Initial planning can dispatch Planner and Critic remotely; dynamic replanning deliberately keeps route solving and patch review as deterministic stages after the remote Replanner selects a bounded strategy.
+
+The system is a **deterministic-core, LLM-assisted, policy-governed Multi-Agent workflow**. Supervisor, Search, Safety, Planner, and Replanner are deterministic roles; Intent, Critic, and Companion are the only LLM-eligible roles. This separation is a business safety boundary, not an autonomous multi-LLM negotiation design.
+
+Every process exposes its own Prometheus endpoint. W3C Trace Context travels in the typed Agent message envelope; API server spans are therefore parents of Redis producer/consumer, role-worker, HTTPX, and SQLAlchemy spans. Queue gauges expose pending messages, DLQ size, and oldest pending age per role.

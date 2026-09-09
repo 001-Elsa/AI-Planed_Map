@@ -101,6 +101,22 @@ class AgentMessageType(str, Enum):
     tool_result = "tool_result"
 
 
+class TraceContext(StrictModel):
+    traceparent: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$",
+    )
+    tracestate: str | None = Field(default=None, max_length=512)
+    baggage: str | None = Field(default=None, max_length=2048)
+
+    def carrier(self) -> dict[str, str]:
+        return {
+            key: value
+            for key, value in self.model_dump(exclude_none=True).items()
+            if isinstance(value, str)
+        }
+
+
 class AgentMessage(StrictModel):
     """Runtime Agent communication envelope.
 
@@ -123,6 +139,7 @@ class AgentMessage(StrictModel):
     reply_to: str | None = Field(default=None, pattern=r"^[A-Za-z0-9._-]{16,80}$")
     inbox: str | None = Field(default=None, pattern=r"^[A-Za-z0-9._-]{16,80}$")
     attempt: int = Field(default=1, ge=1, le=5)
+    trace_context: TraceContext = Field(default_factory=TraceContext)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     expires_at: datetime | None = None
 

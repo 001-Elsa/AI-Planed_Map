@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.clients.weather_client import WeatherProvider, WeatherSnapshot
 from backend.app.core.config import Settings
+from backend.app.core.observability import metrics
 from backend.app.models import (
     AgentArtifact,
     AgentHandoff,
@@ -297,9 +298,15 @@ class PlanningAgentOrchestrator:
         step = self._plan_step(step_id)
         if step is None:
             return
+        changed = step.status != status
         step.status = status
         if begin:
             step.attempt_count += 1
+        if changed:
+            metrics.increment(
+                "mapgo_agent_workflow_node_transitions_total",
+                {"workflow": "planning", "node": step_id, "status": status},
+            )
 
     async def checkpoint(self) -> None:
         if self.checkpoint_store is None:

@@ -11,6 +11,7 @@ from backend.app.core.config import get_settings
 from backend.app.core.exceptions import AppError
 from backend.app.core.privacy import encrypt_location, read_location
 from backend.app.core.security import token_hash
+from backend.app.core.telemetry import inject_trace_context
 from backend.app.db.session import SessionLocal
 from backend.app.models import (
     AgentRun,
@@ -366,6 +367,7 @@ async def update_location(
                 "trip_id": trip.id,
                 "event_id": off_route_event.id,
                 "event_type": "UserOffRoute",
+                "_trace_context": inject_trace_context(),
             },
         )
         await publish_trip_stream(
@@ -449,7 +451,12 @@ async def ingest_event(
     await db.commit()
     await request.app.state.runtime_store.enqueue(
         "mapgo:trip-events",
-        {"trip_id": trip.id, "event_id": event.id, "event_type": body.type.value},
+        {
+            "trip_id": trip.id,
+            "event_id": event.id,
+            "event_type": body.type.value,
+            "_trace_context": inject_trace_context(),
+        },
     )
     await publish_trip_stream(
         request.app.state.runtime_store,

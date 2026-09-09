@@ -4,6 +4,9 @@
 
 > 基于大模型意图理解、候选 POI 与路线联合求解、可验证约束和计划版本控制的智能出行平台。
 
+项目的准确定位是：**Deterministic-core、LLM-assisted、policy-governed Multi-Agent workflow**。
+它不是多个自主 LLM Agent 自由协商；LLM 主要用于 Intent、Critic 和 Companion，其他角色由确定性逻辑约束。
+
 MapGo 的定位不是“让模型生成一条看起来合理的路线”。系统把非确定性的需求理解与确定性的地图事实、约束求解和变更审批分开：
 
 ```text
@@ -30,7 +33,7 @@ MapGo 的定位不是“让模型生成一条看起来合理的路线”。系�
 - LLM 运行时失败自动降级到 RuleBased 解析器，并写入不确定约束 / 降低置信度；
 - 多轮规划澄清（起点、时间、人群、忌口、区域、候选 POI 选择等）；确认答案会写回类型化意图、重新召回候选并重新求解；
 - Supervisor 拓扑：Supervisor Agent 负责任务拆分、调度、状态管理和错误恢复；Intent/Search/Planner/Critic 形成规划链路，Final Answer 由 Supervisor 收束；Companion Agent 继续作为行中事件处理角色。Search/Planner 是受控确定性阶段，不给 LLM 开放地图或求解工具权限；
-- Agent 通信协议 v1：所有规划交接和 Companion 工具循环使用统一结构化消息信封，包含 sender/receiver、task/correlation/causation ID、消息与 Artifact 类型、内容哈希和幂等键；Router 对允许路由执行失败关闭校验，审计内容先最小化再持久化；
+- Agent 通信协议 v1：所有规划交接和 Companion 工具循环使用统一结构化消息信封，包含 sender/receiver、task/correlation/causation ID、W3C Trace Context、消息与 Artifact 类型、内容哈希和幂等键；Router 对允许路由执行失败关闭校验，审计内容先最小化再持久化；
 - Shared State v1：Redis/内存 RuntimeStore 保存带 revision 和 TTL 的当前任务状态，统一包含用户需求、POI 候选、路线方案、Critic 评价和执行历史；Agent 只能读取角色切片、写入本角色字段，更新使用 CAS 防止并发覆盖；PostgreSQL 只保存最小化状态快照、明确确认的长期偏好和正式任务/行程历史；
 - Agent Tool Registry：角色授权、调用模式与数据域统一失败关闭校验；Intent/Search/Planner 的解析、地图和 OR-Tools 能力只允许服务器内部阶段调用，不进入 LLM Tool Schema；Companion 只暴露四个行中工具，并继续叠加 Trip State、Consent、确认与预算 Policy；
 - Cost-aware Model Router：Intent 按复杂度选择 Rule/Small/Strong Structured Output，Critic 使用 Rule/Strong Hybrid，Companion 仅使用 Rule/Small；Supervisor、Search、Safety、Planner、Replanner 显式锁定 deterministic。路由按模型档位计算成本，模型不可用时降级 Rule，高风险只会触发 Critic/HITL，不会扩大工具权限；
@@ -44,7 +47,7 @@ MapGo 的定位不是“让模型生成一条看起来合理的路线”。系�
 - 策展知识库 + 本地 TF-IDF RAG 检索与引文；拒绝无来源编造；
 - 行程复盘摘要（站间偏差、重规划、建议接受/拒绝、ETA 误差）；
 - 站内通知服务（去重、重试、投递状态；Web Push/邮件为可扩展通道）；
-- JSON 日志、经过白名单清洗的 Request/Trace ID、低基数 Prometheus 指标（含 histogram 分桶），以及 API `no-store`、Permissions Policy 等安全响应头；
+- JSON 日志、经过白名单清洗的 Request/Trace ID、API 与各 Worker 独立 `/metrics`、Redis pending/DLQ/reclaim age 告警、Agent 延迟/排队/重试/失败面板，以及跨 API → Redis → Worker → DB 的 OpenTelemetry Trace；
 - CI：Ruff / Mypy / Bandit / pip-audit、Postgres+Redis、Alembic、pytest、AI 评测质量门禁、Playwright E2E、Docker build。
 
 诚实边界：
@@ -52,7 +55,7 @@ MapGo 的定位不是“让模型生成一条看起来合理的路线”。系�
 - 置信度当前是基于 Provider 质量和安全缓冲的启发式区间，不是严格概率预报；代码中的历史残差校准函数尚未接入在线规划，因而不对外宣称已校准；
 - RAG 为本地轻量检索，不是托管向量库；
 - 通知的 Web Push / 邮件适配器尚未对接真实厂商；
-- OpenTelemetry 全链路 SDK 仍可继续加深；当前以 Prometheus + Trace ID 为主。
+- OpenTelemetry 使用 OTLP HTTP 导出；未配置 `OTEL_EXPORTER_OTLP_ENDPOINT` 时保留本地 span 上下文但不发送到外部后端。Compose `observability` profile 提供 Jaeger，生产环境仍需配置采样率、保留期和认证；
 - Patch 接受阶段复用联合求解评价器，重新验证任务完整性/顺序、时间、评分、营业、无障碍、区域、步行、时长和总费用；分类预算与绕行基线仍受 Provider 数据完整性限制；
 - Worker 使用 processing 保留队列、ack、启动恢复、应用层重试和 DLQ；成功提交后未 ack 可能造成重复投递，因此依赖事件幂等，不宣称 Exactly Once；
 - SSE 保存并推送最新行程状态快照，`Last-Event-ID` 用于避免重复展示该快照，不提供逐条、无缺口的历史事件回放；
@@ -107,7 +110,17 @@ Compose 默认按生产环境启动。运行前必须把 `.env` 中的 `POSTGRES
 
 当前注册密码长度为 8～64 个字符。登录/注册按来源 IP 执行独立限流，不信任可由客户端任意更换的设备 Header；已登录 API 另按 Session Token 限流。公开分享链接使用 128 bit（32 位 hex）随机 capability token，旧 16 位链接继续兼容读取。
 
-Compose 启动 `migrate`、`api`、`worker`、`postgres`、`redis`；可选 `observability` profile 启动 Prometheus/Grafana。
+Compose 启动 `migrate`、`api`、`worker`、三个 Agent Role Worker、`postgres`、`redis`；
+可选 `observability` profile 启动 Prometheus、Grafana 和 Jaeger。启用 Trace 导出时：
+
+```powershell
+$env:OTEL_EXPORTER_OTLP_ENDPOINT="http://jaeger:4318/v1/traces"
+docker compose --profile observability up --build
+```
+
+Prometheus、Grafana、Jaeger UI 分别位于 `http://localhost:9090`、`http://localhost:3001`、
+`http://localhost:16686`。API 指标位于 `:3000/metrics`，四个 Worker 在 Compose 网络内通过
+各自的 `:9100/metrics` 暴露指标。
 
 ## 常用命令
 
@@ -187,6 +200,9 @@ Single-Agent 与 Multi-Agent 的 Safety、Critic 和动态恢复能力并不相�
 
 更多设计见 [架构说明](docs/ARCHITECTURE.md)、[威胁模型](docs/THREAT_MODEL.md)、[版本演进](docs/CHANGELOG.md) 和 [ADR](docs/adr/0001-deterministic-planning-boundary.md)。
 
+Worker 指标、告警、Dashboard 和跨进程 Trace 说明见
+[Agent Runtime Observability](docs/AGENT_OBSERVABILITY.md)。
+
 演示流程、可复现的测试与压测命令见 [演示与运行证据](docs/DEMO.md)。仓库展示名已调整为 **MapGo-AI-Planner**；GitHub 上的远端仓库重命名需在仓库设置中执行后，再同步更新 `origin`。
 
 ## 路线图（仍未完成 / 可继续加深）
@@ -194,5 +210,5 @@ Single-Agent 与 Multi-Agent 的 Safety、Critic 和动态恢复能力并不相�
 - 真实 LLM 评测对比与 Prompt 回归；
 - 托管向量库 / 重排序完整 RAG；
 - Web Push / 邮件 / App Push 真实投递；
-- OpenTelemetry 跨 API/Worker/DB/Redis 全链路；
+- OpenTelemetry 生产采样、长期 Trace 存储与告警联动；
 - 录制演示视频 / GIF 并发布在线 Demo；

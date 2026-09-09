@@ -6,6 +6,8 @@
 
 > MapGo 是一个 AI 行程规划与伴游系统。LLM 只把自然语言解析成严格结构化意图，真实 POI 必须来自地图 Provider，候选地点选择、访问顺序和时间窗由确定性求解器完成。行程中发生偏航、暴雨、延误或地点关闭时，Worker 会驱动受工具白名单、状态机、授权和预算限制的 Agent 生成待确认 Plan Patch；用户确认并通过当前 Patch 复验后，系统才创建新的正式计划版本。
 
+架构口径：**Deterministic-core、LLM-assisted、policy-governed Multi-Agent workflow**。不要描述成多个自主 LLM Agent 自由协商；Supervisor、Search、Safety、Planner、Replanner 是确定性角色，LLM 主要用于 Intent、Critic、Companion。
+
 当前技术栈：Python 3.12、FastAPI、Pydantic、SQLAlchemy 2.x、Alembic、PostgreSQL 16、Redis 7、OR-Tools、httpx、原生 ES Modules、高德地图、Playwright、Docker Compose、Prometheus/Grafana、GitHub Actions。
 
 ## 核心链路
@@ -120,13 +122,11 @@ AMap Provider 有连接池、并发信号量、超时、针对 429/5xx 的指数
 
 建议主动说出以下边界：
 
-1. Redis List 没有 ACK/pending reclaim，`BRPOP` 后 Worker 硬崩溃可能丢失在途事件；
-2. 分布式锁没有续租，任务超过 TTL 时可能并发执行；
-3. SSE 只保存最新状态快照，不支持逐条、无缺口回放；
-4. Patch 接受阶段只复验 deadline、最晚返回、步行和总费用，尚未复用首次规划全部约束；
-5. OR-Tools/Beam 搜索使用固定近似代价，大规模问题不保证请求权重下的全局最优；
-6. 同步求解仍运行在 API 进程内，高并发时应隔离到线程池、进程池或独立规划 Worker；
-7. RAG 是本地 TF-IDF，不是向量数据库；真实 Push/邮件、完整 OpenTelemetry 和在线 ETA 校准尚未完成。
+1. 行程事件仍使用 Redis processing list，Agent 角色消息才使用 Redis Stream consumer group；两套队列语义增加运维复杂度；
+2. SSE 只保存最新状态快照，不支持逐条、无缺口回放；
+3. OR-Tools/Beam 搜索使用固定近似代价，大规模问题不保证请求权重下的全局最优；
+4. RAG 是本地 TF-IDF，不是向量数据库，真实 Push/邮件仍未接入；
+5. OpenTelemetry 已贯通 API/Redis/Worker/DB，但生产采样、长期存储、Tail Sampling 和 Trace-to-log 跳转仍需完善。
 
 ## 当前简历写法
 
@@ -161,3 +161,4 @@ AMap Provider 有连接池、并发信号量、超时、针对 429/5xx 的指数
 - “ETA 已完成在线历史校准”；
 - “Web Push / 邮件已经真实投递”；
 - “已接入完整 OpenTelemetry 全链路”。
+- “多个自主 LLM Agent 会自由协商并生成路线”。

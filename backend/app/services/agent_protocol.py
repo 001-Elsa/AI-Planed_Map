@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 
 from pydantic import ValidationError
 
+from backend.app.core.telemetry import inject_trace_context
 from backend.app.schemas.agent_artifacts import (
     AgentEndpoint,
     AgentMessage,
@@ -20,6 +21,7 @@ from backend.app.schemas.agent_artifacts import (
     ArtifactEnvelope,
     CriticSoftAdjustments,
     ReviewReport,
+    TraceContext,
     minimize_agent_payload,
 )
 from backend.app.schemas.ai_intent import AIPlanRequest, AIPlanResult, PlanningIntent, PoiCandidate
@@ -280,6 +282,7 @@ class AgentMessageRouter:
             reply_to=reply_to,
             inbox=inbox,
             attempt=attempt,
+            trace_context=TraceContext.model_validate(inject_trace_context()),
         )
 
     def deliver(self, message: AgentMessage) -> tuple[AgentMessage, str]:

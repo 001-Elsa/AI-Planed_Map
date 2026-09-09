@@ -18,7 +18,8 @@ from typing import Any, Literal, Protocol
 from uuid import uuid4
 
 from backend.app.core.observability import metrics
-from backend.app.schemas.agent_artifacts import AgentEndpoint, AgentMessage
+from backend.app.core.telemetry import inject_trace_context, traced
+from backend.app.schemas.agent_artifacts import AgentEndpoint, AgentMessage, TraceContext
 from backend.app.services.agent_protocol import AgentMessageRouter
 from backend.app.services.agent_tool_contracts import stable_tool_error
 
@@ -32,6 +33,7 @@ class AgentMessageDelivery:
     consumer: str
     delivery_count: int = 1
     reclaimed: bool = False
+    pending_idle_ms: int = 0
 
 
 @dataclass(frozen=True)
@@ -85,6 +87,14 @@ class AgentMessageTransport(Protocol):
     async def dead_letters(
         self, receiver: AgentEndpoint, *, count: int = 20, inbox: str | None = None
     ) -> list[dict[str, Any]]: ...
+
+    async def dead_letter_count(
+        self, receiver: AgentEndpoint, *, inbox: str | None = None
+    ) -> int: ...
+
+    async def oldest_pending_age_ms(
+        self, receiver: AgentEndpoint, *, inbox: str | None = None
+    ) -> int: ...
 
 
 @dataclass
@@ -241,6 +251,7 @@ class InMemoryAgentMessageTransport:
                     consumer=consumer,
                     delivery_count=claim.delivery.delivery_count + 1,
                     reclaimed=True,
+                    pending_idle_ms=int((now - claim.claimed_at) * 1_000),
                 )
                 self._pending[channel][receipt] = _MemoryClaim(
                     delivery=delivery, claimed_at=now
@@ -265,6 +276,20 @@ class InMemoryAgentMessageTransport:
     ) -> list[dict[str, Any]]:
         async with self._condition:
             return list(self._dead_letters[(receiver, inbox)][-max(0, count) :])
+
+    async def dead_letter_count(
+        self, receiver: AgentEndpoint, *, inbox: str | None = None
+    ) -> int:
+        async with self._condition:
+            return len(self._dead_letters[(receiver, inbox)])
+
+    async def oldest_pending_age_ms(
+        self, receiver: AgentEndpoint, *, inbox: str | None = None
+    ) -> int:
+        async with self._condition:
+            claims = self._pending[(receiver, inbox)].values()
+            oldest = min((claim.claimed_at for claim in claims), default=None)
+        return int((time.monotonic() - oldest) * 1_000) if oldest is not None else 0
 
 
 class RedisStreamAgentMessageTransport:
@@ -478,6 +503,13 @@ class RedisStreamAgentMessageTransport:
                 delivery_count = int(
                     row.get("times_delivered") or row.get(b"times_delivered") or delivery_count
                 )
+                pending_idle_ms = int(
+                    row.get("time_since_delivered")
+                    or row.get(b"time_since_delivered")
+                    or 0
+                )
+            else:
+                pending_idle_ms = 0
             deliveries.append(
                 AgentMessageDelivery(
                     message=message,
@@ -485,6 +517,7 @@ class RedisStreamAgentMessageTransport:
                     consumer=consumer,
                     delivery_count=delivery_count,
                     reclaimed=True,
+                    pending_idle_ms=pending_idle_ms,
                 )
             )
         if deliveries:
@@ -519,6 +552,27 @@ class RedisStreamAgentMessageTransport:
                 result.append(json.loads(raw))
         return result
 
+    async def dead_letter_count(
+        self, receiver: AgentEndpoint, *, inbox: str | None = None
+    ) -> int:
+        return int(await self.client.xlen(self._dlq(receiver, inbox)))
+
+    async def oldest_pending_age_ms(
+        self, receiver: AgentEndpoint, *, inbox: str | None = None
+    ) -> int:
+        await self._ensure_group(receiver, inbox)
+        rows = await self.client.xpending_range(
+            self._stream(receiver, inbox),
+            self._group(receiver, inbox),
+            min="-",
+            max="+",
+            count=1,
+        )
+        if not rows:
+            return 0
+        row = rows[0]
+        return int(row.get("time_since_delivered") or row.get(b"time_since_delivered") or 0)
+
 
 class RecoverableAgentMessageBus:
     """Validated message bus used by independently deployable Agent workers."""
@@ -528,8 +582,26 @@ class RecoverableAgentMessageBus:
         self.router = router
 
     async def publish(self, message: AgentMessage) -> AgentPublishResult:
-        self.router.validate(message)
-        return await self.transport.publish(message)
+        with traced(
+            f"agent.message.publish.{message.receiver.value}",
+            kind="producer",
+            attributes={
+                "messaging.destination.name": message.receiver.value,
+                "messaging.message.id": str(message.message_id),
+                "messaging.operation": "publish",
+                "messaging.system": "redis",
+            },
+        ):
+            carrier = inject_trace_context()
+            outbound = (
+                message.model_copy(
+                    update={"trace_context": TraceContext.model_validate(carrier)}
+                )
+                if carrier
+                else message
+            )
+            self.router.validate(outbound)
+            return await self.transport.publish(outbound)
 
     async def receive(
         self,
@@ -586,14 +658,40 @@ class AgentTaskWorker:
         )
         if delivery is None:
             return "idle"
+        created_at = delivery.message.created_at
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        labels = {"role": self.endpoint.value}
+        metrics.observe(
+            "mapgo_agent_task_queue_delay_ms",
+            max(0, (datetime.now(timezone.utc) - created_at).total_seconds() * 1_000),
+            labels,
+        )
+        metrics.observe("mapgo_agent_task_attempt_count", delivery.delivery_count, labels)
+        if delivery.reclaimed:
+            metrics.observe("mapgo_agent_reclaim_age_ms", delivery.pending_idle_ms, labels)
         if delivery.delivery_count > self.max_attempts:
-            return await self.bus.transport.retry(
+            disposition = await self.bus.transport.retry(
                 delivery,
                 error_code="DELIVERY_LIMIT_EXCEEDED",
                 max_attempts=self.max_attempts,
             )
+            metrics.increment("mapgo_agent_task_results_total", {**labels, "result": disposition})
+            return disposition
+        started = time.perf_counter()
         try:
-            outputs = await self.handler(delivery.message)
+            with traced(
+                f"agent.task.{self.endpoint.value}",
+                carrier=delivery.message.trace_context.carrier(),
+                kind="consumer",
+                attributes={
+                    "agent.role": self.endpoint.value,
+                    "messaging.message.id": str(delivery.message.message_id),
+                    "messaging.operation": "process",
+                    "messaging.system": "redis",
+                },
+            ):
+                outputs = await self.handler(delivery.message)
             if outputs is not None:
                 messages = outputs if isinstance(outputs, list) else [outputs]
                 for message in messages:
@@ -607,7 +705,11 @@ class AgentTaskWorker:
                 )
                 # Leave an unacknowledged Redis entry in the PEL for reclaim.
                 # A missing in-memory claim has already been handled elsewhere.
+                metrics.increment(
+                    "mapgo_agent_task_results_total", {**labels, "result": "retry"}
+                )
                 return "retry"
+            metrics.increment("mapgo_agent_task_results_total", {**labels, "result": "acked"})
             return "acked"
         except Exception as exc:
             logger.exception(
@@ -615,10 +717,18 @@ class AgentTaskWorker:
                 self.endpoint.value,
                 self.consumer,
             )
-            return await self.bus.transport.retry(
+            disposition = await self.bus.transport.retry(
                 delivery,
                 error_code=stable_tool_error(exc),
                 max_attempts=self.max_attempts,
+            )
+            metrics.increment("mapgo_agent_task_results_total", {**labels, "result": disposition})
+            return disposition
+        finally:
+            metrics.observe(
+                "mapgo_agent_task_duration_ms",
+                (time.perf_counter() - started) * 1_000,
+                labels,
             )
 
 

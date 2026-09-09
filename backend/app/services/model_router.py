@@ -262,6 +262,9 @@ class ModelRouter:
 
     def public_policy(self) -> dict[str, Any]:
         return {
+            "architecture_positioning": (
+                "deterministic-core, LLM-assisted, policy-governed multi-agent workflow"
+            ),
             "enabled": self.settings.model_router_enabled,
             "tiers": [item.value for item in ModelTier],
             "model_credentials_available": bool(self.settings.llm_api_key),

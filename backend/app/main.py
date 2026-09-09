@@ -25,6 +25,7 @@ from backend.app.clients.weather_client import build_weather_provider
 from backend.app.core.config import get_settings
 from backend.app.core.exceptions import AppError
 from backend.app.core.observability import metrics
+from backend.app.core.telemetry import configure_telemetry, traced
 from backend.app.db.session import SessionLocal, check_database, engine
 from backend.app.infrastructure.runtime_store import build_runtime_store
 from backend.app.models import LocationSnapshot
@@ -101,6 +102,12 @@ class RequestBodyLimitMiddleware:
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
+    configure_telemetry(
+        "mapgo-api",
+        endpoint=settings.otel_exporter_otlp_endpoint,
+        environment=settings.environment,
+        sqlalchemy_engine=engine.sync_engine,
+    )
     if settings.environment == "production":  # api key的检查
         if settings.location_encryption_key in {
             "",
@@ -173,7 +180,9 @@ if not logger.handlers:
 app = FastAPI(
     title=settings.app_name,
     version=settings.app_version,
-    description="大模型意图解析 + 真实 POI + 确定性约束路线优化",
+    description=(
+        "Deterministic-core、LLM-assisted、policy-governed Multi-Agent workflow"
+    ),
     lifespan=lifespan,
 )
 app.include_router(mcp.router)
@@ -264,7 +273,22 @@ async def request_context(request: Request, call_next):
             },
         )
     # 业务接口执行完后，这个 Middleware 会计算耗时，把 X-Request-ID 和 X-Trace-ID 返回给客户端，同时设置若干安全 Header。
-    response = await call_next(request)
+    trace_carrier = {
+        key: value
+        for key, value in request.headers.items()
+        if key.lower() in {"traceparent", "tracestate", "baggage"}
+    }
+    with traced(
+        f"{request.method} {request.url.path}",
+        carrier=trace_carrier,
+        kind="server",
+        attributes={
+            "http.request.method": request.method,
+            "url.path": request.url.path,
+            "mapgo.request_id": request_id,
+        },
+    ):
+        response = await call_next(request)
     elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
     response.headers["X-Request-ID"] = request_id
     response.headers["X-Trace-ID"] = trace_id

@@ -110,6 +110,9 @@ def test_auth_plan_and_ai_pipeline():
         assert model_router["role_policy"]["planner"] == "deterministic_route_optimizer"
         assert model_router["role_policy"]["critic"] == "rule_or_strong_hybrid"
         assert model_router["high_risk_action"] == "hitl"
+        assert model_router["architecture_positioning"] == (
+            "deterministic-core, LLM-assisted, policy-governed multi-agent workflow"
+        )
         assert shared_capability["version"] == "1.0"
         assert shared_capability["optimistic_concurrency"] is True
         assert shared_capability["role_scoped_views"] is True

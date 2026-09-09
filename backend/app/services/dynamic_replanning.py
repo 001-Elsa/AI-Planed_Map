@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.clients.amap_client import MapProvider
+from backend.app.core.observability import metrics
 from backend.app.models import PlanPatch, PlanVersion, TripSession
 from backend.app.schemas.agent_artifacts import (
     AgentBudget,
@@ -413,9 +414,15 @@ class DynamicReplanningOrchestrator:
         step = next(item for item in trace.execution_plan.steps if item.step_id == step_id)
         if step.status == "succeeded":
             return
+        changed = step.status != status
         step.status = status
         if begin:
             step.attempt_count += 1
+        if changed:
+            metrics.increment(
+                "mapgo_agent_workflow_node_transitions_total",
+                {"workflow": "dynamic_replanning", "node": step_id, "status": status},
+            )
         await checkpoint_store.checkpoint(trace)
 
     async def run(

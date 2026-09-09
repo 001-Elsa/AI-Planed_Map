@@ -1,0 +1,42 @@
+groups:
+  - name: mapgo-agent-runtime
+    rules:
+      - alert: AgentWorkerMetricsDown
+        expr: up{job=~"mapgo-.*worker.*"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MapGo Agent worker metrics endpoint is down"
+
+      - alert: AgentPendingBacklog
+        expr: mapgo_agent_pending_messages > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Agent role {{ $labels.role }} has a sustained pending backlog"
+
+      - alert: AgentPendingMessageStale
+        expr: mapgo_agent_oldest_pending_age_ms > 60000
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Agent role {{ $labels.role }} has a stale pending message"
+
+      - alert: AgentDeadLetterQueueNotEmpty
+        expr: mapgo_agent_dlq_messages > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Agent role {{ $labels.role }} has messages in its DLQ"
+
+      - alert: AgentReclaimRateHigh
+        expr: sum by (receiver) (rate(mapgo_agent_messages_reclaimed_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Agent role {{ $labels.receiver }} is repeatedly reclaiming messages"

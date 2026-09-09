@@ -90,6 +90,9 @@ class Settings(BaseSettings):
     agent_stream_max_length: int = 20_000
     agent_message_max_attempts: int = 3
     agent_message_reclaim_idle_ms: int = 30_000
+    metrics_host: str = "0.0.0.0"
+    metrics_port: int = Field(default=9100, ge=1, le=65_535)
+    otel_exporter_otlp_endpoint: str = ""
     # MCP is an optional edge adapter, not the primary orchestration path.
     mcp_server_enabled: bool = False
     mcp_internal_token: str = ""

@@ -3,12 +3,14 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
+from backend.app.core.observability import MetricsRegistry
 from backend.app.schemas.agent_artifacts import (
     AgentEndpoint,
     AgentMessageType,
 )
 from backend.app.schemas.ai_intent import AIPlanRequest, Coordinate
 from backend.app.schemas.dynamic_replanning import TripEventArtifact
+from backend.app.services import agent_protocol, agent_transport
 from backend.app.services.agent_protocol import AgentMessageRouter
 from backend.app.services.agent_transport import (
     AgentTaskWorker,
@@ -82,6 +84,49 @@ def test_memory_transport_deduplicates_reclaims_acks_and_dead_letters():
         assert "must-not-leak" not in str(letters)
 
     asyncio.run(scenario())
+
+
+def test_worker_records_retry_when_acknowledgement_fails(monkeypatch):
+    async def scenario() -> None:
+        router = AgentMessageRouter()
+        transport = InMemoryAgentMessageTransport(router)
+        bus = RecoverableAgentMessageBus(transport, router)
+        await bus.publish(_planning_message(router))
+
+        async def fail_ack(_delivery):
+            return False
+
+        monkeypatch.setattr(transport, "acknowledge", fail_ack)
+        test_metrics = MetricsRegistry()
+        monkeypatch.setattr(agent_transport, "metrics", test_metrics)
+        worker = AgentTaskWorker(
+            bus=bus,
+            endpoint=AgentEndpoint.supervisor,
+            consumer="ack-failure-worker",
+            handler=lambda _message: asyncio.sleep(0, result=None),
+        )
+
+        assert await worker.run_once(block_ms=0) == "retry"
+        assert (
+            'mapgo_agent_task_results_total{result="retry",role="supervisor"} 1'
+            in test_metrics.render()
+        )
+
+    asyncio.run(scenario())
+
+
+def test_agent_message_carries_w3c_trace_context(monkeypatch):
+    traceparent = f"00-{'1' * 32}-{'2' * 16}-01"
+    monkeypatch.setattr(
+        agent_protocol,
+        "inject_trace_context",
+        lambda: {"traceparent": traceparent, "tracestate": "mapgo=test"},
+    )
+
+    message = _planning_message(AgentMessageRouter())
+
+    assert message.trace_context.traceparent == traceparent
+    assert message.trace_context.tracestate == "mapgo=test"
 
 
 class _FakePipeline:
@@ -158,12 +203,19 @@ class _FakeRedis:
 
     async def xpending_range(self, stream, group, **_kwargs):
         return [
-            {"message_id": receipt, "times_delivered": 2}
+            {
+                "message_id": receipt,
+                "times_delivered": 2,
+                "time_since_delivered": 31_000,
+            }
             for receipt in self.pending[(stream, group)]
         ][:1]
 
     async def xrevrange(self, stream, **_kwargs):
         return list(reversed(self.streams[stream]))
+
+    async def xlen(self, stream):
+        return len(self.streams[stream])
 
     def pipeline(self, **_kwargs):
         return _FakePipeline(self)
@@ -192,6 +244,8 @@ def test_redis_stream_transport_uses_consumer_group_ack_retry_and_dlq():
         )
         assert reclaimed[0].reclaimed is True
         assert reclaimed[0].delivery_count == 2
+        assert reclaimed[0].pending_idle_ms == 31_000
+        assert await transport.oldest_pending_age_ms(AgentEndpoint.supervisor) == 31_000
         assert await transport.acknowledge(reclaimed[0]) is True
 
         retry_message = router.build(
@@ -223,6 +277,7 @@ def test_redis_stream_transport_uses_consumer_group_ack_retry_and_dlq():
         )
         letters = await transport.dead_letters(AgentEndpoint.supervisor)
         assert letters[0]["error_code"] == "UPSTREAM_TIMEOUT"
+        assert await transport.dead_letter_count(AgentEndpoint.supervisor) == 1
 
     asyncio.run(scenario())
 

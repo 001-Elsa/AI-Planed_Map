@@ -34,6 +34,37 @@
       "title": "Planning results",
       "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
       "targets": [{"expr": "sum(increase(mapgo_planning_results_total[1h])) by (status)", "legendFormat": "{{status}}"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Agent task p95 latency",
+      "gridPos": {"x": 0, "y": 16, "w": 12, "h": 8},
+      "targets": [{"expr": "histogram_quantile(0.95, sum by (le, role) (rate(mapgo_agent_task_duration_ms_histogram_bucket[5m])))", "legendFormat": "{{role}}"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Agent queue p95 delay",
+      "gridPos": {"x": 12, "y": 16, "w": 12, "h": 8},
+      "targets": [{"expr": "histogram_quantile(0.95, sum by (le, role) (rate(mapgo_agent_task_queue_delay_ms_histogram_bucket[5m])))", "legendFormat": "{{role}}"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Pending and oldest reclaim age",
+      "gridPos": {"x": 0, "y": 24, "w": 12, "h": 8},
+      "targets": [
+        {"expr": "max by (role) (mapgo_agent_pending_messages)", "legendFormat": "pending {{role}}"},
+        {"expr": "max by (role) (mapgo_agent_oldest_pending_age_ms)", "legendFormat": "age-ms {{role}}"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Agent retries, DLQ, and failed nodes",
+      "gridPos": {"x": 12, "y": 24, "w": 12, "h": 8},
+      "targets": [
+        {"expr": "sum by (disposition) (rate(mapgo_agent_message_retries_total[5m]))", "legendFormat": "retry {{disposition}}"},
+        {"expr": "max by (role) (mapgo_agent_dlq_messages)", "legendFormat": "dlq {{role}}"},
+        {"expr": "sum by (workflow, node, status) (rate(mapgo_agent_workflow_node_transitions_total{status=~\"failed|blocked\"}[5m]))", "legendFormat": "{{workflow}} {{node}} {{status}}"}
+      ]
     }
   ]
 }

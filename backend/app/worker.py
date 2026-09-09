@@ -12,8 +12,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.clients.amap_client import build_map_provider
 from backend.app.clients.weather_client import build_weather_provider
 from backend.app.core.config import get_settings
+from backend.app.core.metrics_server import start_metrics_server
 from backend.app.core.observability import metrics
 from backend.app.core.privacy import read_location
+from backend.app.core.telemetry import configure_telemetry, traced
 from backend.app.db.session import SessionLocal, engine
 from backend.app.infrastructure.runtime_store import (
     RedisRuntimeStore,
@@ -461,6 +463,17 @@ async def run_worker() -> None:
     settings = get_settings()
     if not settings.redis_url:
         raise RuntimeError("Worker requires REDIS_URL")
+    configure_telemetry(
+        "mapgo-worker",
+        endpoint=settings.otel_exporter_otlp_endpoint,
+        environment=settings.environment,
+        sqlalchemy_engine=engine.sync_engine,
+    )
+    metrics_server = await start_metrics_server(
+        service_name="mapgo-worker",
+        host=settings.metrics_host,
+        port=settings.metrics_port,
+    )
     store = await build_runtime_store(settings.redis_url)
     agent_bus = build_agent_message_bus(
         mode=settings.agent_message_transport,
@@ -501,14 +514,24 @@ async def run_worker() -> None:
             if reserved:
                 handled = False
                 try:
-                    await process_trip_event(
-                        store,
-                        reserved.payload,
-                        map_provider=map_provider,
-                        weather_provider=weather_provider,
-                        decider=decider,
-                        message_bus=agent_bus,
-                    )
+                    with traced(
+                        "worker.trip_event",
+                        carrier=reserved.payload.get("_trace_context") or {},
+                        kind="consumer",
+                        attributes={
+                            "messaging.system": "redis",
+                            "messaging.operation": "process",
+                            "mapgo.event_type": str(reserved.payload.get("event_type") or ""),
+                        },
+                    ):
+                        await process_trip_event(
+                            store,
+                            reserved.payload,
+                            map_provider=map_provider,
+                            weather_provider=weather_provider,
+                            decider=decider,
+                            message_bus=agent_bus,
+                        )
                     handled = True
                 except Exception:
                     logger.exception("trip event handler crashed")
@@ -532,6 +555,8 @@ async def run_worker() -> None:
                 metrics.increment("mapgo_worker_location_cleanup_total", value=removed)
             await asyncio.sleep(0)
     finally:
+        metrics_server.close()
+        await metrics_server.wait_closed()
         await client.aclose()
         await store.close()
         await engine.dispose()

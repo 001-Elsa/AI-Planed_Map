@@ -14,6 +14,9 @@ import httpx
 
 from backend.app.clients.amap_client import build_map_provider
 from backend.app.core.config import Settings, get_settings
+from backend.app.core.metrics_server import start_metrics_server
+from backend.app.core.observability import metrics
+from backend.app.core.telemetry import configure_telemetry
 from backend.app.infrastructure.runtime_store import build_runtime_store
 from backend.app.schemas.agent_artifacts import (
     AgentEndpoint,
@@ -46,6 +49,36 @@ ROLE_ENDPOINTS = {
     "replanner": AgentEndpoint.replanner,
 }
 RoleHandler = Callable[[AgentMessage], Awaitable[AgentMessage]]
+
+
+async def monitor_agent_queue(
+    transport: RedisStreamAgentMessageTransport,
+    endpoint: AgentEndpoint,
+    *,
+    interval_seconds: int = 15,
+) -> None:
+    labels = {"role": endpoint.value}
+    while True:
+        try:
+            metrics.set_gauge(
+                "mapgo_agent_pending_messages",
+                await transport.pending_count(endpoint),
+                labels,
+            )
+            metrics.set_gauge(
+                "mapgo_agent_dlq_messages",
+                await transport.dead_letter_count(endpoint),
+                labels,
+            )
+            metrics.set_gauge(
+                "mapgo_agent_oldest_pending_age_ms",
+                await transport.oldest_pending_age_ms(endpoint),
+                labels,
+            )
+        except Exception:  # noqa: BLE001 - monitoring must not stop task processing
+            metrics.increment("mapgo_agent_queue_monitor_errors_total", labels)
+            logger.exception("Agent queue monitoring failed role=%s", endpoint.value)
+        await asyncio.sleep(interval_seconds)
 
 
 def _execution_content(execution: AgentExecution[Any]) -> dict[str, Any]:
@@ -165,6 +198,17 @@ async def run_agent_role_worker(role: str) -> None:
     settings = get_settings()
     if not settings.redis_url:
         raise RuntimeError("Agent role workers require REDIS_URL")
+    service_name = f"mapgo-agent-{role}"
+    configure_telemetry(
+        service_name,
+        endpoint=settings.otel_exporter_otlp_endpoint,
+        environment=settings.environment,
+    )
+    metrics_server = await start_metrics_server(
+        service_name=service_name,
+        host=settings.metrics_host,
+        port=settings.metrics_port,
+    )
     store = await build_runtime_store(settings.redis_url)
     bus = build_agent_message_bus(
         mode=settings.agent_message_transport,
@@ -209,11 +253,19 @@ async def run_agent_role_worker(role: str) -> None:
         max_attempts=settings.agent_message_max_attempts,
         reclaim_idle_ms=settings.agent_message_reclaim_idle_ms,
     )
+    monitor = asyncio.create_task(
+        monitor_agent_queue(bus.transport, endpoint),
+        name=f"agent-queue-monitor-{role}",
+    )
     logger.info("Agent role worker started role=%s consumer=%s", role, worker.consumer)
     try:
         while True:
             await worker.run_once(block_ms=1_000)
     finally:
+        monitor.cancel()
+        await asyncio.gather(monitor, return_exceptions=True)
+        metrics_server.close()
+        await metrics_server.wait_closed()
         await client.aclose()
         await store.close()
 
